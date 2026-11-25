@@ -4,9 +4,8 @@
 //! checks, MLS setup validation, and delivery-state transitions belong to the
 //! application layer and are never performed by this transport module.
 
-use std::io;
+use std::{future::Future, io};
 
-use async_trait::async_trait;
 use libp2p::futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p_request_response::Codec;
 
@@ -40,56 +39,55 @@ pub const CONTROL_PROTOCOL: &str = "/p2p-messenger/control/1";
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MessageCodec;
 
-#[async_trait]
 impl Codec for MessageCodec {
     type Protocol = String;
     type Request = Vec<u8>;
     type Response = Vec<u8>;
 
-    async fn read_request<T>(
+    fn read_request<T>(
         &mut self,
         _protocol: &Self::Protocol,
         io: &mut T,
-    ) -> io::Result<Self::Request>
+    ) -> impl Future<Output = io::Result<Self::Request>> + Send
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_frame(io).await
+        read_frame(io)
     }
 
-    async fn read_response<T>(
+    fn read_response<T>(
         &mut self,
         _protocol: &Self::Protocol,
         io: &mut T,
-    ) -> io::Result<Self::Response>
+    ) -> impl Future<Output = io::Result<Self::Response>> + Send
     where
         T: AsyncRead + Unpin + Send,
     {
-        read_frame(io).await
+        read_frame(io)
     }
 
-    async fn write_request<T>(
+    fn write_request<T>(
         &mut self,
         _protocol: &Self::Protocol,
         io: &mut T,
         request: Self::Request,
-    ) -> io::Result<()>
+    ) -> impl Future<Output = io::Result<()>> + Send
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_frame(io, request).await
+        write_frame(io, request)
     }
 
-    async fn write_response<T>(
+    fn write_response<T>(
         &mut self,
         _protocol: &Self::Protocol,
         io: &mut T,
         response: Self::Response,
-    ) -> io::Result<()>
+    ) -> impl Future<Output = io::Result<()>> + Send
     where
         T: AsyncWrite + Unpin + Send,
     {
-        write_frame(io, response).await
+        write_frame(io, response)
     }
 }
 

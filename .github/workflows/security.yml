@@ -1,0 +1,102 @@
+name: Security gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  diagnostic-redaction:
+    name: Diagnostic redaction guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Check diagnostic output and Debug derives
+        run: python3 scripts/check_diagnostics.py
+
+  sbom:
+    name: Deterministic locked SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - name: Generate locked SBOMs
+        run: |
+          python3 scripts/generate_sbom.py \
+            --manifest-path Cargo.toml \
+            --workspace-name root \
+            --output sbom/root.spdx.json
+          python3 scripts/generate_sbom.py \
+            --manifest-path fuzz/Cargo.toml \
+            --workspace-name fuzz \
+            --output sbom/fuzz.spdx.json
+      - name: Verify deterministic regeneration
+        run: |
+          cp sbom/root.spdx.json "$RUNNER_TEMP/root.spdx.json"
+          cp sbom/fuzz.spdx.json "$RUNNER_TEMP/fuzz.spdx.json"
+          python3 scripts/generate_sbom.py \
+            --manifest-path Cargo.toml \
+            --workspace-name root \
+            --output sbom/root.spdx.json
+          python3 scripts/generate_sbom.py \
+            --manifest-path fuzz/Cargo.toml \
+            --workspace-name fuzz \
+            --output sbom/fuzz.spdx.json
+          cmp "$RUNNER_TEMP/root.spdx.json" sbom/root.spdx.json
+          cmp "$RUNNER_TEMP/fuzz.spdx.json" sbom/fuzz.spdx.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sbom
+          path: sbom/*.spdx.json
+          if-no-files-found: error
+          retention-days: 14
+
+  fuzz-smoke:
+    name: Bounded codec fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6a52aad76a94a5fbc50d567bb5be24419801c1fb # nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build fuzz targets
+        working-directory: fuzz
+        run: cargo fuzz build
+      - name: Run short fuzz campaign
+        working-directory: fuzz
+        run: |
+          for target in \
+            fuzz_envelope fuzz_setup fuzz_file \
+            fuzz_channel fuzz_identity_export fuzz_contact_uri
+          do
+            cargo fuzz run "$target" -- \
+              -max_total_time=30 -max_len=8192 -timeout=5 -rss_limit_mb=2048
+          done
+
+  dependency-policy:
+    name: Dependency advisories and policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: security-dependency-policy
+      - name: Install audit tooling
+        run: |
+          cargo install cargo-audit --locked
+          cargo install cargo-deny --locked
+      - name: Advisory audit
+        run: cargo audit --file Cargo.lock
+      - name: License, ban, and source policy
+        run: cargo deny --locked --manifest-path Cargo.toml check
+      - name: Fuzz-toolchain advisory audit
+        run: cargo audit --file fuzz/Cargo.lock
+      - name: Fuzz-toolchain license, ban, and source policy
+        run: cargo deny --locked --manifest-path fuzz/Cargo.toml check

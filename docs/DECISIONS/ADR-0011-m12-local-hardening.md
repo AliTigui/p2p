@@ -30,7 +30,7 @@ The following stay explicitly unimplemented and are not claimed:
 
 - Windows ACL hardening; non-Unix restrictive permission helpers remain no-ops.
 - Filesystem secure erasure on SSD/CoW storage.
-- Repository-wide log review and dependency advisory tooling.
-- Real scanner integration, general format/MIME parsing, network-transfer cancellation, encrypted MLS persistence, and backup/restore.
+- Dependency advisory tooling; the repository-wide print/log/`Debug` review is complete, with redacted local paths, static untrusted-field errors, and a CI diagnostic guard.
+- Real scanner integration, general format/MIME parsing, transport-level cancellation of an already queued worker request, encrypted MLS persistence, and backup/restore.
 
 Windows/macOS artifact builds, installer behavior, signing, notarization, and visual GUI inspection still require configured platform runners or desktop hosts.

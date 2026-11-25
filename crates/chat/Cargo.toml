@@ -14,11 +14,12 @@ p2p-files.workspace = true
 p2p-security.workspace = true
 p2p-messaging.workspace = true
 p2p-network.workspace = true
+p2p-storage.workspace = true
 libp2p.workspace = true
 libp2p-identity.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-p2p-storage.workspace = true
 tempfile = "3"
 tokio.workspace = true

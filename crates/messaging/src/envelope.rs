@@ -485,4 +485,38 @@ mod tests {
         assert_eq!(decoded, envelope);
         decoded.verify().expect("valid channel signature");
     }
+
+    #[test]
+    fn deterministic_bit_flips_never_produce_a_verified_envelope() {
+        let identity = Identity::generate().expect("identity");
+        let envelope = Envelope::new(&identity, params(), b"opaque ciphertext".to_vec())
+            .expect("signed envelope");
+        let bytes = envelope.to_bytes().expect("encoded envelope");
+
+        for index in 0..bytes.len() {
+            let mut mutated = bytes.clone();
+            mutated[index] ^= 0x01;
+            if let Ok(decoded) = Envelope::from_bytes(&mutated) {
+                assert!(
+                    decoded.verify().is_err(),
+                    "bit {index} produced a verified envelope"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_truncated_encoding_is_rejected_without_panics() {
+        let identity = Identity::generate().expect("identity");
+        let envelope = Envelope::new(&identity, params(), b"opaque ciphertext".to_vec())
+            .expect("signed envelope");
+        let bytes = envelope.to_bytes().expect("encoded envelope");
+
+        for len in 0..bytes.len() {
+            assert!(
+                Envelope::from_bytes(&bytes[..len]).is_err(),
+                "prefix of length {len} was accepted"
+            );
+        }
+    }
 }

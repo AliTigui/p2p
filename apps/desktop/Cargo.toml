@@ -31,12 +31,11 @@ p2p-network.workspace = true
 p2p-storage.workspace = true
 dirs.workspace = true
 zeroize.workspace = true
-egui = { version = "0.37", optional = true }
+egui = { version = "0.35", optional = true }
 rfd = { workspace = true, optional = true }
-eframe = { version = "0.37", optional = true, default-features = false, features = [
+eframe = { version = "0.35", optional = true, default-features = false, features = [
   "glow",
   "default_fonts",
-  "clipboard",
   "accesskit",
   "x11",
   "wayland",

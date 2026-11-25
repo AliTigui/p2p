@@ -8,7 +8,9 @@
 //!
 //! MLS state and displayed plaintext are memory-only. Nothing here persists a
 //! restored conversation or claims that encrypted envelope rows can rebuild
-//! MLS group state.
+//! MLS group state. When a vault `Session` is attached, a separate bounded
+//! control-frame digest log preserves replay decisions across restart; it is
+//! not an MLS state restore or a general replay-proof protocol.
 
 #![forbid(unsafe_code)]
 
@@ -21,8 +23,8 @@ pub use channel::{
     MAX_CHANNEL_NAME_BYTES, MAX_CHANNEL_TEXT_BYTES,
 };
 pub use controller::{
-    ChannelInfo, ChatMessage, ConversationInfo, ConversationStatus, MessageOrigin,
-    MessengerController, RedialState,
+    ChannelInfo, ChatMessage, ConversationInfo, ConversationStatus, DEFAULT_FILE_TRANSFER_TIMEOUT,
+    MAX_FILE_TRANSFER_TIMEOUT, MessageOrigin, MessengerController, RedialState,
 };
 use libp2p::Multiaddr;
 pub use libp2p_identity::PeerId;
@@ -53,10 +55,20 @@ pub enum ChatError {
     Network(#[from] p2p_network::NetworkError),
     #[error(transparent)]
     File(#[from] p2p_files::FileError),
+    #[error(transparent)]
+    ControlLog(#[from] p2p_storage::StorageError),
+    #[error("control-log vault identity does not match this session")]
+    ControlLogIdentityMismatch,
     #[error("a file transfer is already active with this peer")]
     FileTransferLimit,
     #[error("file transfer is not tracked for this peer")]
     FileTransferMissing,
+    #[error("no file transfer is currently active for this peer")]
+    FileTransferNotActive,
+    #[error("file transfer has not completed integrity verification")]
+    FileTransferNotComplete,
+    #[error("file transfer timeout must be between 1 ms and 1 hour")]
+    InvalidTransferTimeout,
     #[error("invalid file frame: {0}")]
     InvalidFileFrame(&'static str),
     #[error("invalid MLS setup frame: {0}")]

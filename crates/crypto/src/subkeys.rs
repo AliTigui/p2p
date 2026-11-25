@@ -62,6 +62,7 @@ pub fn fresh_salt() -> Result<[u8; SALT_LEN], CryptoError> {
 }
 
 /// Per-installation subkeys derived from one random master key.
+#[derive(Clone)]
 pub struct Subkeys {
     master: Zeroizing<[u8; KEY_LEN]>,
     salts: [[u8; SALT_LEN]; Purpose::ALL.len()],

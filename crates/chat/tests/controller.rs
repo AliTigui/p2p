@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use p2p_chat::{
     ChatError, ConversationStatus, DEFAULT_CHANNEL_ID, FileConfig, FileFormat, FileScanner,
     GroupOperation, MessageOrigin, MessengerController, QuarantineDeletionPolicy, RedialState,
-    ReleaseApproval, ReleasePolicy, ScanRequest, ScanResult, ScanStatus, SecurityConfig,
-    TransferDirection, TransferStatus, parse_address,
+    ReleaseApproval, ReleasePolicy, SETUP_VERSION, ScanRequest, ScanResult, ScanStatus,
+    SecurityConfig, SetupEnvelope, SetupMessage, TransferDirection, TransferStatus, parse_address,
 };
 use p2p_identity::Identity;
 use p2p_messaging::DeliveryState;
@@ -159,6 +159,10 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         || haystack
             .windows(needle.len())
             .any(|window| window == needle)
+}
+
+fn hex_id(id: &[u8; 16]) -> String {
+    id.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn every_file(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -596,6 +600,112 @@ fn encrypted_file_transfer_verifies_integrity_without_claiming_a_scan() {
     );
     assert!(!format!("{alice:?}").contains(std::str::from_utf8(sentinel).expect("sentinel")));
     assert!(!format!("{bob:?}").contains(std::str::from_utf8(sentinel).expect("sentinel")));
+}
+
+#[test]
+fn stalled_transfer_times_out_and_terminal_state_allows_a_new_transfer() {
+    let directory = tempfile::tempdir().expect("temp file directory");
+    let source = directory.path().join("stalled.txt");
+    fs::write(&source, b"stalled transfer payload").expect("source file");
+    let timeout = Duration::from_secs(2);
+    let file_config = |name: &str| FileConfig {
+        quarantine_dir: directory.path().join(name),
+        quarantine_deletion: QuarantineDeletionPolicy::Retain,
+    };
+
+    let alice_identity = Identity::generate().expect("alice identity");
+    let bob_identity = Identity::generate().expect("bob identity");
+    let mut alice = MessengerController::start_with_transfer_timeout(
+        &alice_identity,
+        local_config(),
+        file_config("alice-quarantine"),
+        SecurityConfig::default(),
+        timeout,
+    )
+    .expect("alice controller");
+    let mut bob = MessengerController::start_with_transfer_timeout(
+        &bob_identity,
+        local_config(),
+        file_config("bob-quarantine"),
+        SecurityConfig::default(),
+        timeout,
+    )
+    .expect("bob controller");
+    let _target = connect_controllers(&mut alice, &mut bob, &bob_identity);
+    let alice_peer = alice_identity.peer_id();
+    let bob_peer = bob_identity.peer_id();
+    alice.start_conversation(bob_peer).expect("start MLS setup");
+    wait_for_joined(&mut alice, &mut bob);
+
+    let transfer_id = alice.send_file(bob_peer, &source).expect("offer file");
+    wait_for(
+        "bob observes the active offer",
+        || {
+            bob.poll();
+            bob.file_transfers()
+                .into_iter()
+                .any(|info| info.transfer_id == transfer_id && info.status.active())
+        },
+        Duration::from_secs(10),
+    );
+    assert!(bob.cancel_file(alice_peer).is_err());
+
+    // Keep Bob's controller unpolled so no chunk acknowledgement is emitted.
+    // Alice's transfer must still fail after its own inactivity deadline.
+    wait_for(
+        "sender times out without progress",
+        || {
+            alice.poll();
+            alice.file_transfers().into_iter().any(|info| {
+                info.transfer_id == transfer_id
+                    && info.status == TransferStatus::Failed("Transfer timed out")
+            })
+        },
+        Duration::from_secs(10),
+    );
+    assert_eq!(alice.pending_file_requests(), 0);
+
+    wait_for(
+        "receiver times out without progress",
+        || {
+            bob.poll();
+            bob.file_transfers().into_iter().any(|info| {
+                info.transfer_id == transfer_id
+                    && info.status == TransferStatus::Failed("Transfer timed out")
+            })
+        },
+        Duration::from_secs(10),
+    );
+    assert_eq!(bob.pending_file_requests(), 0);
+    assert!(
+        !directory
+            .path()
+            .join("bob-quarantine")
+            .join(hex_id(&transfer_id))
+            .exists()
+    );
+
+    let replacement = alice
+        .send_file(bob_peer, &source)
+        .expect("replacement offer");
+    wait_for(
+        "replacement transfer completes",
+        || {
+            alice.poll();
+            bob.poll();
+            let sender_done = alice.file_transfers().into_iter().any(|info| {
+                info.transfer_id == replacement && info.status == TransferStatus::IntegrityVerified
+            });
+            let receiver_done = bob.file_transfers().into_iter().any(|info| {
+                info.transfer_id == replacement && info.status == TransferStatus::IntegrityVerified
+            });
+            sender_done && receiver_done
+        },
+        Duration::from_secs(15),
+    );
+    assert!(bob.abort_file(alice_peer).is_err());
+    bob.cancel_file(alice_peer)
+        .expect("cancel completed release");
 }
 
 #[test]
@@ -1420,8 +1530,17 @@ fn restricted_channel_text_reaches_only_allowed_members() {
         .alice
         .create_channel(conversation_id, "ops", vec![alice_peer, bob_peer])
         .expect("admin creates restricted channel");
+    let metadata_label = format!(
+        "all members see channel metadata; alice={:?} bob={:?} charlie={:?} errors=({:?}, {:?}, {:?})",
+        trio.alice.active_info(),
+        trio.bob.active_info(),
+        trio.charlie.active_info(),
+        trio.alice.last_error(),
+        trio.bob.last_error(),
+        trio.charlie.last_error()
+    );
     wait_for(
-        "all members see channel metadata",
+        &metadata_label,
         || {
             trio.alice.poll();
             trio.bob.poll();
@@ -1432,7 +1551,9 @@ fn restricted_channel_text_reaches_only_allowed_members() {
                     controller.active_info().is_some_and(|info| {
                         info.channels.iter().any(|channel| {
                             channel.channel_id == channel_id
-                                && channel.members == vec![alice_peer, bob_peer]
+                                && channel.members.len() == 2
+                                && channel.members.contains(&alice_peer)
+                                && channel.members.contains(&bob_peer)
                         })
                     })
                 })
@@ -1492,4 +1613,42 @@ fn restricted_channel_text_reaches_only_allowed_members() {
     assert_eq!(trio.alice.last_error(), None);
     assert_eq!(trio.bob.last_error(), None);
     assert_eq!(trio.charlie.last_error(), None);
+}
+
+#[test]
+fn setup_frames_carry_and_sign_transaction_ids_and_reject_v1() {
+    let identity = Identity::generate().expect("identity");
+    let conversation_id = [7u8; 16];
+    let transaction_id = [8u8; 16];
+    let envelope = SetupEnvelope::new(
+        &identity,
+        SetupMessage::WelcomeAck {
+            conversation_id,
+            transaction_id,
+            accepted: true,
+        },
+    )
+    .expect("signed ack");
+    let mut bytes = envelope.to_bytes().expect("encoded ack");
+
+    assert_eq!(&bytes[..4], b"MLS1");
+    assert_eq!(&bytes[4..6], &SETUP_VERSION.to_le_bytes());
+    assert_eq!(&bytes[6..22], &transaction_id);
+
+    let decoded = SetupEnvelope::from_bytes(&bytes).expect("decoded ack");
+    decoded
+        .verify(&identity.peer_id())
+        .expect("valid signature");
+
+    bytes[6] ^= 1;
+    let tampered = SetupEnvelope::from_bytes(&bytes).expect("decoded tampered ack");
+    assert!(matches!(
+        tampered.verify(&identity.peer_id()),
+        Err(ChatError::InvalidSetup(_))
+    ));
+
+    bytes[6] ^= 1;
+    bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
+    let legacy = SetupEnvelope::from_bytes(&bytes).expect_err("version 1 is rejected");
+    assert!(legacy.to_string().contains("version 1"));
 }

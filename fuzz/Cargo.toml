@@ -1,0 +1,61 @@
+[package]
+name = "p2p-fuzz"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+p2p-chat = { path = "../crates/chat" }
+p2p-files = { path = "../crates/files" }
+p2p-identity = { path = "../crates/identity" }
+p2p-messaging = { path = "../crates/messaging" }
+
+[[bin]]
+name = "fuzz_envelope"
+path = "fuzz_targets/fuzz_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_setup"
+path = "fuzz_targets/fuzz_setup.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_file"
+path = "fuzz_targets/fuzz_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_channel"
+path = "fuzz_targets/fuzz_channel.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_identity_export"
+path = "fuzz_targets/fuzz_identity_export.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_contact_uri"
+path = "fuzz_targets/fuzz_contact_uri.rs"
+test = false
+doc = false
+bench = false

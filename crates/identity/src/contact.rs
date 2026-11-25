@@ -161,10 +161,12 @@ impl ContactPayload {
                         .into_owned();
                     display_name = Some(decoded);
                 }
-                other => {
-                    return Err(IdentityError::InvalidContactPayload(format!(
-                        "unknown query field '{other}'"
-                    )));
+                _ => {
+                    // Do not reflect untrusted query keys into errors that may
+                    // be shown in the GUI or written to diagnostics.
+                    return Err(IdentityError::InvalidContactPayload(
+                        "unknown query field".to_owned(),
+                    ));
                 }
             }
         }
@@ -261,7 +263,11 @@ mod tests {
 
         let tampered = format!("{encoded}0");
         assert!(ContactPayload::parse(&tampered).is_err());
-        assert!(ContactPayload::parse(&format!("{encoded}&relay=/dns4/evil")).is_err());
+
+        let unknown_field = format!("{encoded}&EVIL\nFIELD=value");
+        let message = invalid_message(&unknown_field);
+        assert!(message.contains("unknown query field"));
+        assert!(!message.contains("EVIL"));
         assert!(ContactPayload::parse("p2pmsgr://contact/v2/abc?pk=AA").is_err());
     }
 

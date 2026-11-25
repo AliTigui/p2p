@@ -37,7 +37,7 @@ p2p-storage = { path = "crates/storage" }
 
 # Verified in docs/DEPENDENCIES.md. Feature gates are explicit so no browser,
 # image, or webview backend is pulled in by the identity layer.
-libp2p = { version = "=0.56.0", default-features = false, features = [
+libp2p = { version = "=0.57.1", default-features = false, features = [
   "autonat",
   "dcutr",
   "ed25519",
@@ -54,11 +54,10 @@ libp2p = { version = "=0.56.0", default-features = false, features = [
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 libp2p-identity = { version = "0.3.1", features = ["ed25519", "rand", "peerid"] }
-libp2p-request-response = "=0.29.0"
-async-trait = "0.1"
-openmls = "=0.9.2"
-openmls_rust_crypto = "=0.6.0"
-openmls_traits = "=0.6.0"
+libp2p-request-response = "=0.30.0"
+openmls = "=0.10.0-rc.1"
+openmls_rust_crypto = "=0.7.0-rc.1"
+openmls_traits = "=0.7.0-rc.1"
 argon2 = "0.6"
 hkdf = "0.13"
 hmac = "0.13"

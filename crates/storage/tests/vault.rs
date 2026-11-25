@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use p2p_identity::Identity;
-use p2p_storage::{StorageError, Vault};
+use p2p_storage::{ControlRecordOutcome, StorageError, Vault};
 use sha2::{Digest, Sha256};
 
 const USERNAME: &str = "SENTINEL_USER_42";
@@ -55,6 +55,8 @@ fn assert_no_plaintext(directory: &std::path::Path, private_key: &[u8]) {
         directory.join("profile.db"),
         directory.join("profile.db-wal"),
         directory.join("profile.db-shm"),
+        directory.join("control.anchor"),
+        directory.join("control.anchor.tmp"),
     ];
     files.extend(every_file(&directory.join("attachments")));
     for path in files {
@@ -83,6 +85,18 @@ fn assert_no_plaintext(directory: &std::path::Path, private_key: &[u8]) {
             "{name} contains the raw private key"
         );
     }
+}
+
+#[test]
+fn vault_debug_redacts_the_local_directory_path() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let secret_path = directory.path().join("SENTINEL_VAULT_DIRECTORY");
+    let vault = Vault::open(secret_path.clone()).expect("open vault");
+    let debug = format!("{vault:?}");
+
+    assert!(debug.contains("Vault"));
+    assert!(!debug.contains("SENTINEL_VAULT_DIRECTORY"));
+    assert!(!debug.contains(secret_path.to_string_lossy().as_ref()));
 }
 
 #[test]
@@ -519,4 +533,132 @@ fn attachment_deletion_refuses_a_symlink_before_removing_the_record() {
             .file_type()
             .is_symlink()
     );
+}
+
+#[test]
+fn control_log_is_durable_and_idempotent_only_for_requests() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let identity = Identity::generate().expect("identity");
+    let vault = Vault::open(directory.path()).expect("open vault");
+    let peer = b"12D3KooWCONTROLPEER".to_vec();
+    let first = [1u8; 32];
+    let terminal = [2u8; 32];
+    let other_peer = b"12D3KooWOTHERPEER".to_vec();
+
+    let mut session = vault.create(USERNAME, PASSWORD, &identity).expect("create");
+    assert_eq!(
+        session
+            .record_control_frame(&peer, &first, true)
+            .expect("record first request"),
+        ControlRecordOutcome::Appended(1)
+    );
+    assert_eq!(
+        session
+            .record_control_frame(&peer, &first, true)
+            .expect("record repeated request"),
+        ControlRecordOutcome::Idempotent(1)
+    );
+    assert_eq!(
+        session
+            .record_control_frame(&peer, &terminal, false)
+            .expect("record terminal frame"),
+        ControlRecordOutcome::Appended(2)
+    );
+    assert_eq!(
+        session
+            .record_control_frame(&peer, &terminal, false)
+            .expect("record replayed terminal frame"),
+        ControlRecordOutcome::Replay(2)
+    );
+    assert_eq!(
+        session
+            .record_control_frame(&other_peer, &terminal, false)
+            .expect("record peer-specific frame"),
+        ControlRecordOutcome::Appended(3)
+    );
+    session.verify_control_log().expect("verify live log");
+    assert_eq!(session.control_log_state().expect("state").sequence, 3);
+    drop(session);
+
+    let mut reopened = vault.unlock(PASSWORD).expect("unlock");
+    reopened.verify_control_log().expect("verify reopened log");
+    assert_eq!(
+        reopened
+            .record_control_frame(&peer, &terminal, false)
+            .expect("record replay after reopen"),
+        ControlRecordOutcome::Replay(2)
+    );
+    assert_no_plaintext(directory.path(), &identity.export_keypair_bytes());
+}
+
+fn database_snapshot(directory: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fs::read_dir(directory)
+        .expect("read vault directory")
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            if !name.starts_with("profile.db") || !path.is_file() {
+                return None;
+            }
+            Some((path.to_path_buf(), fs::read(&path).expect("read db file")))
+        })
+        .collect()
+}
+
+fn restore_database_snapshot(snapshot: &[(PathBuf, Vec<u8>)]) {
+    for (path, bytes) in snapshot {
+        fs::write(path, bytes).expect("restore db file");
+    }
+}
+
+#[test]
+fn restoring_an_older_database_while_keeping_the_anchor_is_detected() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let identity = Identity::generate().expect("identity");
+    let vault = Vault::open(directory.path()).expect("open vault");
+    let peer = b"12D3KooWCONTROLPEER".to_vec();
+
+    let mut session = vault.create(USERNAME, PASSWORD, &identity).expect("create");
+    session
+        .record_control_frame(&peer, &[7u8; 32], false)
+        .expect("first frame");
+    drop(session);
+    let snapshot = database_snapshot(directory.path());
+
+    let mut session = vault.unlock(PASSWORD).expect("unlock");
+    session
+        .record_control_frame(&peer, &[8u8; 32], false)
+        .expect("second frame");
+    drop(session);
+
+    restore_database_snapshot(&snapshot);
+    assert!(matches!(
+        vault.unlock(PASSWORD),
+        Err(StorageError::RollbackDetected)
+    ));
+}
+
+#[test]
+fn tampered_control_anchor_is_detected() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let identity = Identity::generate().expect("identity");
+    let vault = Vault::open(directory.path()).expect("open vault");
+
+    let mut session = vault.create(USERNAME, PASSWORD, &identity).expect("create");
+    session
+        .record_control_frame(b"12D3KooWCONTROLPEER", &[9u8; 32], false)
+        .expect("frame");
+    drop(session);
+
+    let anchor = directory.path().join("control.anchor");
+    let mut bytes = fs::read(&anchor).expect("read anchor");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    fs::write(&anchor, bytes).expect("write tampered anchor");
+
+    assert!(matches!(
+        vault.unlock(PASSWORD),
+        Err(StorageError::RollbackDetected)
+    ));
 }

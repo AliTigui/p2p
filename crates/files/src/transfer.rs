@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use libp2p_identity::PeerId;
 use p2p_crypto::{KEY_LEN, decrypt_bytes, encrypt_bytes};
@@ -222,6 +222,9 @@ impl OutgoingFile {
         &self,
         identity: &p2p_identity::Identity,
     ) -> Result<FileEnvelope, FileError> {
+        if !self.status.active() {
+            return Err(FileError::UnexpectedFrame);
+        }
         FileEnvelope::new(
             identity,
             FileMessage::Offer {
@@ -242,6 +245,9 @@ impl OutgoingFile {
         &mut self,
         identity: &p2p_identity::Identity,
     ) -> Result<Option<FileEnvelope>, FileError> {
+        if !self.status.active() {
+            return Err(FileError::UnexpectedFrame);
+        }
         if self.next_index >= self.chunk_count {
             return Ok(None);
         }
@@ -273,6 +279,9 @@ impl OutgoingFile {
         &self,
         identity: &p2p_identity::Identity,
     ) -> Result<FileEnvelope, FileError> {
+        if !self.status.active() {
+            return Err(FileError::UnexpectedFrame);
+        }
         FileEnvelope::new(
             identity,
             FileMessage::Manifest {
@@ -294,6 +303,9 @@ impl OutgoingFile {
     /// Record one authenticated chunk acknowledgement. This is transport
     /// progress, not proof of integrity or scanning.
     pub fn mark_acked(&mut self, index: u32, accepted: bool) -> Result<(), FileError> {
+        if !self.status.active() {
+            return Err(FileError::UnexpectedFrame);
+        }
         if index >= self.chunk_count {
             return Err(FileError::UnexpectedChunk);
         }
@@ -309,6 +321,9 @@ impl OutgoingFile {
 
     /// Apply the receiver's final manifest acknowledgement.
     pub fn mark_manifest_ack(&mut self, accepted: bool) {
+        if !self.status.active() {
+            return;
+        }
         self.status = if accepted {
             TransferStatus::IntegrityVerified
         } else {
@@ -318,6 +333,19 @@ impl OutgoingFile {
 
     pub fn mark_failed(&mut self, reason: &'static str) {
         self.status = TransferStatus::Failed(reason);
+    }
+
+    /// Abort this transfer locally. The content key is zeroized and no further
+    /// chunk or manifest frame will be composed. This does not withdraw a
+    /// request already queued in the transport worker; a late response is
+    /// ignored by the application controller.
+    pub fn abort(&mut self, reason: &'static str) -> Result<(), FileError> {
+        if self.status.completed() || matches!(self.status, TransferStatus::Failed(_)) {
+            return Err(FileError::TransferCompleted);
+        }
+        self.content_key = Zeroizing::new([0u8; KEY_LEN]);
+        self.status = TransferStatus::Failed(reason);
+        Ok(())
     }
 
     pub fn all_chunks_acked(&self) -> bool {
@@ -572,6 +600,23 @@ impl IncomingFile {
         self.status = TransferStatus::Failed(reason);
     }
 
+    /// Abort an incomplete incoming transfer. Terminating a transfer is
+    /// distinct from cancelling a release decision: this clears the in-memory
+    /// key, marks the transfer terminal, and removes the partial ciphertext
+    /// quarantine directory because no integrity-verified file exists yet.
+    /// A verified transfer cannot be aborted here; use release cancellation.
+    pub fn abort(&mut self, reason: &'static str) -> Result<(), FileError> {
+        if self.released || self.verified || !self.status.active() {
+            return Err(FileError::TransferCompleted);
+        }
+        self.content_key = Zeroizing::new([0u8; KEY_LEN]);
+        self.approval = ReleaseApproval::Cancelled;
+        self.status = TransferStatus::Failed(reason);
+        remove_quarantine_dir(&self.quarantine_dir)?;
+        self.quarantine_deleted = true;
+        Ok(())
+    }
+
     /// Reassemble plaintext only in a zeroizing memory buffer for an
     /// independent scanner. No bytes are persisted here, and the bytes are
     /// dropped (and zeroized) as soon as the scanner call returns.
@@ -621,8 +666,8 @@ impl IncomingFile {
 
     /// Cancel any pending release decision. Cancellation is terminal for this
     /// transfer; ciphertext stays in quarantine until a separate explicit
-    /// deletion request is allowed by policy. It does not cancel the network
-    /// transfer itself.
+    /// deletion request is allowed by policy. It does not abort an active
+    /// transfer; use [`Self::abort`] for that.
     pub fn cancel(&mut self) -> Result<(), FileError> {
         if self.released {
             return Err(FileError::AlreadyReleased);
@@ -690,13 +735,7 @@ impl IncomingFile {
         if !self.released && self.approval != ReleaseApproval::Cancelled {
             return Err(FileError::QuarantineDeletionDenied);
         }
-        let metadata = fs::symlink_metadata(&self.quarantine_dir)
-            .map_err(|_| FileError::QuarantineDeletionFailed)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(FileError::QuarantineDeletionFailed);
-        }
-        fs::remove_dir_all(&self.quarantine_dir)
-            .map_err(|_| FileError::QuarantineDeletionFailed)?;
+        remove_quarantine_dir(&self.quarantine_dir)?;
         self.quarantine_deleted = true;
         Ok(())
     }
@@ -856,7 +895,10 @@ impl std::fmt::Debug for IncomingFile {
     }
 }
 
-#[cfg(unix)]
+/// Refuse an existing symlink at any already-present path component. This is
+/// deliberately applied on every platform: `symlink_metadata` does not follow
+/// the final component, and on Windows it also rejects ordinary symlinks.
+/// Windows junctions/reparse points still require platform-specific handling.
 fn reject_symlink(path: &Path) -> Result<(), FileError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(FileError::Quarantine),
@@ -866,26 +908,53 @@ fn reject_symlink(path: &Path) -> Result<(), FileError> {
     }
 }
 
-#[cfg(not(unix))]
-fn reject_symlink(_path: &Path) -> Result<(), FileError> {
+/// Walk a path from its root and reject symlinks or parent traversal in every
+/// existing component, not just the final quarantine directory.
+fn reject_unsafe_path_components(path: &Path) -> Result<(), FileError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(part) => {
+                current.push(part);
+                reject_symlink(&current)?;
+            }
+            Component::ParentDir => return Err(FileError::Quarantine),
+        }
+    }
     Ok(())
+}
+
+/// Remove only a transfer's own quarantine directory after rejecting unsafe
+/// path components and a symlink at the final component. This is filesystem
+/// deletion, not secure erasure on SSD/CoW storage.
+fn remove_quarantine_dir(path: &Path) -> Result<(), FileError> {
+    reject_unsafe_path_components(path)?;
+    let metadata = fs::symlink_metadata(path).map_err(|_| FileError::QuarantineDeletionFailed)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(FileError::QuarantineDeletionFailed);
+    }
+    fs::remove_dir_all(path).map_err(|_| FileError::QuarantineDeletionFailed)
 }
 
 #[cfg(unix)]
 fn create_restricted_dir(path: &Path) -> Result<(), FileError> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    reject_symlink(path)?;
+    reject_unsafe_path_components(path)?;
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     builder.mode(0o700);
     builder.create(path).map_err(|_| FileError::Quarantine)?;
-    reject_symlink(path)?;
+    reject_unsafe_path_components(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|_| FileError::Quarantine)
 }
 
 #[cfg(not(unix))]
 fn create_restricted_dir(path: &Path) -> Result<(), FileError> {
-    fs::create_dir_all(path).map_err(|_| FileError::Quarantine)
+    reject_unsafe_path_components(path)?;
+    fs::create_dir_all(path).map_err(|_| FileError::Quarantine)?;
+    reject_unsafe_path_components(path)
 }
 
 #[cfg(unix)]
@@ -931,6 +1000,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn file_config_debug_redacts_the_local_quarantine_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let secret_path = dir.path().join("SENTINEL_QUARANTINE_DIRECTORY");
+        let debug = format!("{:?}", config(&secret_path));
+
+        assert!(debug.contains("quarantine_deletion"));
+        assert!(!debug.contains("SENTINEL_QUARANTINE_DIRECTORY"));
+        assert!(!debug.contains(secret_path.to_string_lossy().as_ref()));
+    }
+
     fn read_all(dir: &Path) -> Vec<u8> {
         let mut all = Vec::new();
         for entry in fs::read_dir(dir).expect("quarantine entries") {
@@ -955,6 +1035,34 @@ mod tests {
 
         assert_eq!(create_restricted_dir(&link), Err(FileError::Quarantine));
         assert_eq!(fs::read_dir(&target).expect("target entries").count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restricted_quarantine_directory_rejects_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let target = directory.path().join("target");
+        fs::create_dir(&target).expect("target directory");
+        let link = directory.path().join("quarantine-parent-link");
+        symlink(&target, &link).expect("parent symlink");
+
+        let path = link.join("child");
+        assert_eq!(create_restricted_dir(&path), Err(FileError::Quarantine));
+        assert_eq!(fs::read_dir(&target).expect("target entries").count(), 0);
+    }
+
+    #[test]
+    fn restricted_quarantine_directory_rejects_parent_traversal() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory
+            .path()
+            .join("quarantine")
+            .join("..")
+            .join("escaped");
+        assert_eq!(create_restricted_dir(&path), Err(FileError::Quarantine));
+        assert!(!directory.path().join("escaped").exists());
     }
 
     #[test]
@@ -1020,6 +1128,44 @@ mod tests {
             incoming.accept_chunk(&tampered),
             Err(FileError::Crypto)
         ));
+    }
+
+    #[test]
+    fn abort_clears_partial_transfer_state_and_quarantine() {
+        let sender = p2p_identity::Identity::generate().expect("sender");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let source = dir.path().join("file.bin");
+        fs::write(&source, vec![13u8; 100]).expect("source");
+        let mut outgoing = OutgoingFile::new(&source).expect("outgoing");
+        let offer = outgoing.offer_frame(&sender).expect("offer");
+        let quarantine_root = dir.path().join("quarantine");
+        let mut incoming = IncomingFile::new(&offer, sender.peer_id(), &config(&quarantine_root))
+            .expect("incoming");
+        let chunk = outgoing
+            .next_chunk_frame(&sender)
+            .expect("chunk")
+            .expect("one chunk");
+        incoming.accept_chunk(&chunk).expect("partial chunk");
+
+        let transfer_dir = quarantine_root.join(hex(incoming.transfer_id()));
+        assert!(transfer_dir.exists());
+        outgoing
+            .abort("Transfer aborted by user")
+            .expect("abort outgoing");
+        incoming
+            .abort("Transfer aborted by user")
+            .expect("abort incoming");
+
+        assert_eq!(
+            incoming.status(),
+            crate::TransferStatus::Failed("Transfer aborted by user")
+        );
+        assert_eq!(incoming.approval(), ReleaseApproval::Cancelled);
+        assert!(incoming.quarantine_deleted());
+        assert!(!transfer_dir.exists());
+        assert!(incoming.accept_chunk(&chunk).is_err());
+        assert!(outgoing.next_chunk_frame(&sender).is_err());
+        assert!(incoming.abort("Again").is_err());
     }
 
     #[test]

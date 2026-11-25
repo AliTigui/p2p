@@ -7,7 +7,7 @@
 The brief requires established cryptographic protocols, forward secrecy, post-compromise security, and group messaging via OpenMLS (RFC 9420). Maintaining a separate 1:1 protocol doubles audit surface and risks inconsistent security properties.
 
 ## Decision
-All conversations are MLS groups. A private chat is a 2-member MLS group. OpenMLS 0.9.2 with `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` is the single conversation encryption path. Channels are logical partitions inside a group's MLS application messages with locally verified policy, because MLS has no native sub-group construct.
+All conversations are MLS groups. A private chat is a 2-member MLS group. OpenMLS 0.10.0-rc.1 with `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` is the single conversation encryption path. The RC line carries the patched RustCrypto big-integer dependency; this is a security-remmediation choice, not a production-stability or certification claim. Channels are logical partitions inside a group's MLS application messages with locally verified policy, because MLS has no native sub-group construct.
 
 ## Consequences
 - One protocol to review and test; membership changes and key rotation behave consistently.

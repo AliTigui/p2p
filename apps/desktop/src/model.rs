@@ -388,7 +388,7 @@ pub fn security_rows(
         privacy.relay_servers
     );
     let relay_observations = format!(
-        "{} reservation(s) · {} circuit(s) · {} relayed connection(s) · no trust implied",
+        "{} reservation event(s) observed since startup · {} circuit event(s) observed since startup · {} relayed connection(s) live at last observation · no trust implied",
         privacy.relay_reservations, privacy.relay_circuits, privacy.relayed_connections
     );
 
@@ -547,7 +547,7 @@ pub fn security_rows(
         StatusRow {
             label: "Identify observation",
             value: format!(
-                "{} peer(s) identified · transport metadata only",
+                "{} identify event(s) observed since startup · transport metadata only",
                 privacy.identified_peers
             ),
         },
@@ -940,8 +940,14 @@ mod tests {
         assert!(value("Discovery candidates").contains("2 mDNS candidate(s)"));
         assert!(value("Discovery candidates").contains("advisory only"));
         assert!(value("Relay configuration").contains("reservation not implied"));
-        assert!(value("Relay observations").contains("1 reservation(s)"));
-        assert!(value("Identify observation").contains("4 peer(s) identified"));
+        assert!(
+            value("Relay observations").contains("1 reservation event(s) observed since startup")
+        );
+        assert!(value("Relay observations").contains("1 circuit event(s) observed since startup"));
+        assert!(value("Relay observations").contains("5 relayed connection(s) live"));
+        assert!(
+            value("Identify observation").contains("4 identify event(s) observed since startup")
+        );
         assert!(value("NAT observation").contains("no AutoNAT observation"));
         assert!(value("Anonymity").contains("No Tor/I2P/mixnet"));
     }

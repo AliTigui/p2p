@@ -164,7 +164,7 @@ impl MessengerApp {
 
     /// Start the direct-connect worker and MLS controller with the unlocked
     /// vault identity. No peer is contacted until the user supplies an address.
-    fn start_chat(&mut self, identity: &Identity) {
+    fn start_chat(&mut self, session: &Session) {
         self.chat = None;
         self.chat_error = None;
         self.peer_address.clear();
@@ -180,7 +180,14 @@ impl MessengerApp {
                 return;
             }
         };
-        match MessengerController::start(identity, config) {
+        let storage = match session.try_clone() {
+            Ok(storage) => storage,
+            Err(error) => {
+                self.chat_error = Some(error.to_string());
+                return;
+            }
+        };
+        match MessengerController::start_with_control_log(session.identity(), config, storage) {
             Ok(chat) => self.chat = Some(chat),
             Err(error) => self.chat_error = Some(error.to_string()),
         }
@@ -478,14 +485,27 @@ impl MessengerApp {
         }
     }
 
-    /// Cancellation is terminal for release and does not delete ciphertext or
-    /// cancel the network transfer.
+    /// Cancellation is terminal for an already completed release decision.
+    /// Active transfers use abort instead.
     fn cancel_file(&mut self, peer: PeerId) {
         let Some(chat) = self.chat.as_mut() else {
             self.chat_error = Some("Network is not running".to_owned());
             return;
         };
         match chat.cancel_file(peer) {
+            Ok(()) => self.chat_error = None,
+            Err(error) => self.chat_error = Some(error.to_string()),
+        }
+    }
+
+    /// Abort an active transfer. This stops local progress and discards
+    /// incomplete ciphertext; it does not delete a verified release.
+    fn abort_file(&mut self, peer: PeerId) {
+        let Some(chat) = self.chat.as_mut() else {
+            self.chat_error = Some("Network is not running".to_owned());
+            return;
+        };
+        match chat.abort_file(peer) {
             Ok(()) => self.chat_error = None,
             Err(error) => self.chat_error = Some(error.to_string()),
         }
@@ -552,7 +572,7 @@ impl MessengerApp {
                 .show(ui, |ui| {
                     ui.add(
                         TextEdit::singleline(&mut self.search)
-                            .id(Id::unique(SEARCH_ID))
+                            .id(Id::new(SEARCH_ID))
                             .hint_text("Search (Ctrl/⌘+K)"),
                     );
                     ui.add_space(8.0);
@@ -1113,6 +1133,9 @@ impl MessengerApp {
                             .small()
                             .weak(),
                         );
+                        if transfer.status.active() && ui.button("Abort transfer").clicked() {
+                            self.abort_file(transfer.peer);
+                        }
                         if transfer.direction == TransferDirection::Incoming && !transfer.released {
                             if transfer.status.completed()
                                 && matches!(
@@ -1165,7 +1188,7 @@ impl MessengerApp {
         }
         ui.label(
             RichText::new(
-                "Incoming ciphertext is quarantined. Structural validation supports TXT, PNG, and GIF only; it is not malware detection. Integrity verification is not a scan, and scanning is unavailable without an independent scanner. Release requires a clean scanner result, a validated format, an allowed extension, and explicit per-file approval; released bytes are copied into the encrypted vault, never written as plaintext here. Quarantine ciphertext is retained by default and is deleted only by an explicit request where policy permits; filesystem deletion is not secure erasure. This app configures no scanner or allowed extensions, so no release action appears by default.",
+                "Incoming ciphertext is quarantined. Structural validation supports TXT, PNG, and GIF only; it is not malware detection. Integrity verification is not a scan, and scanning is unavailable without an independent scanner. Release requires a clean scanner result, a validated format, an allowed extension, and explicit per-file approval; released bytes are copied into the encrypted vault, never written as plaintext here. Quarantine ciphertext for a verified transfer is retained by default and is deleted only by an explicit request where policy permits; aborting an incomplete transfer removes its partial ciphertext. Active transfers have an inactivity timeout and can be aborted; release cancellation applies only after verification. Filesystem deletion is not secure erasure. This app configures no scanner or allowed extensions, so no release action appears by default.",
             )
             .small()
             .weak(),
@@ -1343,7 +1366,7 @@ impl MessengerApp {
                             params.parallelism
                         ),
                     };
-                    self.start_chat(session.identity());
+                    self.start_chat(&session);
                     self.session = Some(session);
                     self.state = VaultState::Unlocked(info);
                     self.form_error = None;
@@ -1404,7 +1427,7 @@ impl MessengerApp {
         });
 
         if focus_search {
-            ctx.memory_mut(|memory| memory.request_focus(Id::unique(SEARCH_ID)));
+            ctx.memory_mut(|memory| memory.request_focus(Id::new(SEARCH_ID)));
         }
         if clear_search {
             self.search.clear();

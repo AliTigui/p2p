@@ -8,7 +8,7 @@
 The original brief specified Tauri 2 + React + TypeScript + Vite. During Milestone 1 the user questioned why npm, TypeScript, and a browser/webview are needed and chose a pure Rust GUI instead. A React app cannot render without a DOM implementation; Tauri provides one via the OS webview. A pure-Rust toolkit removes the webview, JavaScript toolchain, and npm entirely.
 
 ## Decision
-Use **egui 0.37** for widget descriptions and **eframe 0.37** for native OS windows. There is no React, TypeScript, Node.js, npm, Vite, Tailwind, webview, or browser in the application or build.
+Use **egui 0.35** for widget descriptions and **eframe 0.35** for native OS windows. There is no React, TypeScript, Node.js, npm, Vite, Tailwind, webview, or browser in the application or build. The 0.37 line was replaced to resolve the `js-sys` conflict with libp2p 0.57; the GUI remains pure Rust and feature-gated.
 
 Feature layout:
 - `gui` (optional dep `egui`): compiles all widget/model code without display libraries.

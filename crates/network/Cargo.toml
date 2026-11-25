@@ -12,7 +12,6 @@ p2p-core.workspace = true
 p2p-identity.workspace = true
 libp2p.workspace = true
 libp2p-request-response.workspace = true
-async-trait.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 

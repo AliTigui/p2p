@@ -21,9 +21,20 @@ use p2p_network::{
     Network, NetworkConfig, NetworkPrivacyStatus, SetupEvent, SetupResponseId,
 };
 use p2p_security::{ScanRequest, ScanStatus, SecurityConfig};
+use p2p_storage::{ControlRecordOutcome, Session};
+use sha2::{Digest, Sha256};
 
 use crate::channel::{ChannelFrame, ChannelFrameKind, DEFAULT_CHANNEL_ID, MAX_CHANNELS_PER_GROUP};
+use crate::setup::TransactionId;
 use crate::{ChatError, SetupEnvelope, SetupMessage};
+
+/// Default maximum quiet period for one active file transfer. The timer is
+/// reset by authenticated progress, so a slow transfer with steady
+/// acknowledgements is not interrupted.
+pub const DEFAULT_FILE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Upper bound accepted by [`MessengerController::start_with_transfer_timeout`].
+pub const MAX_FILE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// How far a 1:1 MLS setup has progressed. A `Joined` status on the inviter
 /// requires a verified WelcomeAck; on the joiner it requires a verified
@@ -168,6 +179,9 @@ impl fmt::Debug for ChatMessage {
 }
 
 struct PendingOperation {
+    /// Fresh random ID chosen by the local admin; every request, Welcome,
+    /// commit, and acknowledgement for this operation carries it.
+    transaction_id: TransactionId,
     operation: GroupOperation,
     target: Option<PeerId>,
     commit: Vec<u8>,
@@ -180,6 +194,7 @@ struct PendingOperation {
 impl fmt::Debug for PendingOperation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PendingOperation")
+            .field("transaction_id", &hex(&self.transaction_id))
             .field("operation", &self.operation)
             .field("target", &self.target)
             .field("awaited", &self.awaited)
@@ -340,9 +355,48 @@ impl fmt::Debug for ConversationState {
     }
 }
 
+/// Which setup request produced a retained KeyPackage provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingKeyPackageKind {
+    Conversation,
+    GroupJoin,
+}
+
 struct PendingKeyPackage {
     peer: PeerId,
+    kind: PendingKeyPackageKind,
     key_package: MlsKeyPackage,
+    /// Keep the exact encoded response so an identical duplicate request can
+    /// be answered idempotently without regenerating or replacing the provider.
+    response_bytes: Vec<u8>,
+}
+
+/// What kind of response completes one locally initiated setup request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutgoingSetupKind {
+    KeyPackageRequest,
+    Welcome,
+    GroupJoinRequest,
+}
+
+#[derive(Debug, Clone)]
+struct OutgoingSetup {
+    conversation_id: [u8; 16],
+    transaction_id: TransactionId,
+    kind: OutgoingSetupKind,
+}
+
+impl OutgoingSetupKind {
+    fn from_message(message: &SetupMessage) -> Result<Self, ChatError> {
+        match message {
+            SetupMessage::KeyPackageRequest { .. } => Ok(Self::KeyPackageRequest),
+            SetupMessage::Welcome { .. } => Ok(Self::Welcome),
+            SetupMessage::GroupJoinRequest { .. } => Ok(Self::GroupJoinRequest),
+            _ => Err(ChatError::InvalidSetup(
+                "unexpected outbound setup request type",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,9 +408,34 @@ enum GroupRequestKind {
 #[derive(Debug, Clone, Copy)]
 struct GroupRequest {
     conversation_id: [u8; 16],
+    transaction_id: TransactionId,
     peer: PeerId,
     operation: GroupOperation,
     kind: GroupRequestKind,
+}
+
+/// State change from an inbound setup request plus the response to hand back
+/// to the transport. Keeping these together lets validation reject a frame
+/// before any group state is touched while still sending rejection acks.
+struct RequestOutcome {
+    response: Option<SetupMessage>,
+    rejection: Option<ChatError>,
+}
+
+impl RequestOutcome {
+    fn respond(message: SetupMessage) -> Self {
+        Self {
+            response: Some(message),
+            rejection: None,
+        }
+    }
+
+    fn respond_and_reject(message: SetupMessage, error: ChatError) -> Self {
+        Self {
+            response: Some(message),
+            rejection: Some(error),
+        }
+    }
 }
 
 /// One signed MLS ciphertext envelope waiting for a reconnect. The plaintext
@@ -397,6 +476,14 @@ enum FileRequestKind {
         peer: PeerId,
         transfer_id: [u8; 16],
     },
+}
+
+/// Inactivity deadline for one active file transfer. Only the public transfer
+/// ID and a monotonic deadline are retained; no file bytes or keys are stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransferDeadline {
+    transfer_id: [u8; 16],
+    expires_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -440,6 +527,36 @@ enum RedialSlot {
     },
 }
 
+/// Bounded in-memory replay guard for verified setup and group-control frames.
+/// Only `(PeerId, SHA-256 digest)` pairs are retained; no KeyPackage, Welcome,
+/// commit, signature, or other frame bytes are stored.
+const MAX_SETUP_REPLAY_ENTRIES: usize = 512;
+
+#[derive(Debug, Default)]
+struct SetupReplayCache {
+    seen: HashSet<(PeerId, [u8; 32])>,
+    order: VecDeque<(PeerId, [u8; 32])>,
+}
+
+impl SetupReplayCache {
+    /// Record one authenticated frame. Returns `false` when the exact frame
+    /// from the same authenticated peer was already seen in the current window.
+    fn remember(&mut self, peer: PeerId, bytes: &[u8]) -> bool {
+        let digest: [u8; 32] = Sha256::digest(bytes).into();
+        let key = (peer, digest);
+        if !self.seen.insert(key) {
+            return false;
+        }
+        self.order.push_back(key);
+        while self.order.len() > MAX_SETUP_REPLAY_ENTRIES {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        true
+    }
+}
+
 /// Owns the Swarm, MLS sessions, and decrypted view model for the application.
 /// Public methods are safe to call from a GUI frame; all blocking libp2p work
 /// stays inside the network worker thread.
@@ -448,13 +565,14 @@ pub struct MessengerController {
     network: Network,
     conversations: HashMap<[u8; 16], ConversationState>,
     peer_conversations: HashMap<PeerId, [u8; 16]>,
-    pending_key_packages: HashMap<[u8; 16], PendingKeyPackage>,
-    outstanding_setup: HashMap<p2p_network::SetupRequestId, [u8; 16]>,
+    pending_key_packages: HashMap<([u8; 16], TransactionId), PendingKeyPackage>,
+    outstanding_setup: HashMap<p2p_network::SetupRequestId, OutgoingSetup>,
     group_requests: HashMap<p2p_network::SetupRequestId, GroupRequest>,
     outstanding_messages: HashMap<MessageRequestId, [u8; 16]>,
     message_conversations: HashMap<[u8; 16], [u8; 16]>,
     pending_receipts: HashMap<[u8; 16], BTreeSet<PeerId>>,
     applied_commits: HashMap<[u8; 16], HashSet<Vec<u8>>>,
+    setup_replay: SetupReplayCache,
     offline_queue: VecDeque<QueuedMessage>,
     redial_config: RedialConfig,
     dialed_addresses: HashMap<PeerId, Multiaddr>,
@@ -468,6 +586,9 @@ pub struct MessengerController {
     outgoing_files: HashMap<PeerId, OutgoingFile>,
     incoming_files: HashMap<PeerId, IncomingFile>,
     file_requests: HashMap<FileRequestId, FileRequestKind>,
+    transfer_timeout: Duration,
+    transfer_deadlines: HashMap<PeerId, TransferDeadline>,
+    storage: Option<Session>,
     last_error: Option<String>,
 }
 
@@ -478,6 +599,102 @@ impl MessengerController {
     /// `Unavailable` and release is denied.
     pub fn start(identity: &Identity, config: NetworkConfig) -> Result<Self, ChatError> {
         Self::start_with_file_config(identity, config, FileConfig::default())
+    }
+
+    /// Start with an independent connection to the unlocked vault so already
+    /// authenticated setup/group-control frames are rejected durably, including
+    /// after an application restart. The vault identity must be this session's
+    /// identity. This does not restore MLS group state.
+    pub fn start_with_control_log(
+        identity: &Identity,
+        config: NetworkConfig,
+        storage: Session,
+    ) -> Result<Self, ChatError> {
+        Self::build(
+            identity,
+            config,
+            FileConfig::default(),
+            SecurityConfig::default(),
+            DEFAULT_FILE_TRANSFER_TIMEOUT,
+            Some(storage),
+        )
+    }
+
+    /// Start with an explicit file-transfer inactivity timeout. Values below
+    /// 1 ms or above [`MAX_FILE_TRANSFER_TIMEOUT`] are rejected so a caller
+    /// cannot accidentally disable the lifetime bound or make it unusably
+    /// short. Existing constructors use
+    /// [`DEFAULT_FILE_TRANSFER_TIMEOUT`].
+    pub fn start_with_transfer_timeout(
+        identity: &Identity,
+        config: NetworkConfig,
+        file_config: FileConfig,
+        security_config: SecurityConfig,
+        transfer_timeout: Duration,
+    ) -> Result<Self, ChatError> {
+        Self::build(
+            identity,
+            config,
+            file_config,
+            security_config,
+            transfer_timeout,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        identity: &Identity,
+        config: NetworkConfig,
+        file_config: FileConfig,
+        security_config: SecurityConfig,
+        transfer_timeout: Duration,
+        storage: Option<Session>,
+    ) -> Result<Self, ChatError> {
+        if transfer_timeout < Duration::from_millis(1)
+            || transfer_timeout > MAX_FILE_TRANSFER_TIMEOUT
+        {
+            return Err(ChatError::InvalidTransferTimeout);
+        }
+        if storage
+            .as_ref()
+            .is_some_and(|vault| vault.identity().peer_id() != identity.peer_id())
+        {
+            return Err(ChatError::ControlLogIdentityMismatch);
+        }
+        let redial_config = RedialConfig::from(&config);
+        let network = Network::start(identity, config)?;
+        Ok(Self {
+            identity: identity.clone(),
+            network,
+            conversations: HashMap::new(),
+            peer_conversations: HashMap::new(),
+            pending_key_packages: HashMap::new(),
+            outstanding_setup: HashMap::new(),
+            group_requests: HashMap::new(),
+            outstanding_messages: HashMap::new(),
+            message_conversations: HashMap::new(),
+            pending_receipts: HashMap::new(),
+            applied_commits: HashMap::new(),
+            setup_replay: SetupReplayCache::default(),
+            offline_queue: VecDeque::new(),
+            redial_config,
+            dialed_addresses: HashMap::new(),
+            redial: HashMap::new(),
+            connected_peers: BTreeSet::new(),
+            messages: Vec::new(),
+            active: None,
+            active_channel: HashMap::new(),
+            file_config,
+            security_config,
+            outgoing_files: HashMap::new(),
+            incoming_files: HashMap::new(),
+            file_requests: HashMap::new(),
+            transfer_timeout,
+            transfer_deadlines: HashMap::new(),
+            storage,
+            last_error: None,
+        })
     }
 
     /// Start with an explicit quarantine directory. Tests and installers can
@@ -499,35 +716,13 @@ impl MessengerController {
         file_config: FileConfig,
         security_config: SecurityConfig,
     ) -> Result<Self, ChatError> {
-        let redial_config = RedialConfig::from(&config);
-        let network = Network::start(identity, config)?;
-        Ok(Self {
-            identity: identity.clone(),
-            network,
-            conversations: HashMap::new(),
-            peer_conversations: HashMap::new(),
-            pending_key_packages: HashMap::new(),
-            outstanding_setup: HashMap::new(),
-            group_requests: HashMap::new(),
-            outstanding_messages: HashMap::new(),
-            message_conversations: HashMap::new(),
-            pending_receipts: HashMap::new(),
-            applied_commits: HashMap::new(),
-            offline_queue: VecDeque::new(),
-            redial_config,
-            dialed_addresses: HashMap::new(),
-            redial: HashMap::new(),
-            connected_peers: BTreeSet::new(),
-            messages: Vec::new(),
-            active: None,
-            active_channel: HashMap::new(),
+        Self::start_with_transfer_timeout(
+            identity,
+            config,
             file_config,
             security_config,
-            outgoing_files: HashMap::new(),
-            incoming_files: HashMap::new(),
-            file_requests: HashMap::new(),
-            last_error: None,
-        })
+            DEFAULT_FILE_TRANSFER_TIMEOUT,
+        )
     }
 
     pub fn identity(&self) -> &Identity {
@@ -573,6 +768,7 @@ impl MessengerController {
     /// Drain all pending transport events. Invalid or rejected events are
     /// surfaced through [`Self::last_error`]; they never create fake state.
     pub fn poll(&mut self) {
+        self.sweep_transfer_timeouts();
         let mut actions = Vec::new();
         while let Some(state) = self.network.poll_event() {
             match state {
@@ -767,10 +963,15 @@ impl MessengerController {
 
         let conversation = MlsConversation::new(&self.identity)?;
         let conversation_id = conversation.id();
+        let transaction_id = random_id()?;
         self.send_setup(
             &peer,
-            SetupMessage::KeyPackageRequest { conversation_id },
+            SetupMessage::KeyPackageRequest {
+                conversation_id,
+                transaction_id,
+            },
             conversation_id,
+            transaction_id,
         )?;
         let members = BTreeSet::from([self.identity.peer_id(), peer]);
         let mut state = ConversationState::new(conversation, self.identity.peer_id(), members);
@@ -1055,10 +1256,15 @@ impl MessengerController {
         if state.members.contains(&peer) {
             return Err(ChatError::AlreadyEstablished);
         }
+        let transaction_id = random_id()?;
         self.send_setup(
             &peer,
-            SetupMessage::GroupJoinRequest { conversation_id },
+            SetupMessage::GroupJoinRequest {
+                conversation_id,
+                transaction_id,
+            },
             conversation_id,
+            transaction_id,
         )
     }
 
@@ -1071,6 +1277,7 @@ impl MessengerController {
         peer: PeerId,
     ) -> Result<(), ChatError> {
         let local = self.identity.peer_id();
+        let transaction_id = random_id()?;
         if peer == local {
             return Err(ChatError::InvalidGroupTarget("self-removal is not allowed"));
         }
@@ -1101,6 +1308,7 @@ impl MessengerController {
                 .map(|member| (member, false))
                 .collect();
             state.pending_operation = Some(PendingOperation {
+                transaction_id,
                 operation: GroupOperation::Remove,
                 target: Some(peer),
                 commit,
@@ -1117,6 +1325,7 @@ impl MessengerController {
     /// Every other member must acknowledge it before the operation completes.
     pub fn update_member_key(&mut self, conversation_id: [u8; 16]) -> Result<(), ChatError> {
         let local = self.identity.peer_id();
+        let transaction_id = random_id()?;
         {
             let state = self
                 .conversations
@@ -1137,6 +1346,7 @@ impl MessengerController {
                 .map(|member| (member, false))
                 .collect();
             state.pending_operation = Some(PendingOperation {
+                transaction_id,
                 operation: GroupOperation::Update,
                 target: None,
                 commit,
@@ -1188,6 +1398,13 @@ impl MessengerController {
         Ok(())
     }
 
+    /// Number of outbound file frames whose transport responses are still
+    /// being tracked. This is a public count only; no file bytes or keys are
+    /// exposed. It returns to zero on completion, failure, timeout, or abort.
+    pub fn pending_file_requests(&self) -> usize {
+        self.file_requests.len()
+    }
+
     /// Number of signed ciphertext envelopes waiting for a reconnect with the
     /// given peer. This count is public metadata; no text or ciphertext is
     /// exposed through this accessor.
@@ -1211,11 +1428,11 @@ impl MessengerController {
         if self
             .outgoing_files
             .get(&peer)
-            .is_some_and(|transfer| !transfer.status().completed())
+            .is_some_and(|transfer| transfer.status().active())
             || self
                 .incoming_files
                 .get(&peer)
-                .is_some_and(|transfer| !transfer.status().completed())
+                .is_some_and(|transfer| transfer.status().active())
         {
             return Err(ChatError::FileTransferLimit);
         }
@@ -1231,6 +1448,7 @@ impl MessengerController {
         self.file_requests
             .insert(request_id, FileRequestKind::Offer { peer, transfer_id });
         self.outgoing_files.insert(peer, outgoing);
+        self.start_transfer_deadline(peer, transfer_id);
         Ok(transfer_id)
     }
 
@@ -1337,21 +1555,41 @@ impl MessengerController {
         Ok(incoming.approve(&policy)?)
     }
 
-    /// Cancel a pending or approved in-memory release. This does not delete
-    /// quarantine ciphertext and does not cancel the network transfer itself.
+    /// Cancel a pending or approved in-memory release for a completed transfer.
+    /// This is deliberately separate from aborting a transfer: it does not
+    /// delete quarantine ciphertext and does not affect an active transfer.
     pub fn cancel_file(&mut self, peer: PeerId) -> Result<(), ChatError> {
         let incoming = self
             .incoming_files
             .get_mut(&peer)
             .ok_or(ChatError::FileTransferMissing)?;
+        if !incoming.status().completed() {
+            return Err(ChatError::FileTransferNotComplete);
+        }
         Ok(incoming.cancel()?)
+    }
+
+    /// Abort the active transfer with one peer. This stops new file frames,
+    /// drops pending response bookkeeping, clears the in-memory key, and
+    /// removes incomplete quarantine ciphertext. A transport request already
+    /// queued in the worker cannot be withdrawn through the pinned
+    /// request-response API, so any late response is ignored rather than
+    /// applied. A completed transfer is not abortable; use `cancel_file` for
+    /// its release decision.
+    pub fn abort_file(&mut self, peer: PeerId) -> Result<(), ChatError> {
+        let deadline = self
+            .transfer_deadlines
+            .get(&peer)
+            .copied()
+            .ok_or(ChatError::FileTransferNotActive)?;
+        self.abort_transfer(peer, deadline.transfer_id, "Transfer aborted by user")
     }
 
     /// Explicitly delete one incoming transfer's quarantine ciphertext after a
     /// verified transfer has been released or its release was cancelled. This
     /// is denied under the default `Retain` policy and never deletes plaintext
-    /// or cancels the network transfer. Filesystem deletion is not secure
-    /// erasure on SSD/CoW storage.
+    /// or aborts an active transfer. Filesystem deletion is not secure erasure
+    /// on SSD/CoW storage.
     pub fn delete_file_quarantine(&mut self, peer: PeerId) -> Result<(), ChatError> {
         let incoming = self
             .incoming_files
@@ -1548,13 +1786,10 @@ impl MessengerController {
     }
 
     fn is_connected(&self, peer: &PeerId) -> bool {
-        let Ok(swarm_peer) = swarm_peer(peer) else {
-            return false;
-        };
-        matches!(
-            self.network.state(),
-            ConnectionState::Connected { peers } if peers.contains(&swarm_peer)
-        )
+        // Use the controller's own projection of observed Connected events.
+        // A transient peerless transport failure is advisory and must not make
+        // already-authenticated peers look offline.
+        self.connected_peers.contains(peer)
     }
 
     fn set_status(&mut self, conversation_id: [u8; 16], status: ConversationStatus) {
@@ -1587,6 +1822,11 @@ impl MessengerController {
         message: SetupMessage,
         request: GroupRequest,
     ) -> Result<(), ChatError> {
+        if message.transaction_id() != &request.transaction_id {
+            return Err(ChatError::InvalidSetup(
+                "group request transaction ID mismatch",
+            ));
+        }
         let frame = SetupEnvelope::new(&self.identity, message)?;
         let request_id = self
             .network
@@ -1602,7 +1842,8 @@ impl MessengerController {
         let Some(operation) = state.pending_operation.as_ref() else {
             return Ok(());
         };
-        let (op, target, commit, awaited, welcome_target, welcome) = (
+        let (transaction_id, op, target, commit, awaited, welcome_target, welcome) = (
+            operation.transaction_id,
             operation.operation,
             operation.target,
             operation.commit.clone(),
@@ -1616,6 +1857,7 @@ impl MessengerController {
                 if self.is_connected(&joiner) {
                     let request = GroupRequest {
                         conversation_id,
+                        transaction_id,
                         peer: joiner,
                         operation: GroupOperation::Add,
                         kind: GroupRequestKind::Welcome,
@@ -1624,6 +1866,7 @@ impl MessengerController {
                         &joiner,
                         SetupMessage::GroupWelcome {
                             conversation_id,
+                            transaction_id,
                             welcome,
                         },
                         request,
@@ -1650,6 +1893,7 @@ impl MessengerController {
             }
             let request = GroupRequest {
                 conversation_id,
+                transaction_id,
                 peer,
                 operation: op,
                 kind: GroupRequestKind::Commit,
@@ -1658,6 +1902,7 @@ impl MessengerController {
                 &peer,
                 SetupMessage::GroupCommit {
                     conversation_id,
+                    transaction_id,
                     operation: op,
                     target,
                     commit: commit.clone(),
@@ -1681,6 +1926,7 @@ impl MessengerController {
                     continue;
                 };
                 (
+                    operation.transaction_id,
                     operation.operation,
                     operation.target,
                     operation.commit.clone(),
@@ -1690,13 +1936,23 @@ impl MessengerController {
                     operation.welcome_acked,
                 )
             };
-            let (op, target, commit, awaited, welcome_target, welcome, welcome_acked) = snapshot;
+            let (
+                transaction_id,
+                op,
+                target,
+                commit,
+                awaited,
+                welcome_target,
+                welcome,
+                welcome_acked,
+            ) = snapshot;
             if welcome_target == Some(*peer)
                 && !welcome_acked
                 && let Some(welcome) = welcome
             {
                 let request = GroupRequest {
                     conversation_id,
+                    transaction_id,
                     peer: *peer,
                     operation: GroupOperation::Add,
                     kind: GroupRequestKind::Welcome,
@@ -1705,6 +1961,7 @@ impl MessengerController {
                     peer,
                     SetupMessage::GroupWelcome {
                         conversation_id,
+                        transaction_id,
                         welcome,
                     },
                     request,
@@ -1715,6 +1972,7 @@ impl MessengerController {
             if awaited == Some(false) {
                 let request = GroupRequest {
                     conversation_id,
+                    transaction_id,
                     peer: *peer,
                     operation: op,
                     kind: GroupRequestKind::Commit,
@@ -1723,6 +1981,7 @@ impl MessengerController {
                     peer,
                     SetupMessage::GroupCommit {
                         conversation_id,
+                        transaction_id,
                         operation: op,
                         target,
                         commit,
@@ -1765,7 +2024,12 @@ impl MessengerController {
 
     fn remove_local_conversation(&mut self, conversation_id: [u8; 16]) {
         self.conversations.remove(&conversation_id);
-        self.pending_key_packages.remove(&conversation_id);
+        self.pending_key_packages
+            .retain(|(id, _), _| *id != conversation_id);
+        self.outstanding_setup
+            .retain(|_, setup| setup.conversation_id != conversation_id);
+        self.group_requests
+            .retain(|_, request| request.conversation_id != conversation_id);
         self.applied_commits.remove(&conversation_id);
         self.active_channel.remove(&conversation_id);
         self.peer_conversations
@@ -1791,12 +2055,26 @@ impl MessengerController {
         peer: &PeerId,
         message: SetupMessage,
         conversation_id: [u8; 16],
+        transaction_id: TransactionId,
     ) -> Result<(), ChatError> {
+        if message.conversation_id() != &conversation_id
+            || message.transaction_id() != &transaction_id
+        {
+            return Err(ChatError::InvalidSetup("outbound setup IDs mismatch"));
+        }
+        let kind = OutgoingSetupKind::from_message(&message)?;
         let frame = SetupEnvelope::new(&self.identity, message)?;
         let request_id = self
             .network
             .send_setup(swarm_peer(peer)?, frame.to_bytes()?)?;
-        self.outstanding_setup.insert(request_id, conversation_id);
+        self.outstanding_setup.insert(
+            request_id,
+            OutgoingSetup {
+                conversation_id,
+                transaction_id,
+                kind,
+            },
+        );
         Ok(())
     }
 
@@ -1821,6 +2099,37 @@ impl MessengerController {
         Ok((peer, frame))
     }
 
+    /// Only requests that can be retried after a lost response remain
+    /// idempotent. Terminal frames and every acknowledgement are one-shot.
+    fn is_repeatable_setup_message(message: &SetupMessage) -> bool {
+        matches!(
+            message,
+            SetupMessage::KeyPackageRequest { .. } | SetupMessage::GroupJoinRequest { .. }
+        )
+    }
+
+    /// Consult the durable control log before mutating any controller state.
+    /// Without an attached vault the existing in-memory cache remains the only
+    /// replay boundary; with one, a non-repeatable replay is ignored before it
+    /// can clear correlation or enter the in-memory cache.
+    fn durable_control_allows(
+        &mut self,
+        peer: PeerId,
+        bytes: &[u8],
+        repeatable: bool,
+    ) -> Result<bool, ChatError> {
+        let Some(storage) = self.storage.as_mut() else {
+            return Ok(true);
+        };
+        let digest: [u8; 32] = Sha256::digest(bytes).into();
+        Ok(
+            match storage.record_control_frame(&peer.to_bytes(), &digest, repeatable)? {
+                ControlRecordOutcome::Appended(_) | ControlRecordOutcome::Idempotent(_) => true,
+                ControlRecordOutcome::Replay(_) => false,
+            },
+        )
+    }
+
     fn handle_setup_event(&mut self, event: SetupEvent) -> Result<(), ChatError> {
         match event {
             SetupEvent::RequestReceived {
@@ -1829,6 +2138,18 @@ impl MessengerController {
                 bytes,
             } => {
                 let (peer, frame) = Self::decode_setup(peer, &bytes)?;
+                let repeatable = Self::is_repeatable_setup_message(&frame.message);
+                if !self.durable_control_allows(peer, &bytes, repeatable)? {
+                    return Ok(());
+                }
+                let duplicate = !self.setup_replay.remember(peer, &bytes);
+                // KeyPackage requests intentionally answer an exact repeat
+                // idempotently from retained response bytes; all other exact
+                // replays are terminal state transitions or acknowledgements
+                // and must not be re-applied.
+                if duplicate && !repeatable {
+                    return Ok(());
+                }
                 self.handle_setup_request(response_id, peer, frame)
             }
             SetupEvent::ResponseReceived {
@@ -1836,13 +2157,21 @@ impl MessengerController {
                 peer,
                 bytes,
             } => {
-                let group_request = self.group_requests.remove(&request_id);
-                self.outstanding_setup.remove(&request_id);
+                // Decode and verify before removing correlation state, so a
+                // malformed or replayed response cannot clear a live request.
                 let (peer, frame) = Self::decode_setup(peer, &bytes)?;
+                if !self.durable_control_allows(peer, &bytes, false)? {
+                    return Ok(());
+                }
+                if !self.setup_replay.remember(peer, &bytes) {
+                    return Ok(());
+                }
+                let group_request = self.group_requests.remove(&request_id);
+                let outgoing_setup = self.outstanding_setup.remove(&request_id);
                 if let Some(request) = group_request {
                     return self.handle_group_ack(peer, frame.message, request);
                 }
-                self.handle_setup_response(peer, frame)
+                self.process_setup_response(peer, frame, outgoing_setup)
             }
             SetupEvent::Failed { request_id, .. } => {
                 if let Some(request_id) = request_id {
@@ -1855,10 +2184,9 @@ impl MessengerController {
                                 "group commit request failed (operation still pending)".to_owned()
                             }
                         });
-                    } else if let Some(conversation_id) = self.outstanding_setup.remove(&request_id)
-                    {
+                    } else if let Some(setup) = self.outstanding_setup.remove(&request_id) {
                         self.set_status(
-                            conversation_id,
+                            setup.conversation_id,
                             ConversationStatus::Failed("setup request failed"),
                         );
                     }
@@ -1875,60 +2203,81 @@ impl MessengerController {
         peer: PeerId,
         frame: SetupEnvelope,
     ) -> Result<(), ChatError> {
+        let outcome = self.process_setup_request(peer, frame)?;
+        if let Some(message) = outcome.response {
+            self.respond_setup(response_id, message)?;
+        }
+        match outcome.rejection {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Validate and apply one inbound setup request. Every state change is
+    /// gated on the signed transaction ID matching the locally owned pending
+    /// state for that conversation and peer.
+    fn process_setup_request(
+        &mut self,
+        peer: PeerId,
+        frame: SetupEnvelope,
+    ) -> Result<RequestOutcome, ChatError> {
         let public_key = frame.sender_public_key;
         match frame.message {
-            SetupMessage::KeyPackageRequest { conversation_id } => {
-                // A 1:1 invitation is for a conversation the responder does not
-                // have yet. The signed frame still binds the requester, and the
-                // inviter validates the returned KeyPackage before adding it.
-                if self.conversations.contains_key(&conversation_id) {
-                    return Err(ChatError::AlreadyEstablished);
-                }
-                let key_package = MlsConversation::key_package(&self.identity)?;
-                let bytes = key_package.bytes().to_vec();
-                self.pending_key_packages
-                    .insert(conversation_id, PendingKeyPackage { peer, key_package });
-                self.respond_setup(
-                    response_id,
-                    SetupMessage::KeyPackageResponse {
-                        conversation_id,
-                        key_package: bytes,
-                    },
-                )
-            }
+            SetupMessage::KeyPackageRequest {
+                conversation_id,
+                transaction_id,
+            } => self.register_pending_key_package(
+                peer,
+                conversation_id,
+                transaction_id,
+                PendingKeyPackageKind::Conversation,
+            ),
             SetupMessage::Welcome {
                 conversation_id,
+                transaction_id,
                 welcome,
-            } => self.join_from_welcome(response_id, peer, conversation_id, welcome, false),
-            SetupMessage::GroupJoinRequest { conversation_id } => {
-                // The invitee does not have the group yet. The signed frame
-                // binds the inviting peer; the admin validates this KeyPackage
-                // before creating the Welcome and epoch-changing commit.
-                if self.conversations.contains_key(&conversation_id) {
-                    return Err(ChatError::AlreadyEstablished);
-                }
-                let key_package = MlsConversation::key_package(&self.identity)?;
-                let bytes = key_package.bytes().to_vec();
-                self.pending_key_packages
-                    .insert(conversation_id, PendingKeyPackage { peer, key_package });
-                self.respond_setup(
-                    response_id,
-                    SetupMessage::GroupKeyPackageResponse {
-                        conversation_id,
-                        key_package: bytes,
-                    },
-                )
+            } => {
+                let ack =
+                    self.join_from_welcome(peer, conversation_id, transaction_id, welcome, false)?;
+                Ok(RequestOutcome::respond(ack))
             }
+            SetupMessage::GroupJoinRequest {
+                conversation_id,
+                transaction_id,
+            } => self.register_pending_key_package(
+                peer,
+                conversation_id,
+                transaction_id,
+                PendingKeyPackageKind::GroupJoin,
+            ),
             SetupMessage::GroupWelcome {
                 conversation_id,
+                transaction_id,
                 welcome,
-            } => self.join_from_welcome(response_id, peer, conversation_id, welcome, true),
+            } => {
+                let ack =
+                    self.join_from_welcome(peer, conversation_id, transaction_id, welcome, true)?;
+                Ok(RequestOutcome::respond(ack))
+            }
             SetupMessage::GroupCommit {
                 conversation_id,
+                transaction_id,
                 operation,
                 target,
                 commit,
             } => {
+                // A peer with its own pending operation must not accept a
+                // commit from a different transaction.
+                if self
+                    .conversations
+                    .get(&conversation_id)
+                    .and_then(|state| state.pending_operation.as_ref())
+                    .is_some_and(|pending| pending.transaction_id != transaction_id)
+                {
+                    return Err(ChatError::InvalidSetup(
+                        "group commit transaction does not match pending operation",
+                    ));
+                }
                 let (accepted, self_removed, refresh_members) = {
                     let state = self
                         .conversations
@@ -1987,42 +2336,147 @@ impl MessengerController {
                     let local = self.identity.peer_id();
                     self.refresh_peer_conversations(conversation_id, &local);
                 }
-                self.respond_setup(
-                    response_id,
-                    SetupMessage::GroupCommitAck {
-                        conversation_id,
-                        operation,
-                        accepted,
-                    },
-                )?;
+                let ack = SetupMessage::GroupCommitAck {
+                    conversation_id,
+                    transaction_id,
+                    operation,
+                    accepted,
+                };
                 if accepted {
-                    Ok(())
+                    Ok(RequestOutcome::respond(ack))
                 } else {
-                    Err(ChatError::GroupOperationRejected)
+                    Ok(RequestOutcome::respond_and_reject(
+                        ack,
+                        ChatError::GroupOperationRejected,
+                    ))
                 }
             }
             _ => Err(ChatError::InvalidSetup("unexpected setup request type")),
         }
     }
 
-    fn join_from_welcome(
+    /// Retain one KeyPackage provider per `(conversation, transaction)`. An
+    /// identical duplicate from the same peer is answered with the same
+    /// response; a different transaction for a pending conversation is rejected
+    /// instead of displacing the original provider.
+    fn register_pending_key_package(
         &mut self,
-        response_id: SetupResponseId,
         peer: PeerId,
         conversation_id: [u8; 16],
-        welcome: Vec<u8>,
-        group_control: bool,
-    ) -> Result<(), ChatError> {
+        transaction_id: TransactionId,
+        kind: PendingKeyPackageKind,
+    ) -> Result<RequestOutcome, ChatError> {
         if self.conversations.contains_key(&conversation_id) {
             return Err(ChatError::AlreadyEstablished);
         }
-        let pending = self
+        let key = (conversation_id, transaction_id);
+        if let Some(pending) = self.pending_key_packages.get(&key) {
+            if pending.peer != peer {
+                return Err(ChatError::UnexpectedSender);
+            }
+            if pending.kind != kind {
+                return Err(ChatError::InvalidSetup(
+                    "setup request kind does not match pending KeyPackage",
+                ));
+            }
+            let response = match kind {
+                PendingKeyPackageKind::Conversation => SetupMessage::KeyPackageResponse {
+                    conversation_id,
+                    transaction_id,
+                    key_package: pending.response_bytes.clone(),
+                },
+                PendingKeyPackageKind::GroupJoin => SetupMessage::GroupKeyPackageResponse {
+                    conversation_id,
+                    transaction_id,
+                    key_package: pending.response_bytes.clone(),
+                },
+            };
+            return Ok(RequestOutcome::respond(response));
+        }
+        if self
             .pending_key_packages
-            .remove(&conversation_id)
-            .ok_or(ChatError::PendingKeyPackageMissing)?;
+            .keys()
+            .any(|(id, _)| *id == conversation_id)
+        {
+            return Err(ChatError::InvalidSetup(
+                "another setup transaction is already pending for this conversation",
+            ));
+        }
+        let key_package = MlsConversation::key_package(&self.identity)?;
+        let bytes = key_package.bytes().to_vec();
+        self.pending_key_packages.insert(
+            key,
+            PendingKeyPackage {
+                peer,
+                kind,
+                key_package,
+                response_bytes: bytes.clone(),
+            },
+        );
+        let response = match kind {
+            PendingKeyPackageKind::Conversation => SetupMessage::KeyPackageResponse {
+                conversation_id,
+                transaction_id,
+                key_package: bytes,
+            },
+            PendingKeyPackageKind::GroupJoin => SetupMessage::GroupKeyPackageResponse {
+                conversation_id,
+                transaction_id,
+                key_package: bytes,
+            },
+        };
+        Ok(RequestOutcome::respond(response))
+    }
+
+    /// Join a conversation from a Welcome bound to the pending transaction and
+    /// return the acknowledgement carrying that same transaction ID.
+    fn join_from_welcome(
+        &mut self,
+        peer: PeerId,
+        conversation_id: [u8; 16],
+        transaction_id: TransactionId,
+        welcome: Vec<u8>,
+        group_control: bool,
+    ) -> Result<SetupMessage, ChatError> {
+        if self.conversations.contains_key(&conversation_id) {
+            return Err(ChatError::AlreadyEstablished);
+        }
+        let key = (conversation_id, transaction_id);
+        let Some(pending) = self.pending_key_packages.get(&key) else {
+            return Err(ChatError::PendingKeyPackageMissing);
+        };
         if pending.peer != peer {
             return Err(ChatError::UnexpectedSender);
         }
+        let expected_kind = if group_control {
+            PendingKeyPackageKind::GroupJoin
+        } else {
+            PendingKeyPackageKind::Conversation
+        };
+        if pending.kind != expected_kind {
+            return Err(ChatError::InvalidSetup(
+                "welcome type does not match pending KeyPackage",
+            ));
+        }
+        let pending = self
+            .pending_key_packages
+            .remove(&key)
+            .ok_or(ChatError::PendingKeyPackageMissing)?;
+        let ack = |accepted: bool| {
+            if group_control {
+                SetupMessage::GroupWelcomeAck {
+                    conversation_id,
+                    transaction_id,
+                    accepted,
+                }
+            } else {
+                SetupMessage::WelcomeAck {
+                    conversation_id,
+                    transaction_id,
+                    accepted,
+                }
+            }
+        };
         match MlsConversation::join(
             &self.identity,
             conversation_id,
@@ -2037,49 +2491,38 @@ impl MessengerController {
                     .insert(conversation_id, DEFAULT_CHANNEL_ID);
                 self.refresh_peer_conversations(conversation_id, &self.identity.peer_id());
                 self.active = Some(conversation_id);
-                let ack = if group_control {
-                    SetupMessage::GroupWelcomeAck {
-                        conversation_id,
-                        accepted: true,
-                    }
-                } else {
-                    SetupMessage::WelcomeAck {
-                        conversation_id,
-                        accepted: true,
-                    }
-                };
-                self.respond_setup(response_id, ack)
+                Ok(ack(true))
             }
             Err(error) => {
-                let ack = if group_control {
-                    SetupMessage::GroupWelcomeAck {
-                        conversation_id,
-                        accepted: false,
-                    }
-                } else {
-                    SetupMessage::WelcomeAck {
-                        conversation_id,
-                        accepted: false,
-                    }
-                };
-                let _ = self.respond_setup(response_id, ack);
                 self.last_error = Some(error.to_string());
-                Ok(())
+                Ok(ack(false))
             }
         }
     }
 
-    fn handle_setup_response(
+    fn process_setup_response(
         &mut self,
         peer: PeerId,
         frame: SetupEnvelope,
+        outgoing: Option<OutgoingSetup>,
     ) -> Result<(), ChatError> {
         let public_key = frame.sender_public_key;
         match frame.message {
             SetupMessage::KeyPackageResponse {
                 conversation_id,
+                transaction_id,
                 key_package,
             } => {
+                let outgoing =
+                    outgoing.ok_or(ChatError::InvalidSetup("untracked setup response"))?;
+                if outgoing.kind != OutgoingSetupKind::KeyPackageRequest
+                    || outgoing.conversation_id != conversation_id
+                    || outgoing.transaction_id != transaction_id
+                {
+                    return Err(ChatError::InvalidSetup(
+                        "unexpected KeyPackage response transaction",
+                    ));
+                }
                 let welcome = {
                     let state = self
                         .conversations
@@ -2100,15 +2543,28 @@ impl MessengerController {
                     &peer,
                     SetupMessage::Welcome {
                         conversation_id,
+                        transaction_id,
                         welcome,
                     },
                     conversation_id,
+                    transaction_id,
                 )
             }
             SetupMessage::GroupKeyPackageResponse {
                 conversation_id,
+                transaction_id,
                 key_package,
             } => {
+                let outgoing =
+                    outgoing.ok_or(ChatError::InvalidSetup("untracked setup response"))?;
+                if outgoing.kind != OutgoingSetupKind::GroupJoinRequest
+                    || outgoing.conversation_id != conversation_id
+                    || outgoing.transaction_id != transaction_id
+                {
+                    return Err(ChatError::InvalidSetup(
+                        "unexpected group KeyPackage response transaction",
+                    ));
+                }
                 let local = self.identity.peer_id();
                 {
                     let state = self
@@ -2139,6 +2595,7 @@ impl MessengerController {
                     state.members.insert(peer);
                     state.sync_default_channel();
                     state.pending_operation = Some(PendingOperation {
+                        transaction_id,
                         operation: GroupOperation::Add,
                         target: Some(peer),
                         commit,
@@ -2153,8 +2610,19 @@ impl MessengerController {
             }
             SetupMessage::WelcomeAck {
                 conversation_id,
+                transaction_id,
                 accepted,
             } => {
+                let outgoing =
+                    outgoing.ok_or(ChatError::InvalidSetup("untracked setup response"))?;
+                if outgoing.kind != OutgoingSetupKind::Welcome
+                    || outgoing.conversation_id != conversation_id
+                    || outgoing.transaction_id != transaction_id
+                {
+                    return Err(ChatError::InvalidSetup(
+                        "unexpected welcome acknowledgement transaction",
+                    ));
+                }
                 let state = self
                     .conversations
                     .get_mut(&conversation_id)
@@ -2162,8 +2630,8 @@ impl MessengerController {
                 if !state.members.contains(&peer) {
                     return Err(ChatError::UnexpectedSender);
                 }
-                // A late or duplicate acknowledgement must not overwrite a
-                // terminal setup result.
+                // A late or duplicate acknowledgement from an older setup
+                // must not overwrite a terminal setup result.
                 if state.status != ConversationStatus::WelcomeSent {
                     return Err(ChatError::InvalidSetup(
                         "unexpected welcome acknowledgement",
@@ -2190,59 +2658,86 @@ impl MessengerController {
             return Err(ChatError::UnexpectedSender);
         }
         let conversation_id = request.conversation_id;
+        let transaction_id = request.transaction_id;
         match (message, request.kind) {
             (
                 SetupMessage::GroupWelcomeAck {
                     conversation_id: ack_id,
+                    transaction_id: ack_transaction,
                     accepted,
                 },
                 GroupRequestKind::Welcome,
             ) => {
-                if ack_id != conversation_id || request.operation != GroupOperation::Add {
+                if ack_id != conversation_id
+                    || ack_transaction != transaction_id
+                    || request.operation != GroupOperation::Add
+                {
                     return Err(ChatError::InvalidSetup(
                         "unexpected group Welcome acknowledgement",
+                    ));
+                }
+                let Some(operation) = self
+                    .conversations
+                    .get(&conversation_id)
+                    .and_then(|state| state.pending_operation.as_ref())
+                else {
+                    return Err(ChatError::InvalidSetup("no group operation is pending"));
+                };
+                if operation.transaction_id != transaction_id {
+                    return Err(ChatError::InvalidSetup(
+                        "group Welcome acknowledgement belongs to a different transaction",
                     ));
                 }
                 if !accepted {
                     self.last_error = Some("group Welcome was rejected".to_owned());
                     return Ok(());
                 }
-                let state = self
-                    .conversations
+                self.conversations
                     .get_mut(&conversation_id)
-                    .ok_or(ChatError::UnknownConversation)?;
-                let Some(operation) = state.pending_operation.as_mut() else {
-                    return Err(ChatError::InvalidSetup("no group operation is pending"));
-                };
-                operation.welcome_acked = true;
+                    .and_then(|state| state.pending_operation.as_mut())
+                    .ok_or(ChatError::InvalidSetup("no group operation is pending"))?
+                    .welcome_acked = true;
                 self.finish_operation_if_ready(conversation_id);
                 Ok(())
             }
             (
                 SetupMessage::GroupCommitAck {
                     conversation_id: ack_id,
+                    transaction_id: ack_transaction,
                     operation: acked_operation,
                     accepted,
                 },
                 GroupRequestKind::Commit,
             ) => {
-                if ack_id != conversation_id || acked_operation != request.operation {
+                if ack_id != conversation_id
+                    || ack_transaction != transaction_id
+                    || acked_operation != request.operation
+                {
                     return Err(ChatError::InvalidSetup(
                         "unexpected group commit acknowledgement",
+                    ));
+                }
+                let Some(operation) = self
+                    .conversations
+                    .get(&conversation_id)
+                    .and_then(|state| state.pending_operation.as_ref())
+                else {
+                    return Err(ChatError::InvalidSetup("no group operation is pending"));
+                };
+                if operation.transaction_id != transaction_id {
+                    return Err(ChatError::InvalidSetup(
+                        "group commit acknowledgement belongs to a different transaction",
                     ));
                 }
                 if !accepted {
                     self.last_error = Some("group commit was rejected by a member".to_owned());
                     return Err(ChatError::GroupOperationRejected);
                 }
-                let state = self
+                let awaited = self
                     .conversations
                     .get_mut(&conversation_id)
-                    .ok_or(ChatError::UnknownConversation)?;
-                let Some(operation) = state.pending_operation.as_mut() else {
-                    return Err(ChatError::InvalidSetup("no group operation is pending"));
-                };
-                let awaited = operation
+                    .and_then(|state| state.pending_operation.as_mut())
+                    .ok_or(ChatError::InvalidSetup("no group operation is pending"))?
                     .awaited
                     .get_mut(&peer)
                     .ok_or(ChatError::UnexpectedSender)?;
@@ -2318,11 +2813,11 @@ impl MessengerController {
                 if self
                     .incoming_files
                     .get(&peer)
-                    .is_some_and(|transfer| !transfer.status().completed())
+                    .is_some_and(|transfer| transfer.status().active())
                     || self
                         .outgoing_files
                         .get(&peer)
-                        .is_some_and(|transfer| !transfer.status().completed())
+                        .is_some_and(|transfer| transfer.status().active())
                 {
                     self.respond_file(response_id, FileMessage::Reject { transfer_id })?;
                     return Err(ChatError::FileTransferLimit);
@@ -2338,21 +2833,24 @@ impl MessengerController {
                     },
                 )?;
                 self.incoming_files.insert(peer, incoming);
+                self.start_transfer_deadline(peer, transfer_id);
                 Ok(())
             }
             FileMessage::Chunk { index, .. } => {
-                let (accepted, error) = match self.incoming_files.get_mut(&peer) {
-                    Some(incoming) if *incoming.transfer_id() == transfer_id => {
+                let (accepted, error, progressed) = match self.incoming_files.get_mut(&peer) {
+                    Some(incoming)
+                        if *incoming.transfer_id() == transfer_id && incoming.status().active() =>
+                    {
                         match incoming.accept_chunk(&frame) {
-                            Ok(()) => (true, None),
-                            Err(p2p_files::FileError::DuplicateChunk) => (true, None),
+                            Ok(()) => (true, None, true),
+                            Err(p2p_files::FileError::DuplicateChunk) => (true, None, false),
                             Err(error) => {
                                 incoming.mark_failed("Incoming chunk failed");
-                                (false, Some(error.to_string()))
+                                (false, Some(error.to_string()), false)
                             }
                         }
                     }
-                    _ => (false, Some("untracked file chunk".to_owned())),
+                    _ => (false, Some("inactive file chunk".to_owned()), false),
                 };
                 self.respond_file(
                     response_id,
@@ -2362,6 +2860,11 @@ impl MessengerController {
                         accepted,
                     },
                 )?;
+                if progressed {
+                    self.touch_transfer_deadline(peer, transfer_id);
+                } else if error.is_some() {
+                    self.clear_transfer_deadline(peer, transfer_id);
+                }
                 if let Some(error) = error {
                     self.last_error = Some(error);
                 }
@@ -2369,13 +2872,15 @@ impl MessengerController {
             }
             FileMessage::Manifest { .. } => {
                 let (accepted, error) = match self.incoming_files.get_mut(&peer) {
-                    Some(incoming) if *incoming.transfer_id() == transfer_id => {
+                    Some(incoming)
+                        if *incoming.transfer_id() == transfer_id && incoming.status().active() =>
+                    {
                         match incoming.verify_manifest(&frame) {
                             Ok(_) => (true, None),
                             Err(error) => (false, Some(error.to_string())),
                         }
                     }
-                    _ => (false, Some("untracked file manifest".to_owned())),
+                    _ => (false, Some("inactive file manifest".to_owned())),
                 };
                 self.respond_file(
                     response_id,
@@ -2384,6 +2889,7 @@ impl MessengerController {
                         accepted,
                     },
                 )?;
+                self.clear_transfer_deadline(peer, transfer_id);
                 if let Some(error) = error {
                     self.last_error = Some(error);
                 }
@@ -2442,6 +2948,7 @@ impl MessengerController {
                 {
                     outgoing.mark_accepted();
                 }
+                self.touch_transfer_deadline(peer, expected_id);
                 self.send_next_outgoing_frame(peer, expected_id)
             }
             (
@@ -2474,6 +2981,7 @@ impl MessengerController {
                     outgoing.has_more_chunks()
                         || (outgoing.all_chunks_acked() && !outgoing.manifest_sent())
                 };
+                self.touch_transfer_deadline(peer, expected_id);
                 if should_continue {
                     self.send_next_outgoing_frame(peer, expected_id)?;
                 }
@@ -2496,6 +3004,11 @@ impl MessengerController {
                     && *outgoing.transfer_id() == expected_id
                 {
                     outgoing.mark_manifest_ack(*accepted);
+                }
+                if *accepted {
+                    self.clear_transfer_deadline(peer, expected_id);
+                } else {
+                    self.fail_file_transfer(&peer, &expected_id, "Manifest rejected by peer");
                 }
                 Ok(())
             }
@@ -2574,6 +3087,102 @@ impl MessengerController {
         {
             incoming.mark_failed(reason);
         }
+        self.clear_transfer_deadline(*peer, *transfer_id);
+    }
+
+    fn start_transfer_deadline(&mut self, peer: PeerId, transfer_id: [u8; 16]) {
+        self.transfer_deadlines.insert(
+            peer,
+            TransferDeadline {
+                transfer_id,
+                expires_at: Instant::now() + self.transfer_timeout,
+            },
+        );
+    }
+
+    fn touch_transfer_deadline(&mut self, peer: PeerId, transfer_id: [u8; 16]) {
+        if let Some(deadline) = self.transfer_deadlines.get_mut(&peer)
+            && deadline.transfer_id == transfer_id
+        {
+            deadline.expires_at = Instant::now() + self.transfer_timeout;
+        }
+    }
+
+    fn clear_transfer_deadline(&mut self, peer: PeerId, transfer_id: [u8; 16]) {
+        if self
+            .transfer_deadlines
+            .get(&peer)
+            .is_some_and(|deadline| deadline.transfer_id == transfer_id)
+        {
+            self.transfer_deadlines.remove(&peer);
+        }
+    }
+
+    fn sweep_transfer_timeouts(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<(PeerId, [u8; 16])> = self
+            .transfer_deadlines
+            .iter()
+            .filter(|(_, deadline)| deadline.expires_at <= now)
+            .map(|(peer, deadline)| (*peer, deadline.transfer_id))
+            .collect();
+        for (peer, transfer_id) in expired {
+            let _ = self.abort_transfer(peer, transfer_id, "Transfer timed out");
+        }
+    }
+
+    fn abort_transfer(
+        &mut self,
+        peer: PeerId,
+        transfer_id: [u8; 16],
+        reason: &'static str,
+    ) -> Result<(), ChatError> {
+        let Some(deadline) = self.transfer_deadlines.get(&peer).copied() else {
+            return Err(ChatError::FileTransferNotActive);
+        };
+        if deadline.transfer_id != transfer_id {
+            return Err(ChatError::FileTransferNotActive);
+        }
+        let outgoing_active = self.outgoing_files.get(&peer).is_some_and(|transfer| {
+            *transfer.transfer_id() == transfer_id && transfer.status().active()
+        });
+        let incoming_active = self.incoming_files.get(&peer).is_some_and(|transfer| {
+            *transfer.transfer_id() == transfer_id && transfer.status().active()
+        });
+        if !outgoing_active && !incoming_active {
+            self.transfer_deadlines.remove(&peer);
+            return Err(ChatError::FileTransferNotActive);
+        }
+
+        self.file_requests.retain(|_, kind| match kind {
+            FileRequestKind::Offer {
+                peer: p,
+                transfer_id: id,
+            }
+            | FileRequestKind::Chunk {
+                peer: p,
+                transfer_id: id,
+                ..
+            }
+            | FileRequestKind::Manifest {
+                peer: p,
+                transfer_id: id,
+            } => *p != peer || *id != transfer_id,
+        });
+        if outgoing_active {
+            self.outgoing_files
+                .get_mut(&peer)
+                .expect("checked outgoing transfer")
+                .abort(reason)?;
+        }
+        if incoming_active {
+            self.incoming_files
+                .get_mut(&peer)
+                .expect("checked incoming transfer")
+                .abort(reason)?;
+        }
+        self.transfer_deadlines.remove(&peer);
+        Ok(())
     }
 
     fn handle_message_event(&mut self, event: MessageEvent) -> Result<(), ChatError> {
@@ -2951,6 +3560,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p2p_storage::Vault;
 
     #[test]
     fn default_controller_privacy_status_is_all_off_and_unobserved() {
@@ -2976,5 +3586,641 @@ mod tests {
         assert_eq!(status.identified_peers, 0);
         assert_eq!(status.relayed_connections, 0);
         assert!(status.nat_description().contains("no AutoNAT observation"));
+    }
+
+    fn test_controller() -> (Identity, MessengerController) {
+        let identity = Identity::generate().expect("identity");
+        let controller =
+            MessengerController::start(&identity, NetworkConfig::default()).expect("controller");
+        (identity, controller)
+    }
+
+    fn signed(identity: &Identity, message: SetupMessage) -> SetupEnvelope {
+        SetupEnvelope::new(identity, message).expect("signed setup frame")
+    }
+
+    #[test]
+    fn setup_replay_cache_is_bounded_and_keyed_by_peer_and_digest() {
+        let (_, mut controller) = test_controller();
+        let peer = Identity::generate().expect("peer");
+        let other_peer = Identity::generate().expect("other peer");
+        let first = 0u64.to_le_bytes();
+
+        assert!(controller.setup_replay.remember(peer.peer_id(), &first));
+        assert!(!controller.setup_replay.remember(peer.peer_id(), &first));
+        assert!(
+            controller
+                .setup_replay
+                .remember(other_peer.peer_id(), &first),
+            "the same bytes from another authenticated peer are a distinct key"
+        );
+        assert_eq!(controller.setup_replay.seen.len(), 2);
+
+        let second = 1u64.to_le_bytes();
+        assert!(controller.setup_replay.remember(peer.peer_id(), &second));
+        for value in 2..MAX_SETUP_REPLAY_ENTRIES as u64 {
+            assert!(
+                controller
+                    .setup_replay
+                    .remember(peer.peer_id(), &value.to_le_bytes())
+            );
+        }
+        assert!(controller.setup_replay.remember(
+            peer.peer_id(),
+            &(MAX_SETUP_REPLAY_ENTRIES as u64).to_le_bytes()
+        ));
+        assert_eq!(controller.setup_replay.seen.len(), MAX_SETUP_REPLAY_ENTRIES);
+        assert_eq!(
+            controller.setup_replay.order.len(),
+            MAX_SETUP_REPLAY_ENTRIES
+        );
+        assert!(
+            controller.setup_replay.remember(peer.peer_id(), &first),
+            "the oldest entry must be evicted once the bound is reached"
+        );
+    }
+
+    #[test]
+    fn exact_setup_request_replay_is_ignored_after_verification() {
+        let (_, mut controller) = test_controller();
+        let peer = Identity::generate().expect("peer");
+        let bytes = signed(
+            &peer,
+            SetupMessage::WelcomeAck {
+                conversation_id: [7u8; 16],
+                transaction_id: [8u8; 16],
+                accepted: true,
+            },
+        )
+        .to_bytes()
+        .expect("encoded setup frame");
+        let event = || SetupEvent::RequestReceived {
+            response_id: SetupResponseId::new(11),
+            peer: swarm_peer(&peer.peer_id()).expect("swarm peer"),
+            bytes: bytes.clone(),
+        };
+
+        assert!(controller.handle_setup_event(event()).is_err());
+        assert!(
+            controller.handle_setup_event(event()).is_ok(),
+            "an exact replay must not be re-applied or re-reported"
+        );
+        assert_eq!(controller.setup_replay.seen.len(), 1);
+    }
+
+    #[test]
+    fn exact_setup_response_replay_is_ignored_after_verification() {
+        let (_, mut controller) = test_controller();
+        let peer = Identity::generate().expect("peer");
+        let bytes = signed(
+            &peer,
+            SetupMessage::WelcomeAck {
+                conversation_id: [9u8; 16],
+                transaction_id: [10u8; 16],
+                accepted: false,
+            },
+        )
+        .to_bytes()
+        .expect("encoded setup frame");
+        let event = || SetupEvent::ResponseReceived {
+            request_id: p2p_network::SetupRequestId::new(12),
+            peer: swarm_peer(&peer.peer_id()).expect("swarm peer"),
+            bytes: bytes.clone(),
+        };
+
+        assert!(controller.handle_setup_event(event()).is_err());
+        assert!(
+            controller.handle_setup_event(event()).is_ok(),
+            "an exact response replay must not be re-applied"
+        );
+        assert_eq!(controller.setup_replay.seen.len(), 1);
+    }
+
+    #[test]
+    fn durable_control_log_rejects_exact_authenticated_frame_after_reopen() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let identity = Identity::generate().expect("identity");
+        let peer = Identity::generate().expect("peer");
+        let vault = Vault::open(directory.path()).expect("open vault");
+        let bytes = signed(
+            &peer,
+            SetupMessage::WelcomeAck {
+                conversation_id: [17u8; 16],
+                transaction_id: [18u8; 16],
+                accepted: true,
+            },
+        )
+        .to_bytes()
+        .expect("encoded setup frame");
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        let mut session = vault
+            .create("controller", "vault-password", &identity)
+            .expect("create vault");
+        assert_eq!(
+            session
+                .record_control_frame(&peer.peer_id().to_bytes(), &digest, false)
+                .expect("record authenticated frame"),
+            ControlRecordOutcome::Appended(1)
+        );
+        drop(session);
+
+        let storage = vault.unlock("vault-password").expect("reopen vault");
+        let mut controller = MessengerController::start_with_control_log(
+            &identity,
+            NetworkConfig::default(),
+            storage,
+        )
+        .expect("controller with durable replay log");
+        let event = SetupEvent::RequestReceived {
+            response_id: SetupResponseId::new(13),
+            peer: swarm_peer(&peer.peer_id()).expect("swarm peer"),
+            bytes: bytes.clone(),
+        };
+        assert!(
+            controller.handle_setup_event(event).is_ok(),
+            "a durable replay is ignored rather than re-applied"
+        );
+        assert!(
+            controller.setup_replay.seen.is_empty(),
+            "a durable replay must be rejected before entering the in-memory cache"
+        );
+        assert!(controller.last_error().is_none());
+    }
+
+    #[test]
+    fn durable_control_log_keeps_request_retries_idempotent_after_reopen() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let identity = Identity::generate().expect("identity");
+        let peer = Identity::generate().expect("peer");
+        let vault = Vault::open(directory.path()).expect("open vault");
+        let bytes = signed(
+            &peer,
+            SetupMessage::KeyPackageRequest {
+                conversation_id: [19u8; 16],
+                transaction_id: [20u8; 16],
+            },
+        )
+        .to_bytes()
+        .expect("encoded setup frame");
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        let mut session = vault
+            .create("controller", "vault-password", &identity)
+            .expect("create vault");
+        assert_eq!(
+            session
+                .record_control_frame(&peer.peer_id().to_bytes(), &digest, true)
+                .expect("record retryable request"),
+            ControlRecordOutcome::Appended(1)
+        );
+        drop(session);
+
+        let storage = vault.unlock("vault-password").expect("reopen vault");
+        let mut controller = MessengerController::start_with_control_log(
+            &identity,
+            NetworkConfig::default(),
+            storage,
+        )
+        .expect("controller with durable replay log");
+        controller
+            .handle_setup_event(SetupEvent::RequestReceived {
+                response_id: SetupResponseId::new(14),
+                peer: swarm_peer(&peer.peer_id()).expect("swarm peer"),
+                bytes,
+            })
+            .expect("idempotent request retry");
+
+        assert_eq!(controller.pending_key_packages.len(), 1);
+        assert_eq!(controller.setup_replay.seen.len(), 1);
+    }
+
+    fn joined_state(identity: &Identity, peer: PeerId, admin: PeerId) -> ConversationState {
+        let conversation = MlsConversation::new(identity).expect("MLS conversation");
+        ConversationState::new(
+            conversation,
+            admin,
+            BTreeSet::from([identity.peer_id(), peer]),
+        )
+    }
+
+    #[test]
+    fn duplicate_key_package_requests_cannot_replace_a_pending_transaction() {
+        let (_local, mut controller) = test_controller();
+        let peer = Identity::generate().expect("peer");
+        let other_peer = Identity::generate().expect("other peer");
+        let conversation_id = [31u8; 16];
+        let first = [32u8; 16];
+        let second = [33u8; 16];
+
+        let first_outcome = controller
+            .process_setup_request(
+                peer.peer_id(),
+                signed(
+                    &peer,
+                    SetupMessage::KeyPackageRequest {
+                        conversation_id,
+                        transaction_id: first,
+                    },
+                ),
+            )
+            .expect("first request");
+        let first_key_package = match first_outcome.response.expect("response") {
+            SetupMessage::KeyPackageResponse {
+                transaction_id,
+                key_package,
+                ..
+            } => {
+                assert_eq!(transaction_id, first);
+                key_package
+            }
+            _ => panic!("unexpected response type"),
+        };
+        assert_eq!(controller.pending_key_packages.len(), 1);
+        assert_eq!(
+            controller
+                .pending_key_packages
+                .get(&(conversation_id, first))
+                .map(|pending| pending.peer),
+            Some(peer.peer_id())
+        );
+
+        let conflicting = signed(
+            &peer,
+            SetupMessage::KeyPackageRequest {
+                conversation_id,
+                transaction_id: second,
+            },
+        );
+        assert!(matches!(
+            controller.process_setup_request(peer.peer_id(), conflicting),
+            Err(ChatError::InvalidSetup(_))
+        ));
+        let from_other_peer = signed(
+            &other_peer,
+            SetupMessage::KeyPackageRequest {
+                conversation_id,
+                transaction_id: second,
+            },
+        );
+        assert!(matches!(
+            controller.process_setup_request(other_peer.peer_id(), from_other_peer),
+            Err(ChatError::InvalidSetup(_))
+        ));
+        let wrong_kind = signed(
+            &peer,
+            SetupMessage::GroupJoinRequest {
+                conversation_id,
+                transaction_id: first,
+            },
+        );
+        assert!(matches!(
+            controller.process_setup_request(peer.peer_id(), wrong_kind),
+            Err(ChatError::InvalidSetup(_))
+        ));
+        assert_eq!(controller.pending_key_packages.len(), 1);
+        assert!(
+            controller
+                .pending_key_packages
+                .contains_key(&(conversation_id, first))
+        );
+        assert!(
+            !controller
+                .pending_key_packages
+                .contains_key(&(conversation_id, second))
+        );
+
+        let duplicate = signed(
+            &peer,
+            SetupMessage::KeyPackageRequest {
+                conversation_id,
+                transaction_id: first,
+            },
+        );
+        let duplicate_outcome = controller
+            .process_setup_request(peer.peer_id(), duplicate)
+            .expect("idempotent duplicate request");
+        match duplicate_outcome.response.expect("response") {
+            SetupMessage::KeyPackageResponse {
+                transaction_id,
+                key_package,
+                ..
+            } => {
+                assert_eq!(transaction_id, first);
+                assert_eq!(key_package, first_key_package);
+            }
+            _ => panic!("unexpected duplicate response type"),
+        }
+        assert_eq!(controller.pending_key_packages.len(), 1);
+        assert_eq!(
+            controller
+                .pending_key_packages
+                .get(&(conversation_id, first))
+                .map(|pending| pending.response_bytes.clone()),
+            Some(first_key_package)
+        );
+    }
+
+    #[test]
+    fn stale_welcome_acknowledgements_are_rejected() {
+        let (identity, mut controller) = test_controller();
+        let peer = Identity::generate().expect("peer");
+        let conversation_id = [34u8; 16];
+        let current = [35u8; 16];
+        let stale = [36u8; 16];
+        let mut state = joined_state(&identity, peer.peer_id(), identity.peer_id());
+        state.status = ConversationStatus::WelcomeSent;
+        controller.conversations.insert(conversation_id, state);
+
+        let outgoing = OutgoingSetup {
+            conversation_id,
+            transaction_id: current,
+            kind: OutgoingSetupKind::Welcome,
+        };
+        let stale_frame = signed(
+            &peer,
+            SetupMessage::WelcomeAck {
+                conversation_id,
+                transaction_id: stale,
+                accepted: true,
+            },
+        );
+        assert!(matches!(
+            controller.process_setup_response(peer.peer_id(), stale_frame, Some(outgoing.clone())),
+            Err(ChatError::InvalidSetup(_))
+        ));
+        assert_eq!(
+            controller.conversations[&conversation_id].status,
+            ConversationStatus::WelcomeSent
+        );
+
+        let wrong_conversation = signed(
+            &peer,
+            SetupMessage::WelcomeAck {
+                conversation_id: [37u8; 16],
+                transaction_id: current,
+                accepted: true,
+            },
+        );
+        assert!(matches!(
+            controller.process_setup_response(
+                peer.peer_id(),
+                wrong_conversation,
+                Some(outgoing.clone())
+            ),
+            Err(ChatError::InvalidSetup(_))
+        ));
+        assert_eq!(
+            controller.conversations[&conversation_id].status,
+            ConversationStatus::WelcomeSent
+        );
+
+        let valid = signed(
+            &peer,
+            SetupMessage::WelcomeAck {
+                conversation_id,
+                transaction_id: current,
+                accepted: true,
+            },
+        );
+        controller
+            .process_setup_response(peer.peer_id(), valid, Some(outgoing))
+            .expect("valid welcome ack");
+        assert_eq!(
+            controller.conversations[&conversation_id].status,
+            ConversationStatus::Joined
+        );
+
+        let duplicate = signed(
+            &peer,
+            SetupMessage::WelcomeAck {
+                conversation_id,
+                transaction_id: current,
+                accepted: true,
+            },
+        );
+        assert!(
+            controller
+                .process_setup_response(peer.peer_id(), duplicate, None)
+                .is_err()
+        );
+        assert_eq!(
+            controller.conversations[&conversation_id].status,
+            ConversationStatus::Joined
+        );
+    }
+
+    #[test]
+    fn stale_group_commit_and_welcome_acks_are_rejected() {
+        let (identity, mut controller) = test_controller();
+        let member = Identity::generate().expect("member");
+        let conversation_id = [38u8; 16];
+        let current = [39u8; 16];
+        let stale = [40u8; 16];
+        let mut state = joined_state(&identity, member.peer_id(), identity.peer_id());
+        state.pending_operation = Some(PendingOperation {
+            transaction_id: current,
+            operation: GroupOperation::Add,
+            target: Some(member.peer_id()),
+            commit: vec![1, 2, 3],
+            awaited: BTreeMap::from([(member.peer_id(), false)]),
+            welcome_target: Some(member.peer_id()),
+            welcome: Some(vec![9]),
+            welcome_acked: false,
+        });
+        controller.conversations.insert(conversation_id, state);
+        let welcome_request = GroupRequest {
+            conversation_id,
+            transaction_id: current,
+            peer: member.peer_id(),
+            operation: GroupOperation::Add,
+            kind: GroupRequestKind::Welcome,
+        };
+        let commit_request = GroupRequest {
+            conversation_id,
+            transaction_id: current,
+            peer: member.peer_id(),
+            operation: GroupOperation::Add,
+            kind: GroupRequestKind::Commit,
+        };
+
+        let stale_welcome_ack = signed(
+            &member,
+            SetupMessage::GroupWelcomeAck {
+                conversation_id,
+                transaction_id: stale,
+                accepted: true,
+            },
+        );
+        assert!(matches!(
+            controller.handle_group_ack(
+                member.peer_id(),
+                stale_welcome_ack.message,
+                welcome_request
+            ),
+            Err(ChatError::InvalidSetup(_))
+        ));
+        let stale_commit_ack = signed(
+            &member,
+            SetupMessage::GroupCommitAck {
+                conversation_id,
+                transaction_id: stale,
+                operation: GroupOperation::Add,
+                accepted: true,
+            },
+        );
+        assert!(matches!(
+            controller.handle_group_ack(member.peer_id(), stale_commit_ack.message, commit_request),
+            Err(ChatError::InvalidSetup(_))
+        ));
+        let cross_conversation = signed(
+            &member,
+            SetupMessage::GroupCommitAck {
+                conversation_id: [41u8; 16],
+                transaction_id: current,
+                operation: GroupOperation::Add,
+                accepted: true,
+            },
+        );
+        assert!(matches!(
+            controller.handle_group_ack(
+                member.peer_id(),
+                cross_conversation.message,
+                commit_request
+            ),
+            Err(ChatError::InvalidSetup(_))
+        ));
+        let operation = controller.conversations[&conversation_id]
+            .pending_operation
+            .as_ref()
+            .expect("pending operation");
+        assert!(!operation.welcome_acked);
+        assert_eq!(operation.awaited.get(&member.peer_id()), Some(&false));
+
+        let valid_welcome_ack = signed(
+            &member,
+            SetupMessage::GroupWelcomeAck {
+                conversation_id,
+                transaction_id: current,
+                accepted: true,
+            },
+        );
+        controller
+            .handle_group_ack(member.peer_id(), valid_welcome_ack.message, welcome_request)
+            .expect("valid welcome ack");
+        let valid_commit_ack = signed(
+            &member,
+            SetupMessage::GroupCommitAck {
+                conversation_id,
+                transaction_id: current,
+                operation: GroupOperation::Add,
+                accepted: true,
+            },
+        );
+        controller
+            .handle_group_ack(member.peer_id(), valid_commit_ack.message, commit_request)
+            .expect("valid commit ack");
+        assert!(
+            controller.conversations[&conversation_id]
+                .pending_operation
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cross_conversation_and_transaction_substitution_is_rejected() {
+        let (identity, mut controller) = test_controller();
+        let admin = Identity::generate().expect("admin");
+        let conversation_id = [42u8; 16];
+        let other_conversation = [43u8; 16];
+        let transaction_id = [44u8; 16];
+        let other_transaction = [45u8; 16];
+
+        let key_package = MlsConversation::key_package(&identity).expect("key package");
+        controller.pending_key_packages.insert(
+            (conversation_id, transaction_id),
+            PendingKeyPackage {
+                peer: admin.peer_id(),
+                kind: PendingKeyPackageKind::GroupJoin,
+                key_package,
+                response_bytes: b"key package bytes".to_vec(),
+            },
+        );
+        let wrong_conversation = signed(
+            &admin,
+            SetupMessage::GroupWelcome {
+                conversation_id: other_conversation,
+                transaction_id,
+                welcome: b"welcome".to_vec(),
+            },
+        );
+        assert!(matches!(
+            controller.process_setup_request(admin.peer_id(), wrong_conversation),
+            Err(ChatError::PendingKeyPackageMissing)
+        ));
+        let wrong_transaction = signed(
+            &admin,
+            SetupMessage::GroupWelcome {
+                conversation_id,
+                transaction_id: other_transaction,
+                welcome: b"welcome".to_vec(),
+            },
+        );
+        assert!(matches!(
+            controller.process_setup_request(admin.peer_id(), wrong_transaction),
+            Err(ChatError::PendingKeyPackageMissing)
+        ));
+        let wrong_welcome_kind = signed(
+            &admin,
+            SetupMessage::Welcome {
+                conversation_id,
+                transaction_id,
+                welcome: b"welcome".to_vec(),
+            },
+        );
+        assert!(matches!(
+            controller.process_setup_request(admin.peer_id(), wrong_welcome_kind),
+            Err(ChatError::InvalidSetup(_))
+        ));
+        assert_eq!(controller.pending_key_packages.len(), 1);
+        assert!(
+            controller
+                .pending_key_packages
+                .contains_key(&(conversation_id, transaction_id))
+        );
+
+        let mut state = joined_state(&identity, admin.peer_id(), admin.peer_id());
+        state.pending_operation = Some(PendingOperation {
+            transaction_id,
+            operation: GroupOperation::Update,
+            target: None,
+            commit: vec![1, 2, 3],
+            awaited: BTreeMap::from([(admin.peer_id(), false)]),
+            welcome_target: None,
+            welcome: None,
+            welcome_acked: true,
+        });
+        controller.conversations.insert(conversation_id, state);
+        let substituted_commit = signed(
+            &admin,
+            SetupMessage::GroupCommit {
+                conversation_id,
+                transaction_id: other_transaction,
+                operation: GroupOperation::Update,
+                target: None,
+                commit: b"substituted commit".to_vec(),
+            },
+        );
+        assert!(matches!(
+            controller.process_setup_request(admin.peer_id(), substituted_commit),
+            Err(ChatError::InvalidSetup(
+                "group commit transaction does not match pending operation"
+            ))
+        ));
+        assert!(controller.applied_commits.is_empty());
+        let operation = controller.conversations[&conversation_id]
+            .pending_operation
+            .as_ref()
+            .expect("pending operation");
+        assert_eq!(operation.transaction_id, transaction_id);
+        assert_eq!(operation.awaited.get(&admin.peer_id()), Some(&false));
     }
 }

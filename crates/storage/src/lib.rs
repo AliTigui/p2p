@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 mod attachments;
+mod control_log;
 
 use std::fmt;
 use std::fs;
@@ -25,6 +26,9 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 pub use attachments::{AttachmentInfo, MAX_ATTACHMENT_BYTES};
+pub use control_log::{
+    ControlLogState, ControlRecordOutcome, MAX_CONTROL_LOG_ENTRIES, MAX_CONTROL_PEER_BYTES,
+};
 
 const DATABASE_NAME: &str = "profile.db";
 const MASTER_AAD: &[u8] = b"p2p-messenger/master-key-wrap/v1";
@@ -64,6 +68,12 @@ pub enum StorageError {
     AuthenticationFailed,
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
+    #[error("authenticated control log is invalid: {0}")]
+    ControlLogIntegrity(String),
+    #[error("authenticated control log is full")]
+    ControlLogFull,
+    #[error("vault rollback was detected")]
+    RollbackDetected,
     #[error("filesystem error: {0}")]
     Io(#[from] io::Error),
     #[error("cryptographic error: {0}")]
@@ -73,9 +83,17 @@ pub enum StorageError {
 }
 
 /// A vault located in a local directory. No network or remote service is used.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Vault {
     directory: PathBuf,
+}
+
+impl fmt::Debug for Vault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Vault")
+            .field("directory", &"<redacted local path>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Vault {
@@ -147,8 +165,8 @@ impl Vault {
         kdf_blob.push(ARGON2_ID_V1);
         kdf_blob.extend_from_slice(&params.to_bytes());
 
-        let conn = self.open_connection()?;
-        run_migrations(&conn)?;
+        let mut conn = self.open_connection()?;
+        run_migrations(&mut conn)?;
         conn.execute(
             "INSERT INTO profile (
                 id, profile_id, username, kdf_salt, kdf_params, wrapped_master,
@@ -170,14 +188,17 @@ impl Vault {
         fs::create_dir_all(&attachment_dir)?;
         restrict_directory(&attachment_dir)?;
 
-        Ok(Session {
+        let session = Session {
             conn,
             subkeys,
             profile_id,
             identity: identity.clone(),
             params,
             attachment_dir,
-        })
+            vault_dir: self.directory.clone(),
+        };
+        session.initialize_control_log()?;
+        Ok(session)
     }
 
     /// Unlock an existing vault. Argon2id runs on the calling thread, so GUI
@@ -190,8 +211,8 @@ impl Vault {
             return Err(StorageError::EmptyPassword);
         }
 
-        let conn = self.open_connection()?;
-        run_migrations(&conn)?;
+        let mut conn = self.open_connection()?;
+        run_migrations(&mut conn)?;
         let record = read_profile(&conn)?;
 
         let kek = derive_kek(password, &record.kdf_salt, record.params)?;
@@ -214,27 +235,34 @@ impl Vault {
         fs::create_dir_all(&attachment_dir)?;
         restrict_directory(&attachment_dir)?;
 
-        Ok(Session {
+        let session = Session {
             conn,
             subkeys,
             profile_id: record.profile_id,
             identity,
             params: record.params,
             attachment_dir,
-        })
+            vault_dir: self.directory.clone(),
+        };
+        session.verify_control_log()?;
+        Ok(session)
     }
 
     fn open_connection(&self) -> Result<Connection, StorageError> {
-        let conn = Connection::open(self.database_path())?;
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA secure_delete = ON;
-             PRAGMA temp_store = MEMORY;
-             PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 5000;",
-        )?;
-        Ok(conn)
+        open_connection(&self.database_path())
     }
+}
+
+fn open_connection(path: &Path) -> Result<Connection, StorageError> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA secure_delete = ON;
+         PRAGMA temp_store = MEMORY;
+         PRAGMA foreign_keys = ON;
+         PRAGMA busy_timeout = 5000;",
+    )?;
+    Ok(conn)
 }
 
 /// An unlocked vault session. Dropping it does not delete any data.
@@ -245,6 +273,7 @@ pub struct Session {
     identity: Identity,
     params: Argon2Params,
     attachment_dir: PathBuf,
+    vault_dir: PathBuf,
 }
 
 impl Session {
@@ -261,6 +290,21 @@ impl Session {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+
+    /// Open an independent connection to the same vault with the same derived
+    /// subkeys. Callers can keep one session for attachments while giving the
+    /// chat controller a separate session for the durable control log.
+    pub fn try_clone(&self) -> Result<Self, StorageError> {
+        Ok(Self {
+            conn: open_connection(&self.vault_dir.join(DATABASE_NAME))?,
+            subkeys: self.subkeys.clone(),
+            profile_id: self.profile_id,
+            identity: self.identity.clone(),
+            params: self.params,
+            attachment_dir: self.attachment_dir.clone(),
+            vault_dir: self.vault_dir.clone(),
+        })
     }
 
     /// Store a setting. The key is stored only as an HMAC blind index and the
@@ -570,16 +614,34 @@ CREATE TABLE attachments (
 );
 ";
 
-const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3];
+const SCHEMA_V4: &str = "
+CREATE TABLE control_log (
+    sequence INTEGER PRIMARY KEY CHECK (sequence > 0),
+    record_bi BLOB NOT NULL UNIQUE,
+    ciphertext BLOB NOT NULL,
+    chain_hash BLOB NOT NULL
+);
 
-fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
-    conn.execute_batch(
+CREATE TABLE control_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    chain BLOB NOT NULL
+);
+
+INSERT INTO control_state (id, sequence, chain) VALUES (1, 0, zeroblob(32));
+";
+
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4];
+
+fn run_migrations(conn: &mut Connection) -> Result<(), StorageError> {
+    let transaction = conn.transaction()?;
+    transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS migrations (
             version INTEGER PRIMARY KEY,
             applied_at INTEGER NOT NULL
         );",
     )?;
-    let current: i64 = conn.query_row(
+    let current: i64 = transaction.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM migrations",
         [],
         |row| row.get(0),
@@ -587,13 +649,14 @@ fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
     for (offset, sql) in MIGRATIONS.iter().enumerate() {
         let version = i64::try_from(offset + 1).expect("migration count fits in i64");
         if version > current {
-            conn.execute_batch(sql)?;
-            conn.execute(
+            transaction.execute_batch(sql)?;
+            transaction.execute(
                 "INSERT INTO migrations (version, applied_at) VALUES (?1, ?2)",
                 params![version, now_seconds()?],
             )?;
         }
     }
+    transaction.commit()?;
     Ok(())
 }
 

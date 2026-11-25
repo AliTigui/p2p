@@ -2,9 +2,10 @@
 //!
 //! KeyPackage and Welcome frames are transport-protected by Noise and signed by
 //! the vault Ed25519 identity. The signature binds the sender PeerId, public
-//! key, conversation ID, and frame body so an application cannot accept a setup
-//! message from a different authenticated peer. Setup frames are not chat
-//! messages and never carry delivery status.
+//! key, transaction ID, conversation ID, and frame body so an application cannot
+//! accept a setup message from a different authenticated peer or a different
+//! operation. Setup frames are not chat messages and never carry delivery
+//! status.
 
 use std::fmt;
 
@@ -16,8 +17,13 @@ use crate::ChatError;
 
 /// Fixed frame magic. Unknown magic is rejected, never negotiated.
 pub const SETUP_MAGIC: [u8; 4] = *b"MLS1";
-/// Setup frame version implemented by this build.
-pub const SETUP_VERSION: u16 = 1;
+/// Setup frame version implemented by this build. Version 1 frames carried no
+/// transaction ID and are rejected rather than ambiguously accepted.
+pub const SETUP_VERSION: u16 = 2;
+/// Length of the random, signed transaction ID carried by every setup frame.
+pub const TRANSACTION_ID_LEN: usize = 16;
+/// A fresh random identifier shared by every frame of one setup operation.
+pub type TransactionId = [u8; TRANSACTION_ID_LEN];
 
 /// Maximum bytes accepted in one setup frame. This matches the transport cap.
 pub const MAX_SETUP_FRAME_BYTES: usize = p2p_network::MAX_MESSAGE_BYTES;
@@ -45,37 +51,49 @@ const GROUP_WELCOME_ACK: u8 = 10;
 #[derive(Clone, PartialEq, Eq)]
 pub enum SetupMessage {
     /// Ask the peer to generate a KeyPackage for a new conversation.
-    KeyPackageRequest { conversation_id: [u8; 16] },
+    KeyPackageRequest {
+        conversation_id: [u8; 16],
+        transaction_id: TransactionId,
+    },
     /// Return the generated KeyPackage for that conversation.
     KeyPackageResponse {
         conversation_id: [u8; 16],
+        transaction_id: TransactionId,
         key_package: Vec<u8>,
     },
     /// Add the peer from its KeyPackage and deliver the Welcome.
     Welcome {
         conversation_id: [u8; 16],
+        transaction_id: TransactionId,
         welcome: Vec<u8>,
     },
     /// Acknowledge that the Welcome was accepted and the group was joined.
     WelcomeAck {
         conversation_id: [u8; 16],
+        transaction_id: TransactionId,
         accepted: bool,
     },
     /// Ask an already connected peer to join an existing group.
-    GroupJoinRequest { conversation_id: [u8; 16] },
+    GroupJoinRequest {
+        conversation_id: [u8; 16],
+        transaction_id: TransactionId,
+    },
     /// Return a fresh KeyPackage for a group join request.
     GroupKeyPackageResponse {
         conversation_id: [u8; 16],
+        transaction_id: TransactionId,
         key_package: Vec<u8>,
     },
     /// Deliver a Welcome to a newly added group member.
     GroupWelcome {
         conversation_id: [u8; 16],
+        transaction_id: TransactionId,
         welcome: Vec<u8>,
     },
     /// Apply one authorized epoch-changing MLS commit.
     GroupCommit {
         conversation_id: [u8; 16],
+        transaction_id: TransactionId,
         operation: GroupOperation,
         target: Option<PeerId>,
         commit: Vec<u8>,
@@ -83,12 +101,14 @@ pub enum SetupMessage {
     /// Acknowledge that a group commit was applied or report rejection.
     GroupCommitAck {
         conversation_id: [u8; 16],
+        transaction_id: TransactionId,
         operation: GroupOperation,
         accepted: bool,
     },
     /// Acknowledge that a group Welcome was accepted and joined.
     GroupWelcomeAck {
         conversation_id: [u8; 16],
+        transaction_id: TransactionId,
         accepted: bool,
     },
 }
@@ -109,9 +129,12 @@ impl SetupMessage {
         }
     }
 
-    fn conversation_id(&self) -> &[u8; 16] {
+    /// The conversation this setup frame belongs to.
+    pub fn conversation_id(&self) -> &[u8; 16] {
         match self {
-            Self::KeyPackageRequest { conversation_id }
+            Self::KeyPackageRequest {
+                conversation_id, ..
+            }
             | Self::KeyPackageResponse {
                 conversation_id, ..
             }
@@ -121,7 +144,9 @@ impl SetupMessage {
             | Self::WelcomeAck {
                 conversation_id, ..
             }
-            | Self::GroupJoinRequest { conversation_id }
+            | Self::GroupJoinRequest {
+                conversation_id, ..
+            }
             | Self::GroupKeyPackageResponse {
                 conversation_id, ..
             }
@@ -137,6 +162,22 @@ impl SetupMessage {
             | Self::GroupWelcomeAck {
                 conversation_id, ..
             } => conversation_id,
+        }
+    }
+
+    /// The signed transaction ID shared by every frame of one setup operation.
+    pub fn transaction_id(&self) -> &TransactionId {
+        match self {
+            Self::KeyPackageRequest { transaction_id, .. }
+            | Self::KeyPackageResponse { transaction_id, .. }
+            | Self::Welcome { transaction_id, .. }
+            | Self::WelcomeAck { transaction_id, .. }
+            | Self::GroupJoinRequest { transaction_id, .. }
+            | Self::GroupKeyPackageResponse { transaction_id, .. }
+            | Self::GroupWelcome { transaction_id, .. }
+            | Self::GroupCommit { transaction_id, .. }
+            | Self::GroupCommitAck { transaction_id, .. }
+            | Self::GroupWelcomeAck { transaction_id, .. } => transaction_id,
         }
     }
 
@@ -168,17 +209,22 @@ impl SetupMessage {
     fn from_parts(
         code: u8,
         conversation_id: [u8; 16],
+        transaction_id: TransactionId,
         payload: Vec<u8>,
     ) -> Result<Self, ChatError> {
         match code {
             KEY_PACKAGE_REQUEST => {
                 expect_empty(&payload)?;
-                Ok(Self::KeyPackageRequest { conversation_id })
+                Ok(Self::KeyPackageRequest {
+                    conversation_id,
+                    transaction_id,
+                })
             }
             KEY_PACKAGE_RESPONSE => {
                 expect_payload(&payload)?;
                 Ok(Self::KeyPackageResponse {
                     conversation_id,
+                    transaction_id,
                     key_package: payload,
                 })
             }
@@ -186,6 +232,7 @@ impl SetupMessage {
                 expect_payload(&payload)?;
                 Ok(Self::Welcome {
                     conversation_id,
+                    transaction_id,
                     welcome: payload,
                 })
             }
@@ -193,17 +240,22 @@ impl SetupMessage {
                 let accepted = parse_ack(&payload, "invalid welcome acknowledgement")?;
                 Ok(Self::WelcomeAck {
                     conversation_id,
+                    transaction_id,
                     accepted,
                 })
             }
             GROUP_JOIN_REQUEST => {
                 expect_empty(&payload)?;
-                Ok(Self::GroupJoinRequest { conversation_id })
+                Ok(Self::GroupJoinRequest {
+                    conversation_id,
+                    transaction_id,
+                })
             }
             GROUP_KEY_PACKAGE_RESPONSE => {
                 expect_payload(&payload)?;
                 Ok(Self::GroupKeyPackageResponse {
                     conversation_id,
+                    transaction_id,
                     key_package: payload,
                 })
             }
@@ -211,6 +263,7 @@ impl SetupMessage {
                 expect_payload(&payload)?;
                 Ok(Self::GroupWelcome {
                     conversation_id,
+                    transaction_id,
                     welcome: payload,
                 })
             }
@@ -218,6 +271,7 @@ impl SetupMessage {
                 let (operation, target, commit) = parse_group_commit_payload(&payload)?;
                 Ok(Self::GroupCommit {
                     conversation_id,
+                    transaction_id,
                     operation,
                     target,
                     commit,
@@ -233,6 +287,7 @@ impl SetupMessage {
                     .ok_or(ChatError::InvalidSetup("unknown group operation"))?;
                 Ok(Self::GroupCommitAck {
                     conversation_id,
+                    transaction_id,
                     operation,
                     accepted: payload[1] == 1,
                 })
@@ -241,6 +296,7 @@ impl SetupMessage {
                 let accepted = parse_ack(&payload, "invalid group welcome acknowledgement")?;
                 Ok(Self::GroupWelcomeAck {
                     conversation_id,
+                    transaction_id,
                     accepted,
                 })
             }
@@ -266,6 +322,7 @@ impl fmt::Debug for SetupMessage {
         f.debug_struct("SetupMessage")
             .field("kind", &kind)
             .field("conversation_id", &hex(self.conversation_id()))
+            .field("transaction_id", &hex(self.transaction_id()))
             .field(
                 "payload_len",
                 &self.payload().map(|payload| payload.len()).unwrap_or(0),
@@ -313,9 +370,15 @@ impl SetupEnvelope {
             return Err(ChatError::InvalidSetup("wrong frame magic"));
         }
         let version = reader.u16()?;
-        if version != SETUP_VERSION {
-            return Err(ChatError::InvalidSetup("unsupported frame version"));
+        if version == 1 {
+            return Err(ChatError::InvalidSetup(
+                "unsupported setup frame version 1; transaction IDs are required",
+            ));
         }
+        if version != SETUP_VERSION {
+            return Err(ChatError::InvalidSetup("unsupported setup frame version"));
+        }
+        let transaction_id = reader.fixed::<TRANSACTION_ID_LEN>()?;
         let code = reader.u8()?;
         let conversation_id = reader.fixed::<16>()?;
         let sender_public_key = reader.var(MAX_PUBLIC_KEY_BYTES)?;
@@ -326,7 +389,7 @@ impl SetupEnvelope {
 
         let sender = PeerId::from_bytes(&sender_bytes)
             .map_err(|_| ChatError::InvalidSetup("invalid sender PeerId"))?;
-        let message = SetupMessage::from_parts(code, conversation_id, payload)?;
+        let message = SetupMessage::from_parts(code, conversation_id, transaction_id, payload)?;
         let envelope = Self {
             sender,
             sender_public_key,
@@ -373,6 +436,7 @@ impl SetupEnvelope {
         let mut bytes = Vec::with_capacity(self.message.payload()?.len() + 128);
         bytes.extend_from_slice(&SETUP_MAGIC);
         bytes.extend_from_slice(&SETUP_VERSION.to_le_bytes());
+        bytes.extend_from_slice(self.message.transaction_id());
         bytes.push(self.message.code());
         bytes.extend_from_slice(self.message.conversation_id());
         put_bytes(&mut bytes, &self.sender_public_key)?;
@@ -573,10 +637,16 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p2p_messaging::random_id;
+
+    fn txid() -> TransactionId {
+        random_id().expect("random transaction id")
+    }
 
     fn message() -> SetupMessage {
         SetupMessage::KeyPackageResponse {
             conversation_id: [7u8; 16],
+            transaction_id: txid(),
             key_package: b"opaque key package bytes".to_vec(),
         }
     }
@@ -601,6 +671,7 @@ mod tests {
                 &identity,
                 SetupMessage::WelcomeAck {
                     conversation_id: [9u8; 16],
+                    transaction_id: txid(),
                     accepted,
                 },
             )
@@ -640,6 +711,7 @@ mod tests {
         let identity = Identity::generate().expect("identity");
         let oversized = SetupMessage::KeyPackageResponse {
             conversation_id: [1u8; 16],
+            transaction_id: txid(),
             key_package: vec![0u8; MAX_SETUP_PAYLOAD_BYTES + 1],
         };
         assert!(SetupEnvelope::new(&identity, oversized).is_err());
@@ -653,6 +725,7 @@ mod tests {
             &identity,
             SetupMessage::Welcome {
                 conversation_id: [3u8; 16],
+                transaction_id: txid(),
                 welcome: secret,
             },
         )
@@ -669,43 +742,54 @@ mod tests {
         let target = Identity::generate().expect("target").peer_id();
         let conversation_id = [11u8; 16];
         let cases = [
-            SetupMessage::GroupJoinRequest { conversation_id },
+            SetupMessage::GroupJoinRequest {
+                conversation_id,
+                transaction_id: txid(),
+            },
             SetupMessage::GroupKeyPackageResponse {
                 conversation_id,
+                transaction_id: txid(),
                 key_package: b"group key package".to_vec(),
             },
             SetupMessage::GroupWelcome {
                 conversation_id,
+                transaction_id: txid(),
                 welcome: b"group welcome".to_vec(),
             },
             SetupMessage::GroupCommit {
                 conversation_id,
+                transaction_id: txid(),
                 operation: GroupOperation::Add,
                 target: Some(target),
                 commit: b"group commit".to_vec(),
             },
             SetupMessage::GroupCommit {
                 conversation_id,
+                transaction_id: txid(),
                 operation: GroupOperation::Update,
                 target: None,
                 commit: b"update commit".to_vec(),
             },
             SetupMessage::GroupCommitAck {
                 conversation_id,
+                transaction_id: txid(),
                 operation: GroupOperation::Remove,
                 accepted: true,
             },
             SetupMessage::GroupCommitAck {
                 conversation_id,
+                transaction_id: txid(),
                 operation: GroupOperation::Update,
                 accepted: false,
             },
             SetupMessage::GroupWelcomeAck {
                 conversation_id,
+                transaction_id: txid(),
                 accepted: true,
             },
             SetupMessage::GroupWelcomeAck {
                 conversation_id,
+                transaction_id: txid(),
                 accepted: false,
             },
         ];
@@ -728,25 +812,48 @@ mod tests {
         let mut unknown_operation = vec![GroupOperation::Add.code() + 9, 0];
         unknown_operation.extend_from_slice(b"commit");
         assert!(
-            SetupMessage::from_parts(GROUP_COMMIT, conversation_id, unknown_operation).is_err()
+            SetupMessage::from_parts(GROUP_COMMIT, conversation_id, txid(), unknown_operation)
+                .is_err()
         );
 
         let mut bad_target_flag = vec![GroupOperation::Remove.code(), 2];
         bad_target_flag.extend_from_slice(b"commit");
-        assert!(SetupMessage::from_parts(GROUP_COMMIT, conversation_id, bad_target_flag).is_err());
+        assert!(
+            SetupMessage::from_parts(GROUP_COMMIT, conversation_id, txid(), bad_target_flag)
+                .is_err()
+        );
 
         let mut truncated_target = vec![GroupOperation::Remove.code(), 1, 8, 0, 0, 0];
         truncated_target.extend_from_slice(&[7u8; 4]);
-        assert!(SetupMessage::from_parts(GROUP_COMMIT, conversation_id, truncated_target).is_err());
+        assert!(
+            SetupMessage::from_parts(GROUP_COMMIT, conversation_id, txid(), truncated_target)
+                .is_err()
+        );
 
         let missing_commit = vec![GroupOperation::Update.code(), 0];
-        assert!(SetupMessage::from_parts(GROUP_COMMIT, conversation_id, missing_commit).is_err());
+        assert!(
+            SetupMessage::from_parts(GROUP_COMMIT, conversation_id, txid(), missing_commit)
+                .is_err()
+        );
 
-        assert!(SetupMessage::from_parts(GROUP_COMMIT_ACK, conversation_id, vec![1]).is_err());
-        assert!(SetupMessage::from_parts(GROUP_COMMIT_ACK, conversation_id, vec![1, 2]).is_err());
-        assert!(SetupMessage::from_parts(GROUP_COMMIT_ACK, conversation_id, vec![99, 1]).is_err());
-        assert!(SetupMessage::from_parts(GROUP_WELCOME_ACK, conversation_id, vec![1, 1]).is_err());
-        assert!(SetupMessage::from_parts(GROUP_JOIN_REQUEST, conversation_id, vec![0]).is_err());
+        assert!(
+            SetupMessage::from_parts(GROUP_COMMIT_ACK, conversation_id, txid(), vec![1]).is_err()
+        );
+        assert!(
+            SetupMessage::from_parts(GROUP_COMMIT_ACK, conversation_id, txid(), vec![1, 2])
+                .is_err()
+        );
+        assert!(
+            SetupMessage::from_parts(GROUP_COMMIT_ACK, conversation_id, txid(), vec![99, 1])
+                .is_err()
+        );
+        assert!(
+            SetupMessage::from_parts(GROUP_WELCOME_ACK, conversation_id, txid(), vec![1, 1])
+                .is_err()
+        );
+        assert!(
+            SetupMessage::from_parts(GROUP_JOIN_REQUEST, conversation_id, txid(), vec![0]).is_err()
+        );
     }
 
     #[test]
@@ -754,6 +861,7 @@ mod tests {
         let identity = Identity::generate().expect("identity");
         let oversized = SetupMessage::GroupCommit {
             conversation_id: [13u8; 16],
+            transaction_id: txid(),
             operation: GroupOperation::Add,
             target: None,
             commit: vec![0u8; MAX_SETUP_PAYLOAD_BYTES + 1],
@@ -764,6 +872,7 @@ mod tests {
             &identity,
             SetupMessage::GroupWelcome {
                 conversation_id: [13u8; 16],
+                transaction_id: txid(),
                 welcome: b"signed welcome".to_vec(),
             },
         )
@@ -784,6 +893,7 @@ mod tests {
             &identity,
             SetupMessage::GroupWelcome {
                 conversation_id: [14u8; 16],
+                transaction_id: txid(),
                 welcome: secret.to_vec(),
             },
         )
@@ -792,6 +902,7 @@ mod tests {
             &identity,
             SetupMessage::GroupCommit {
                 conversation_id: [14u8; 16],
+                transaction_id: txid(),
                 operation: GroupOperation::Add,
                 target: None,
                 commit: commit_secret.to_vec(),
@@ -805,5 +916,188 @@ mod tests {
         assert!(debug.contains("group-welcome"));
         assert!(debug.contains("group-commit"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn every_role_and_transaction_carries_a_distinct_signed_id() {
+        let inviter = Identity::generate().expect("inviter identity");
+        let responder = Identity::generate().expect("responder identity");
+        let target = Identity::generate().expect("target identity").peer_id();
+        let conversation_id = [21u8; 16];
+        let ids: Vec<TransactionId> = (0..10).map(|n| [n + 1; TRANSACTION_ID_LEN]).collect();
+        let cases = [
+            (
+                &inviter,
+                SetupMessage::KeyPackageRequest {
+                    conversation_id,
+                    transaction_id: ids[0],
+                },
+            ),
+            (
+                &responder,
+                SetupMessage::KeyPackageResponse {
+                    conversation_id,
+                    transaction_id: ids[1],
+                    key_package: b"key package".to_vec(),
+                },
+            ),
+            (
+                &inviter,
+                SetupMessage::Welcome {
+                    conversation_id,
+                    transaction_id: ids[2],
+                    welcome: b"welcome".to_vec(),
+                },
+            ),
+            (
+                &responder,
+                SetupMessage::WelcomeAck {
+                    conversation_id,
+                    transaction_id: ids[3],
+                    accepted: true,
+                },
+            ),
+            (
+                &inviter,
+                SetupMessage::GroupJoinRequest {
+                    conversation_id,
+                    transaction_id: ids[4],
+                },
+            ),
+            (
+                &responder,
+                SetupMessage::GroupKeyPackageResponse {
+                    conversation_id,
+                    transaction_id: ids[5],
+                    key_package: b"group key package".to_vec(),
+                },
+            ),
+            (
+                &inviter,
+                SetupMessage::GroupWelcome {
+                    conversation_id,
+                    transaction_id: ids[6],
+                    welcome: b"group welcome".to_vec(),
+                },
+            ),
+            (
+                &inviter,
+                SetupMessage::GroupCommit {
+                    conversation_id,
+                    transaction_id: ids[7],
+                    operation: GroupOperation::Add,
+                    target: Some(target),
+                    commit: b"commit".to_vec(),
+                },
+            ),
+            (
+                &responder,
+                SetupMessage::GroupCommitAck {
+                    conversation_id,
+                    transaction_id: ids[8],
+                    operation: GroupOperation::Add,
+                    accepted: true,
+                },
+            ),
+            (
+                &responder,
+                SetupMessage::GroupWelcomeAck {
+                    conversation_id,
+                    transaction_id: ids[9],
+                    accepted: true,
+                },
+            ),
+        ];
+
+        let mut seen = std::collections::BTreeSet::new();
+        for (signer, message) in cases {
+            assert!(seen.insert(*message.transaction_id()));
+            let envelope = SetupEnvelope::new(signer, message.clone()).expect("signed frame");
+            let bytes = envelope.to_bytes().expect("encoded frame");
+            let decoded = SetupEnvelope::from_bytes(&bytes).expect("decoded frame");
+            assert_eq!(decoded.message.transaction_id(), message.transaction_id());
+            decoded.verify(&signer.peer_id()).expect("valid signature");
+        }
+        assert_eq!(seen.len(), ids.len());
+    }
+
+    #[test]
+    fn transaction_id_round_trips_and_is_covered_by_the_signature() {
+        let identity = Identity::generate().expect("identity");
+        let transaction_id = [0xa5u8; TRANSACTION_ID_LEN];
+        let envelope = SetupEnvelope::new(
+            &identity,
+            SetupMessage::WelcomeAck {
+                conversation_id: [22u8; 16],
+                transaction_id,
+                accepted: true,
+            },
+        )
+        .expect("signed ack");
+        let mut bytes = envelope.to_bytes().expect("encoded ack");
+
+        // magic || version || transaction id: the ID is in the signed header.
+        assert_eq!(&bytes[..4], &SETUP_MAGIC);
+        assert_eq!(&bytes[4..6], &SETUP_VERSION.to_le_bytes());
+        assert_eq!(&bytes[6..6 + TRANSACTION_ID_LEN], &transaction_id);
+
+        let decoded = SetupEnvelope::from_bytes(&bytes).expect("decoded ack");
+        assert_eq!(decoded.message.transaction_id(), &transaction_id);
+        decoded.verify(&identity.peer_id()).expect("valid ack");
+
+        bytes[6] ^= 1;
+        let tampered = SetupEnvelope::from_bytes(&bytes).expect("decoded tampered ack");
+        assert_ne!(tampered.message.transaction_id(), &transaction_id);
+        assert!(matches!(
+            tampered.verify(&identity.peer_id()),
+            Err(ChatError::InvalidSetup("signature is invalid"))
+        ));
+    }
+
+    #[test]
+    fn version_one_and_unknown_version_frames_are_rejected() {
+        let identity = Identity::generate().expect("identity");
+        let bytes = SetupEnvelope::new(
+            &identity,
+            SetupMessage::KeyPackageRequest {
+                conversation_id: [23u8; 16],
+                transaction_id: txid(),
+            },
+        )
+        .expect("signed frame")
+        .to_bytes()
+        .expect("encoded frame");
+
+        let mut v1 = bytes.clone();
+        v1[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let v1_error = SetupEnvelope::from_bytes(&v1).expect_err("v1 is rejected");
+        assert!(v1_error.to_string().contains("unsupported"));
+        assert!(v1_error.to_string().contains("version 1"));
+
+        let mut future = bytes;
+        future[4..6].copy_from_slice(&(SETUP_VERSION + 1).to_le_bytes());
+        assert!(SetupEnvelope::from_bytes(&future).is_err());
+    }
+
+    #[test]
+    fn truncated_and_trailing_transaction_header_bytes_are_rejected() {
+        let identity = Identity::generate().expect("identity");
+        let bytes = SetupEnvelope::new(
+            &identity,
+            SetupMessage::KeyPackageRequest {
+                conversation_id: [24u8; 16],
+                transaction_id: txid(),
+            },
+        )
+        .expect("signed frame")
+        .to_bytes()
+        .expect("encoded frame");
+
+        for len in 6..6 + TRANSACTION_ID_LEN {
+            assert!(SetupEnvelope::from_bytes(&bytes[..len]).is_err());
+        }
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(SetupEnvelope::from_bytes(&trailing).is_err());
     }
 }

@@ -112,11 +112,11 @@ pub enum RelayEvent {
 /// universal reachability.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NatEvent {
-    /// AutoNAT reported a status change.
+    /// AutoNAT reported a status change. libp2p 0.56's AutoNAT v1
+    /// `StatusChanged` event has no confidence value; none is synthesized here.
     StatusChanged {
         status: String,
         address: Option<Multiaddr>,
-        confidence: u32,
     },
     /// DCUtR reported a hole-punch attempt outcome.
     HolePunch {
@@ -158,12 +158,21 @@ pub struct NetworkPrivacyStatus {
     pub relay_servers: usize,
     pub autonat_enabled: bool,
     pub dcutr_enabled: bool,
+    /// Latest advisory candidate count from discovery events.
     pub discovered_candidates: usize,
+    /// Latest advisory Kademlia route count from discovery events.
     pub kad_routes: usize,
+    /// Cumulative reservation events observed since worker startup, not the
+    /// number of currently held reservations.
     pub relay_reservations: usize,
+    /// Cumulative circuit events observed since worker startup, not the number
+    /// of currently live circuits.
     pub relay_circuits: usize,
     pub nat_status: String,
+    /// Cumulative identify events observed since worker startup, not the number
+    /// of currently identified or connected peers.
     pub identified_peers: usize,
+    /// Latest live relayed-connection count reported by a transport event.
     pub relayed_connections: usize,
 }
 
@@ -228,6 +237,16 @@ mod tests {
         let bounded = bounded_text(&value, 32);
         assert_eq!(bounded.chars().count(), 35);
         assert!(bounded.ends_with("..."));
+    }
+
+    #[test]
+    fn nat_status_change_has_no_fabricated_confidence() {
+        // AutoNAT v1 StatusChanged in libp2p 0.56 exposes no confidence value.
+        let event = NatEvent::StatusChanged {
+            status: "Private".to_owned(),
+            address: None,
+        };
+        assert!(matches!(event, NatEvent::StatusChanged { .. }));
     }
 
     #[test]

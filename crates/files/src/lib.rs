@@ -17,6 +17,7 @@
 mod frame;
 mod transfer;
 
+use std::fmt;
 use std::path::PathBuf;
 
 pub use frame::{
@@ -111,6 +112,8 @@ pub enum FileError {
     QuarantineAlreadyDeleted,
     #[error("quarantine deletion failed")]
     QuarantineDeletionFailed,
+    #[error("transfer has already completed and cannot be aborted")]
+    TransferCompleted,
 }
 
 /// Explicit quarantine deletion policy. Integrity verification, format
@@ -134,10 +137,19 @@ impl QuarantineDeletionPolicy {
 
 /// Local file-transfer policy. Only the quarantine directory is user-visible;
 /// all other limits are fixed protocol constants.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct FileConfig {
     pub quarantine_dir: PathBuf,
     pub quarantine_deletion: QuarantineDeletionPolicy,
+}
+
+impl fmt::Debug for FileConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileConfig")
+            .field("quarantine_dir", &"<redacted local path>")
+            .field("quarantine_deletion", &self.quarantine_deletion)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for FileConfig {
@@ -210,6 +222,13 @@ impl TransferStatus {
 
     pub fn completed(self) -> bool {
         matches!(self, Self::IntegrityVerified)
+    }
+
+    /// True while the transfer is still exchanging frames. A failed or
+    /// integrity-verified transfer is terminal and cannot be aborted; a
+    /// completed transfer may still have a separate release decision.
+    pub fn active(self) -> bool {
+        !matches!(self, Self::IntegrityVerified | Self::Failed(_))
     }
 }
 

@@ -1,0 +1,113 @@
+# Threat Model
+
+This model states attacker capabilities separately from properties the code currently demonstrates. "Expected defense" is not a claim unless the corresponding test is listed and passing.
+
+## 1. Protected assets
+
+| Asset | Protection boundary | Current status |
+|---|---|---|
+| Vault master key / password | Argon2id-wrapped random key; zeroizing buffers; no plaintext persistence | Implemented and tested |
+| Device identity private key | Noise-authenticated transport key; encrypted vault export only; redacted `Debug` | Implemented, but reused across roles |
+| Message plaintext | MLS application encryption; memory-only display; no plaintext logs | Implemented and tested |
+| MLS ratchet/group state | OpenMLS in-memory provider | Implemented in memory; no encrypted persistence/restore; the control digest log does not restore it |
+| Control-frame digest continuity | Schema v4 chained log + AEAD vault anchor | Implemented for partial local detection; DB-only rollback and anchor tamper detected, full vault including anchor not detectable locally |
+| File plaintext | Fresh AEAD key; zeroizing buffers; quarantine ciphertext only | Implemented for tested flows |
+| Contact verification state | Out-of-band fingerprint comparison; explicit user action | Implemented; no automatic trust promotion |
+| Honest status | UI rows derived from observed transport/application events | Implemented; monotonic counters are labelled as observations |
+
+## 2. Trust boundaries
+
+1. **Local user and process.** Trusted with decrypted data in memory, but not with silent protocol-state changes: setup/group transitions require signed frames and explicit state checks.
+2. **Noise-authenticated peer.** Authenticated at transport layer only. May be malicious, replay frames, send malformed input, or attempt protocol desynchronization.
+3. **MLS group member.** Authenticated for group membership. In the current channel design, every group member possesses the MLS keys for all logical channels.
+4. **Optional relay operator.** Can observe circuit metadata and ciphertext sizes/timing, delay, drop, or deny service. Cannot decrypt Noise or MLS payloads.
+5. **Optional discovery/NAT/identify sources.** Advisory only. Never promoted to contacts, trust, delivery, or verification.
+6. **Local filesystem attacker.** Can read the vault/quarantine directory. May be able to write or restore snapshots if the OS account is compromised.
+7. **Software supply-chain actor.** May attempt to publish modified dependencies, artifacts, or downgrade versions.
+
+## 3. Attacker profiles
+
+### Attacker A — Network observer
+
+- **Capabilities:** Observe source/destination IP, packet sizes, timing, connection duration, and frequency.
+- **Assumptions:** No access to endpoint memory or Noise keys.
+- **Scenarios:** Link a stable PeerId to activity; infer conversation timing and message-size classes.
+- **Expected defenses:** Noise hides payloads; no plaintext headers; direct mode is labelled non-anonymous.
+- **Tests:** Direct-connect wire tests; address validation tests; GUI anonymity status row.
+- **Residual risk:** Full metadata linkability remains. No padding, mixnet, or anonymity route exists.
+
+### Attacker B — Malicious network peer
+
+- **Capabilities:** Send malformed, oversized, replayed, or out-of-order frames; disconnect; advertise addresses; exhaust request budgets.
+- **Assumptions:** Holds a valid Noise key and can establish a connection.
+- **Scenarios:** Frame parser abuse, replayed setup frames, cross-conversation substitution, connection/request flooding.
+- **Expected defenses:** Bounded decoders with strict magic/version/length checks; message replay cache and sequence high-water mark; signed v2 setup frames with transaction IDs plus a bounded digest replay cache; aggregate and per-protocol request caps; PeerId binding.
+- **Tests:** Envelope tamper/replay/sequence and mutation tests; setup transaction/tamper/replay-cache tests; bounded codec tests; aggregate and cross-protocol resilience tests.
+- **Residual risk:** The 512-entry setup/group-control cache is bounded and memory-only, but the schema v4 chained, blind-indexed digest log plus vault anchor rejects exact authenticated terminal replays after restart and keeps request retries idempotent; it fails closed at 4096 entries or malformed records and does not replace transaction binding or MLS state guards. Restoring the whole vault including the anchor is not locally detectable. Per-protocol reservations are bounded by the configured aggregate request/byte ceiling and are not a distributed-flood or OS-resource guarantee. Explicit pending-socket caps (16 inbound and 16 outbound by default) and a per-source-IP pre-auth cap (four direct TCP upgrades by default) bound concurrent handshakes, but distributed floods and OS-level resource exhaustion require external capacity testing.
+
+### Attacker C — Malicious group member
+
+- **Capabilities:** Send group-control frames, replay commits, attempt unauthorized channel access, exploit epoch confusion.
+- **Assumptions:** Is an authenticated MLS group member.
+- **Scenarios:** Forge admin role, replay old commit, decrypt a restricted-channel ciphertext obtained out of band.
+- **Expected defenses:** Creator-admin authorization, signed commit operation/target binding, epoch checks, MLS sender credential checks, removed-member epoch exclusion.
+- **Tests:** MLS Add/Remove/Update tests, stale-epoch rejection, group receipt tests, honest restricted-channel delivery tests.
+- **Residual risk:** Channel confidentiality is not cryptographic. Role delegation is not implemented. Setup/group-control frames now have a bounded memory cache plus a durable chained digest log with anchor verification on unlock, but it is partial local continuity, not a replay-proof log or MLS state restoration.
+
+### Attacker D — Compromised device / local disk extractor
+
+- **Capabilities:** Read vault and quarantine files; possibly restore snapshots; inspect process memory if fully compromised.
+- **Assumptions:** Knows or can guess the password only within Argon2id limits; may not have live memory access.
+- **Scenarios:** Offline password guessing, plaintext grep of DB/WAL/SHM, key extraction, snapshot rollback, symlink redirection.
+- **Expected defenses:** Argon2id; AEAD ciphertext; blind indexes; zeroizing buffers; redacted `Debug`; Unix symlink refusal; `secure_delete`; bounded SQLite temp handling; schema v4 chained control log with `<vault>/control.anchor` verified on unlock.
+- **Tests:** Vault wrong-password/change/plaintext scans; identity envelope tests; Unix symlink tests; redacted-debug tests; durable replay/idempotence after reopen, older-DB-with-current-anchor rollback detection, and anchor bit-flip detection.
+- **Residual risk:** No Windows ACL hardening, no secure erasure guarantee, no external anchor (a full vault restored with its anchor is not locally detectable), no encrypted MLS persistence, and full device compromise exposes decrypted memory.
+
+### Attacker E — Malicious relay / storage operator
+
+- **Capabilities:** Observe circuit metadata and ciphertext sizes/timing; drop, delay, replay transport bytes; deny service.
+- **Assumptions:** Does not possess endpoint Noise or MLS keys.
+- **Scenarios:** Inspect file offer to recover content key; tamper with relayed ciphertext; replay stored ciphertext.
+- **Expected defenses:** Noise terminates at endpoints; relay copies opaque bytes; MLS and file AEAD reject tampering; file transfer over observed relayed paths is disabled by conservative policy.
+- **Tests:** Source-level libp2p verification; direct wire tests; targeted and final-workspace inbound relay-policy tests.
+- **Residual risk:** No live three-node relay interception test has been run on this host. No decentralized mailbox/storage protocol exists.
+
+### Attacker F — Malicious software update / supply chain
+
+- **Capabilities:** Publish modified dependency versions, artifacts, or old vulnerable releases.
+- **Assumptions:** Can influence registry or release channel but cannot sign with the developer key if signing is configured.
+- **Scenarios:** Dependency confusion, yanked/crate compromise, modified installer, downgrade.
+- **Expected defenses:** `Cargo.lock`, locked builds, checksums, source-first packaging, and SHA-pinned external workflow actions.
+- **Tests:** Locked CI builds and release checksum verification.
+- **Residual risk:** A security workflow and `deny.toml` are configured; local advisory/license/ban/source checks now pass for both lockfiles after upgrading libp2p and the OpenMLS provider line. `cargo audit` still reports unmaintained warnings, and the OpenMLS fix is on a release-candidate line. Deterministic SBOMs exist but provide only locked source-graph inventory. Signed artifacts, provenance, and reproducible builds remain absent; pinned actions are not independently audited, signature-verified, or proven trustworthy. Checksums prove release-channel consistency, not developer identity.
+
+## 4. Attack-to-mitigation matrix
+
+| Attack | Primary mitigation | Verified locally | Residual risk |
+|---|---|---|---|
+| Wrong PeerId impersonation | Noise PeerId binding + envelope public-key binding | Yes | Human identity still requires out-of-band fingerprint |
+| Envelope replay | Message-ID cache + sequence high-water mark + epoch checks | Yes | Replay state is in-memory; legacy load path is limited |
+| Setup replay/overwrite | Signed v2 frames, strict `(conversation, transaction, peer)` state guards, bounded 512-entry digest cache, and schema v4 chained blind-indexed log anchored by `<vault>/control.anchor` | Yes for tested cases | Memory cache is bounded; durable log caps at 4096 and fails closed; full vault including anchor rollback is not locally detectable |
+| Unauthorized group change | Admin check + signed commit operation/target binding | Yes | No delegated roles |
+| Restricted-channel plaintext disclosure | Sender/recemit operation/target binding | Yes | No delegated roles |
+| Restricted-channel plaintext disclosure | Sender/receiver policy only | Yes for honest clients | Excluded MLS members can decrypt obtained ciphertext |
+| Relay content-key disclosure | Noise terminates at endpoints | Source verified | No live three-node capture test |
+| File tampering | Fresh AEAD key, AAD, manifest hash, full hash | Yes | Scanner availability is a separate policy gate |
+| Stalled file transfer | Inactivity deadline, separate abort, local key zeroization, pending-request cleanup, incomplete quarantine cleanup | Yes for loopback timeout/abort tests | Worker request already queued in libp2p cannot be withdrawn; late responses are ignored |
+| Malicious file execution | No auto-execute; narrow validation; explicit release | Yes | No general format/MIME parser or real scanner configured |
+| Vault plaintext grep | AEAD at rest + blind indexes + WAL/SHM scans | Yes | Full-vault snapshot rollback including the anchor is undetectable locally; DB-only rollback is detected |
+| DB-only rollback / anchor tamper | Schema v4 chain plus `control.anchor` verified on unlock | Yes | Full-vault-plus-anchor restore has no local detection and no external anchor |
+| Symlink redirection | Unix final-path checks; quarantine ancestor-component and parent-traversal rejection | Partially | Vault parent-path symlinks and Windows reparse points remain gaps |
+| Pre-authentication socket flooding | Explicit libp2p pending-inbound/outbound caps plus per-source-IP direct-socket cap before Noise; authenticated aggregate and per-protocol limits after Noise | Yes for stalled-socket and per-IP adversarial tests | No distributed flood benchmark or OS FD-tuning claim; relay upgrades are outside the raw-socket rule |
+| Same-peer cross-protocol starvation | Aggregate per-peer ceiling plus derived per-protocol request/byte reservations; denied requests are not charged | Yes for local loopback | Reservations are bounded by aggregate config; no distributed flood benchmark |
+| Metadata tracing | None | N/A | Direct peers/relays see IP, timing, size |
+| Malicious update | Lockfile + locked builds + checksums + local advisory gate | Partially | No signed artifacts, CI gate run, or provenance claim |
+
+## 5. Assumptions that do not hold
+
+- A successful signature does not prove the real-world identity of a contact.
+- MLS group membership does not prove authorization for a restricted logical channel in the current design.
+- AEAD integrity does not prove a file is free of malware.
+- Transport encryption does not provide anonymity.
+- A direct connection or a discovery candidate does not prove network reachability or user trust.
+- File deletion does not provide cryptographic erasure on SSD/CoW filesystems.

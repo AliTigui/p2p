@@ -22,6 +22,11 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use libp2p::connection_limits::{
+    Behaviour as ConnectionLimitBehaviour, ConnectionLimits as Libp2pConnectionLimits,
+};
+use libp2p::core::muxing::StreamMuxerBox;
+use libp2p::core::transport::Transport;
 use libp2p::futures::StreamExt;
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::behaviour::toggle::Toggle;
@@ -37,8 +42,11 @@ use p2p_identity::Identity;
 use thiserror::Error;
 use tokio::sync::mpsc as tokio_mpsc;
 
+mod pending_admission;
 mod privacy;
 mod protocol;
+
+use pending_admission::PerIpPendingTransport;
 
 pub use privacy::{
     DiscoveryEvent, DiscoverySource, IdentifyEvent, NatEvent, NetworkPrivacyStatus, RelayEvent,
@@ -66,6 +74,10 @@ struct Behaviour {
     relay_server: Toggle<relay::Behaviour>,
     autonat: Toggle<autonat::v1::Behaviour>,
     dcutr: Toggle<dcutr::Behaviour>,
+    // Enforces socket admission limits before Noise authentication. The
+    // established-connection counters below remain authoritative for
+    // per-peer/per-IP policy and relayed-path accounting.
+    connection_limits: ConnectionLimitBehaviour,
 }
 
 /// Errors from the direct-connect network layer.
@@ -77,6 +89,8 @@ pub enum NetworkError {
     Transport(String),
     #[error("invalid peer address: {0}")]
     InvalidAddress(String),
+    #[error("invalid network configuration: {0}")]
+    InvalidConfig(String),
     #[error("network worker is not running")]
     Stopped,
     #[error("dial request could not be queued: {0}")]
@@ -98,6 +112,10 @@ pub enum NetworkError {
     #[error("file transfer over a relay is disabled by policy")]
     FileOverRelay,
 }
+
+/// Shared, static reason for the conservative file-over-relay policy. It is a
+/// metadata/policy choice, not a claim that a relay sees file keys or plaintext.
+const FILE_RELAY_POLICY_REASON: &str = "file transfer over a relay is disabled by policy";
 
 /// Observed connection state. Every variant comes from a real Swarm event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,7 +191,8 @@ fn ip_key(address: &Multiaddr) -> Option<IpKey> {
 }
 
 /// Admission counters for established connections. They are checked at the
-/// authenticated `ConnectionEstablished` event, not at the raw socket layer.
+/// authenticated `ConnectionEstablished` event; raw pre-authentication sockets
+/// are bounded by [`TransportLimits`] and `PerIpPendingTransport`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ConnectionLimits {
     max_total: usize,
@@ -197,40 +216,173 @@ impl ConnectionLimits {
     }
 }
 
+/// Explicit libp2p pending-socket limits enforced before Noise authentication.
+/// `PerIpPendingTransport` adds a per-source-IP pre-auth cap; the worker-side
+/// [`ConnectionLimits`] owns established per-IP and relayed-path policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransportLimits {
+    max_pending_incoming: u32,
+    max_pending_outgoing: u32,
+    max_established_total: u32,
+    max_established_per_peer: u32,
+}
+
+impl TransportLimits {
+    fn from_config(config: &NetworkConfig) -> Result<Self, String> {
+        let u32_value = |value: usize, name: &str| {
+            u32::try_from(value).map_err(|_| format!("{name} exceeds the libp2p u32 limit"))
+        };
+        Ok(Self {
+            max_pending_incoming: config.max_pending_incoming_connections,
+            max_pending_outgoing: config.max_pending_outgoing_connections,
+            max_established_total: u32_value(
+                config.max_total_connections,
+                "max_total_connections",
+            )?,
+            max_established_per_peer: u32_value(
+                config.max_connections_per_peer,
+                "max_connections_per_peer",
+            )?,
+        })
+    }
+
+    fn libp2p(self) -> Libp2pConnectionLimits {
+        Libp2pConnectionLimits::default()
+            .with_max_pending_incoming(Some(self.max_pending_incoming))
+            .with_max_pending_outgoing(Some(self.max_pending_outgoing))
+            .with_max_established(Some(self.max_established_total))
+            .with_max_established_per_peer(Some(self.max_established_per_peer))
+    }
+}
+
+/// Inbound application protocol family used for fair-share rate limiting.
+/// Each family gets a reserved sliding window inside the aggregate per-peer
+/// budget, so one saturated protocol cannot consume another protocol's share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RequestProtocol {
+    Message,
+    Setup,
+    File,
+    Control,
+}
+
+impl RequestProtocol {
+    const ALL: [Self; 4] = [Self::Message, Self::Setup, Self::File, Self::Control];
+}
+
 /// Sliding-window budget for inbound application requests. It counts opaque
 /// request bytes before the application decodes them; responses and transport
-/// handshake bytes are not counted.
+/// handshake bytes are not counted. An aggregate per-peer window remains the
+/// hard ceiling, with a derived per-protocol reservation inside it.
 #[derive(Debug)]
 struct RateLimiter {
     window: Duration,
     max_bytes: usize,
     max_requests: u32,
+    max_protocol_bytes: usize,
+    max_protocol_requests: u32,
     entries: HashMap<PeerId, VecDeque<(Instant, usize)>>,
+    protocol_entries: HashMap<(PeerId, RequestProtocol), VecDeque<(Instant, usize)>>,
 }
 
 impl RateLimiter {
     fn new(config: &NetworkConfig) -> Self {
+        let protocol_count = RequestProtocol::ALL.len();
+        let protocol_count_u32 = protocol_count as u32;
+        let max_protocol_requests = if config.max_requests_per_peer_per_window == 0 {
+            0
+        } else {
+            let requested = config.max_requests_per_peer_per_window;
+            // Preserve a small meaningful burst for each protocol even when
+            // the aggregate ceiling is below four requests; never let the
+            // reservation exceed that ceiling.
+            let minimum = requested.min(2);
+            requested
+                .saturating_add(protocol_count_u32 - 1)
+                .saturating_div(protocol_count_u32)
+                .max(minimum)
+                .min(requested)
+        };
+        // Keep a full frame available per protocol whenever the configured
+        // aggregate ceiling is large enough. Small custom ceilings fall back
+        // to the aggregate byte cap; the aggregate window is always enforced.
+        let max_protocol_bytes = (config.max_request_bytes_per_peer_per_window / protocol_count)
+            .max(MAX_MESSAGE_BYTES)
+            .min(config.max_request_bytes_per_peer_per_window);
         Self {
             window: config.rate_window,
             max_bytes: config.max_request_bytes_per_peer_per_window,
             max_requests: config.max_requests_per_peer_per_window,
+            max_protocol_bytes,
+            max_protocol_requests,
             entries: HashMap::new(),
+            protocol_entries: HashMap::new(),
         }
     }
 
-    fn allow(&mut self, peer: PeerId, bytes: usize, now: Instant) -> bool {
-        let entry = self.entries.entry(peer).or_default();
-        entry.retain(|(seen, _)| now.saturating_duration_since(*seen) < self.window);
+    fn allow(
+        &mut self,
+        peer: PeerId,
+        protocol: RequestProtocol,
+        bytes: usize,
+        now: Instant,
+    ) -> bool {
+        // Sweep every expired history, not only the current peer's: otherwise
+        // distinct-peer churn could grow either map forever. A peer whose
+        // window has fully elapsed has no effect on any current limit, and an
+        // empty entry must never remain after `retain`.
+        for entry in self.entries.values_mut() {
+            entry.retain(|(seen, _)| now.saturating_duration_since(*seen) < self.window);
+        }
+        for entry in self.protocol_entries.values_mut() {
+            entry.retain(|(seen, _)| now.saturating_duration_since(*seen) < self.window);
+        }
+        self.entries.retain(|_, entry| !entry.is_empty());
+        self.protocol_entries.retain(|_, entry| !entry.is_empty());
+
+        let protocol_key = (peer, protocol);
+        // Check both windows before recording either one. A rejected request
+        // must not consume another protocol's aggregate capacity.
+        if !Self::fits(
+            self.entries.get(&peer),
+            bytes,
+            self.max_requests,
+            self.max_bytes,
+        ) || !Self::fits(
+            self.protocol_entries.get(&protocol_key),
+            bytes,
+            self.max_protocol_requests,
+            self.max_protocol_bytes,
+        ) {
+            return false;
+        }
+        Self::record(&mut self.entries, peer, bytes, now);
+        Self::record(&mut self.protocol_entries, protocol_key, bytes, now);
+        true
+    }
+
+    fn fits(
+        entry: Option<&VecDeque<(Instant, usize)>>,
+        bytes: usize,
+        max_requests: u32,
+        max_bytes: usize,
+    ) -> bool {
+        let Some(entry) = entry else {
+            return max_requests > 0 && bytes <= max_bytes;
+        };
         let seen_bytes = entry
             .iter()
             .fold(0usize, |sum, (_, bytes)| sum.saturating_add(*bytes));
-        if entry.len() as u32 >= self.max_requests
-            || seen_bytes.saturating_add(bytes) > self.max_bytes
-        {
-            return false;
-        }
-        entry.push_back((now, bytes));
-        true
+        (entry.len() as u32) < max_requests && seen_bytes.saturating_add(bytes) <= max_bytes
+    }
+
+    fn record<K: Eq + std::hash::Hash>(
+        entries: &mut HashMap<K, VecDeque<(Instant, usize)>>,
+        key: K,
+        bytes: usize,
+        now: Instant,
+    ) {
+        entries.entry(key).or_default().push_back((now, bytes));
     }
 }
 
@@ -258,9 +410,27 @@ impl std::fmt::Display for MessageResponseId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SetupRequestId(u64);
 
+impl SetupRequestId {
+    /// Construct a local transport request identifier. Inbound identifiers are
+    /// normally produced by the swarm worker; this supports explicit event
+    /// construction in tests and adapters.
+    pub fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
 /// Local identifier for one inbound MLS setup request awaiting a response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SetupResponseId(u64);
+
+impl SetupResponseId {
+    /// Construct a local transport response identifier. Inbound identifiers
+    /// are normally produced by the swarm worker; this supports explicit event
+    /// construction in tests and adapters.
+    pub fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+}
 
 impl std::fmt::Display for SetupRequestId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -649,8 +819,14 @@ pub struct NetworkConfig {
     pub max_total_connections: usize,
     /// Hard cap on simultaneous connections to one authenticated PeerId.
     pub max_connections_per_peer: usize,
-    /// Hard cap on simultaneous connections from one observed IP address.
+    /// Hard cap on simultaneous established or pre-authentication connections
+    /// from one observed IP address. Pre-auth slots are released when the
+    /// Noise/Yamux upgrade completes or is dropped.
     pub max_connections_per_ip: usize,
+    /// Hard cap on concurrent inbound sockets before Noise authentication.
+    pub max_pending_incoming_connections: u32,
+    /// Hard cap on concurrent outbound sockets before Noise authentication.
+    pub max_pending_outgoing_connections: u32,
     /// Maximum inbound application requests from one peer per rate window.
     pub max_requests_per_peer_per_window: u32,
     /// Maximum inbound application request bytes from one peer per rate window.
@@ -696,6 +872,8 @@ impl Default for NetworkConfig {
             max_total_connections: 16,
             max_connections_per_peer: 1,
             max_connections_per_ip: 4,
+            max_pending_incoming_connections: 16,
+            max_pending_outgoing_connections: 16,
             max_requests_per_peer_per_window: 64,
             max_request_bytes_per_peer_per_window: 16 * MAX_MESSAGE_BYTES,
             rate_window: Duration::from_secs(1),
@@ -884,6 +1062,9 @@ impl Network {
     /// already awaiting a dial, connection, or failure is rejected so repeated
     /// button presses or retry loops cannot stack duplicate dials.
     pub fn dial(&mut self, address: Multiaddr) -> Result<(), NetworkError> {
+        // Validate before touching the command queue or pending dial map, so
+        // even direct public API callers cannot queue a relay address.
+        validate_direct_peer_address(&address)?;
         let expected = peer_from_address(&address).ok_or_else(|| {
             NetworkError::InvalidAddress("address has no /p2p/<peer-id>".to_owned())
         })?;
@@ -970,6 +1151,13 @@ impl Network {
     /// Hand a signed file frame to the file protocol for one authenticated
     /// peer. The returned ID tracks a transport request; it never means the
     /// file was received, verified, scanned, or safe.
+    ///
+    /// With pinned libp2p 0.56 the relay client transport uses the same Noise
+    /// security upgrade as direct TCP, so a relay forwards opaque Noise bytes
+    /// and cannot read application plaintext or the file content key. It can
+    /// still observe PeerIds, IPs, timing, and sizes. File transfer is
+    /// conservatively disabled on observed relayed paths pending a dedicated
+    /// relay-safe file-key/transport design.
     pub fn send_file(&self, peer: PeerId, bytes: Vec<u8>) -> Result<FileRequestId, NetworkError> {
         validate_message_bytes(&bytes)?;
         let id = FileRequestId(self.next_file_request_id.fetch_add(1, Ordering::Relaxed));
@@ -1162,7 +1350,13 @@ impl Network {
         match self.events.try_recv() {
             Ok(state) => {
                 self.clear_settled_addresses(&state);
-                self.state = state.clone();
+                // A peerless transport failure (for example a rejected inbound
+                // socket) is advisory: the caller still receives it, but it
+                // must not erase live authenticated connections from the
+                // cached state used to decide whether peers are reachable.
+                if !matches!(&state, ConnectionState::Failed { peer: None, .. }) {
+                    self.state = state.clone();
+                }
                 Some(state)
             }
             Err(tokio_mpsc::error::TryRecvError::Empty) => None,
@@ -1259,6 +1453,21 @@ fn privacy_status_from_config(config: &NetworkConfig) -> NetworkPrivacyStatus {
 }
 
 fn validate_config(config: &NetworkConfig) -> Result<(), NetworkError> {
+    if config.max_total_connections == 0
+        || config.max_connections_per_peer == 0
+        || config.max_connections_per_ip == 0
+    {
+        return Err(NetworkError::InvalidConfig(
+            "connection limits must be at least one".to_owned(),
+        ));
+    }
+    if config.max_pending_incoming_connections == 0 || config.max_pending_outgoing_connections == 0
+    {
+        return Err(NetworkError::InvalidConfig(
+            "pending connection limits must be at least one".to_owned(),
+        ));
+    }
+    TransportLimits::from_config(config).map_err(NetworkError::InvalidConfig)?;
     if config.enable_kad && config.kad_bootstrap_peers.is_empty() {
         return Err(NetworkError::InvalidAddress(
             "Kademlia requires at least one user-supplied bootstrap address".to_owned(),
@@ -1539,6 +1748,14 @@ fn run_worker(
                                 emit_connected(&events, &connected);
                             }
                         }
+                        SwarmEvent::IncomingConnectionError { error, .. } => {
+                            // Transport-level rejections (including connection-limit
+                            // denials) are reported as failures, never as connections.
+                            emit(&events, ConnectionState::Failed {
+                                peer: None,
+                                reason: incoming_error_reason(&error),
+                            });
+                        }
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                             if let Some(peer) = peer_id {
                                 expected_peers.remove(&peer);
@@ -1556,7 +1773,12 @@ fn run_worker(
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Messages(event)) => {
                             if let Some((peer, bytes)) = denied_request(&event)
-                                && !rate_limiter.allow(peer, bytes, Instant::now())
+                                && !rate_limiter.allow(
+                                    peer,
+                                    RequestProtocol::Message,
+                                    bytes,
+                                    Instant::now(),
+                                )
                             {
                                 let raw = next_response_id;
                                 next_response_id = next_response_id.checked_add(1).unwrap_or(1);
@@ -1580,7 +1802,12 @@ fn run_worker(
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Setup(event)) => {
                             if let Some((peer, bytes)) = denied_request(&event)
-                                && !rate_limiter.allow(peer, bytes, Instant::now())
+                                && !rate_limiter.allow(
+                                    peer,
+                                    RequestProtocol::Setup,
+                                    bytes,
+                                    Instant::now(),
+                                )
                             {
                                 let raw = next_setup_response_id;
                                 next_setup_response_id =
@@ -1605,7 +1832,12 @@ fn run_worker(
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Files(event)) => {
                             if let Some((peer, bytes)) = denied_request(&event)
-                                && !rate_limiter.allow(peer, bytes, Instant::now())
+                                && !rate_limiter.allow(
+                                    peer,
+                                    RequestProtocol::File,
+                                    bytes,
+                                    Instant::now(),
+                                )
                             {
                                 let raw = next_file_response_id;
                                 next_file_response_id =
@@ -1620,6 +1852,7 @@ fn run_worker(
                             }
                             handle_file_event(
                                 event,
+                                &relayed_peers,
                                 &mut next_file_response_id,
                                 &mut file_outbound_ids,
                                 &mut file_outbound_by_swarm,
@@ -1630,7 +1863,12 @@ fn run_worker(
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Control(event)) => {
                             if let Some((peer, bytes)) = denied_request(&event)
-                                && !rate_limiter.allow(peer, bytes, Instant::now())
+                                && !rate_limiter.allow(
+                                    peer,
+                                    RequestProtocol::Control,
+                                    bytes,
+                                    Instant::now(),
+                                )
                             {
                                 let raw = next_control_response_id;
                                 next_control_response_id =
@@ -1786,11 +2024,7 @@ fn run_worker(
                             };
                             emit_nat(
                                 &nat_events,
-                                NatEvent::StatusChanged {
-                                    status,
-                                    address,
-                                    confidence: 0,
-                                },
+                                NatEvent::StatusChanged { status, address },
                             );
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Dcutr(event)) => emit_nat(
@@ -1927,17 +2161,21 @@ fn run_worker(
                                 });
                                 continue;
                             }
-                            // The signed file offer currently carries the fresh
-                            // content key. A relay operator would see that
-                            // offer, so file transfer is refused on relayed
-                            // paths until a separate E2E key exchange exists.
+                            // libp2p 0.56 upgrades the relay client transport
+                            // with the same Noise upgrade used for direct TCP:
+                            // the relay forwards opaque Noise bytes, so it sees
+                            // PeerIds/IPs/timing/sizes but not application
+                            // plaintext or the file content key. This remains
+                            // a conservative metadata/policy restriction until
+                            // a dedicated relay-safe file-key/transport design
+                            // exists; it is not a claim that the relay can
+                            // read the offer.
                             if relayed_peers.get(&peer).copied().unwrap_or(0) > 0 {
                                 emit_file(&file_events, FileEvent::Failed {
                                     request_id: Some(id),
                                     response_id: None,
                                     peer,
-                                    reason: "file transfer over a relay is disabled by policy"
-                                        .to_owned(),
+                                    reason: FILE_RELAY_POLICY_REASON.to_owned(),
                                 });
                                 continue;
                             }
@@ -2045,6 +2283,7 @@ fn build_swarm(
 ) -> Result<Swarm<Behaviour>, String> {
     let local_peer_id = keypair.public().to_peer_id();
     let connection_timeout = config.connection_timeout;
+    let transport_limits = TransportLimits::from_config(config)?;
 
     let mdns = if config.enable_mdns {
         match mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id) {
@@ -2106,16 +2345,28 @@ fn build_swarm(
         .with_interval(Duration::from_secs(60))
         .with_timeout(Duration::from_secs(10));
 
+    // The standard builder applies libp2p's connection limits only after the
+    // transport emits an inbound connection. Wrap the upgraded TCP transport
+    // so a single source IP cannot occupy the whole pre-authentication budget
+    // with stalled sockets before Noise authentication.
+    let noise = libp2p::noise::Config::new(keypair).map_err(|error| error.to_string())?;
+    let direct_transport = PerIpPendingTransport::new(
+        libp2p::tcp::tokio::Transport::new(Default::default())
+            .upgrade(libp2p::core::upgrade::Version::V1Lazy)
+            .authenticate(noise)
+            .multiplex(libp2p::yamux::Config::default())
+            .map(|(peer, connection), _| (peer, StreamMuxerBox::new(connection))),
+        config.max_connections_per_ip,
+    );
+
     let swarm = SwarmBuilder::with_existing_identity(keypair.clone())
         .with_tokio()
-        .with_tcp(
-            Default::default(),
-            libp2p::noise::Config::new,
-            libp2p::yamux::Config::default,
-        )
+        .with_other_transport(move |_| direct_transport)
         .map_err(|error| error.to_string())?
         // The relay transport is present so client behaviour can be opted in.
         // With the behaviour toggled off it never dials or listens on a relay.
+        // Relay upgrades are composed around the wrapped direct transport, so
+        // this per-IP rule applies only to raw inbound TCP sockets.
         .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)
         .map_err(|error| error.to_string())?
         .with_behaviour(|key, relay_client| Behaviour {
@@ -2173,6 +2424,7 @@ fn build_swarm(
                 .enable_dcutr
                 .then(|| dcutr::Behaviour::new(local_peer_id))
                 .into(),
+            connection_limits: ConnectionLimitBehaviour::new(transport_limits.libp2p()),
         })
         .map_err(|error| error.to_string())?
         .with_swarm_config(std::convert::identity)
@@ -2367,9 +2619,38 @@ fn handle_setup_event(
     }
 }
 
+/// Allocate a response ID for an inbound file request unless the peer is on an
+/// observed relayed path. Rejection emits one `FileEvent::Failed` and allocates
+/// no pending response slot. This helper is separate from the libp2p event
+/// handler so the policy can be tested without constructing a private
+/// `ResponseChannel`.
+fn file_request_policy_response_id(
+    peer: PeerId,
+    relayed_peers: &HashMap<PeerId, usize>,
+    next_response_id: &mut u64,
+    events: &tokio_mpsc::Sender<FileEvent>,
+) -> Option<FileResponseId> {
+    let raw = *next_response_id;
+    *next_response_id = next_response_id.checked_add(1).unwrap_or(1);
+    if relayed_peers.get(&peer).copied().unwrap_or(0) > 0 {
+        emit_file(
+            events,
+            FileEvent::Failed {
+                request_id: None,
+                response_id: Some(FileResponseId(raw)),
+                peer,
+                reason: FILE_RELAY_POLICY_REASON.to_owned(),
+            },
+        );
+        return None;
+    }
+    Some(FileResponseId(raw))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_file_event(
     event: request_response::Event<Vec<u8>, Vec<u8>>,
+    relayed_peers: &HashMap<PeerId, usize>,
     next_response_id: &mut u64,
     outbound_ids: &mut HashMap<FileRequestId, OutboundRequestId>,
     outbound_by_swarm: &mut HashMap<OutboundRequestId, FileRequestId>,
@@ -2387,9 +2668,16 @@ fn handle_file_event(
                 request,
                 channel,
             } => {
-                let raw = *next_response_id;
-                *next_response_id = next_response_id.checked_add(1).unwrap_or(1);
-                let response_id = FileResponseId(raw);
+                let Some(response_id) =
+                    file_request_policy_response_id(peer, relayed_peers, next_response_id, events)
+                else {
+                    // Drop the inbound channel without creating a response
+                    // slot or emitting RequestReceived. The behaviour sees a
+                    // response omission; the application sees only the Failed
+                    // event emitted by the policy helper.
+                    drop(channel);
+                    return;
+                };
                 pending_responses.insert(response_id, (peer, request_id, channel));
                 inbound_by_swarm.insert(request_id, response_id);
                 emit_file(
@@ -2656,6 +2944,15 @@ fn truncate_reason(reason: &str) -> String {
     }
 }
 
+fn incoming_error_reason(error: &libp2p::swarm::ListenError) -> String {
+    if let libp2p::swarm::ListenError::Denied { cause } = error
+        && let Some(exceeded) = cause.downcast_ref::<libp2p::connection_limits::Exceeded>()
+    {
+        return truncate_reason(&exceeded.to_string());
+    }
+    truncate_reason(&error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2667,6 +2964,8 @@ mod tests {
         assert_eq!(config.connection_timeout, Duration::from_secs(10));
         assert_eq!(config.max_redial_attempts, 3);
         assert_eq!(config.max_connections_per_peer, 1);
+        assert_eq!(config.max_pending_incoming_connections, 16);
+        assert_eq!(config.max_pending_outgoing_connections, 16);
         assert!(config.max_request_bytes_per_peer_per_window > MAX_MESSAGE_BYTES);
         assert!(!config.enable_identify);
         assert!(!config.enable_ping);
@@ -2678,6 +2977,52 @@ mod tests {
         assert!(config.relay_servers.is_empty());
         assert_eq!(config.relay_mode, RelayMode::Off);
         assert_eq!(config.max_relayed_connections, 4);
+    }
+
+    #[test]
+    fn transport_limits_map_config_to_explicit_libp2p_bounds() {
+        let config = NetworkConfig::default();
+        assert_eq!(
+            TransportLimits::from_config(&config).expect("transport limits"),
+            TransportLimits {
+                max_pending_incoming: 16,
+                max_pending_outgoing: 16,
+                max_established_total: 16,
+                max_established_per_peer: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn config_validation_rejects_zero_or_oversized_connection_limits() {
+        assert!(matches!(
+            validate_config(&NetworkConfig {
+                max_pending_incoming_connections: 0,
+                ..NetworkConfig::default()
+            }),
+            Err(NetworkError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            validate_config(&NetworkConfig {
+                max_pending_outgoing_connections: 0,
+                ..NetworkConfig::default()
+            }),
+            Err(NetworkError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            validate_config(&NetworkConfig {
+                max_total_connections: 0,
+                ..NetworkConfig::default()
+            }),
+            Err(NetworkError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            validate_config(&NetworkConfig {
+                max_total_connections: usize::MAX,
+                ..NetworkConfig::default()
+            }),
+            Err(NetworkError::InvalidConfig(_))
+        ));
     }
 
     #[test]
@@ -2782,16 +3127,91 @@ mod tests {
                 .to_peer_id();
         let now = Instant::now();
 
-        assert!(limiter.allow(peer_id, 6, now));
-        assert!(limiter.allow(peer_id, 4, now));
-        assert!(!limiter.allow(peer_id, 1, now), "byte cap must be enforced");
+        assert!(limiter.allow(peer_id, RequestProtocol::Message, 6, now));
+        assert!(limiter.allow(peer_id, RequestProtocol::Message, 4, now));
         assert!(
-            !limiter.allow(peer_id, 0, now + Duration::from_millis(500)),
+            !limiter.allow(peer_id, RequestProtocol::Message, 1, now),
+            "byte cap must be enforced"
+        );
+        assert!(
+            !limiter.allow(
+                peer_id,
+                RequestProtocol::Message,
+                0,
+                now + Duration::from_millis(500)
+            ),
             "request count cap must be enforced"
         );
         assert!(
-            limiter.allow(peer_id, 1, now + Duration::from_secs(2)),
+            limiter.allow(
+                peer_id,
+                RequestProtocol::Message,
+                1,
+                now + Duration::from_secs(2)
+            ),
             "old entries must leave the sliding window"
+        );
+    }
+
+    #[test]
+    fn rate_limiter_reserves_protocol_shares_inside_the_aggregate_ceiling() {
+        let config = NetworkConfig {
+            rate_window: Duration::from_secs(1),
+            max_requests_per_peer_per_window: 8,
+            max_request_bytes_per_peer_per_window: 8 * MAX_MESSAGE_BYTES,
+            ..NetworkConfig::default()
+        };
+        let mut limiter = RateLimiter::new(&config);
+        assert_eq!(limiter.max_protocol_requests, 2);
+        assert_eq!(limiter.max_protocol_bytes, 2 * MAX_MESSAGE_BYTES);
+        let peer = generated_peer_id();
+        let now = Instant::now();
+        let frame = MAX_MESSAGE_BYTES;
+
+        assert!(limiter.allow(peer, RequestProtocol::Control, frame, now));
+        assert!(limiter.allow(peer, RequestProtocol::Control, frame, now));
+        assert!(
+            !limiter.allow(peer, RequestProtocol::Control, frame, now),
+            "control must not exceed its reserved byte share"
+        );
+        assert!(
+            limiter.allow(peer, RequestProtocol::Message, frame, now),
+            "saturated control traffic must not block messages"
+        );
+        assert!(limiter.allow(peer, RequestProtocol::Setup, frame, now));
+        assert!(limiter.allow(peer, RequestProtocol::File, frame, now));
+        assert!(limiter.allow(peer, RequestProtocol::Message, frame, now));
+        assert!(
+            !limiter.allow(peer, RequestProtocol::Message, frame, now),
+            "messages must not exceed their reserved byte share"
+        );
+        assert_eq!(limiter.entries.len(), 1);
+        assert_eq!(limiter.protocol_entries.len(), 4);
+    }
+
+    #[test]
+    fn rate_limiter_denied_request_does_not_charge_the_aggregate_budget() {
+        let config = NetworkConfig {
+            rate_window: Duration::from_secs(1),
+            max_requests_per_peer_per_window: 3,
+            max_request_bytes_per_peer_per_window: 64,
+            ..NetworkConfig::default()
+        };
+        let mut limiter = RateLimiter::new(&config);
+        assert_eq!(limiter.max_protocol_requests, 2);
+        let peer = generated_peer_id();
+        let now = Instant::now();
+
+        assert!(limiter.allow(peer, RequestProtocol::Message, 1, now));
+        assert!(limiter.allow(peer, RequestProtocol::Message, 1, now));
+        assert!(!limiter.allow(peer, RequestProtocol::Message, 1, now));
+        assert!(
+            limiter.allow(peer, RequestProtocol::Setup, 1, now),
+            "a per-protocol denial must not consume the aggregate request budget"
+        );
+        assert!(
+            !limiter.allow(peer, RequestProtocol::File, 1, now),
+            "the aggregate request ceiling must still apply"
         );
     }
 
@@ -2843,6 +3263,199 @@ mod tests {
             reason: "dial failed".to_owned(),
         };
         assert!(failed.description().starts_with("Failed:"));
+    }
+
+    #[test]
+    fn peerless_failure_event_does_not_erase_live_connections() {
+        let (mut network, events, _commands) = network_with_test_channels();
+        let peer = generated_peer_id();
+        let connected = ConnectionState::Connected { peers: vec![peer] };
+        events
+            .try_send(connected.clone())
+            .expect("connected event queued");
+        events
+            .try_send(ConnectionState::Failed {
+                peer: None,
+                reason: "connection limit exceeded".to_owned(),
+            })
+            .expect("advisory failure event queued");
+
+        assert_eq!(network.poll_event(), Some(connected.clone()));
+        assert_eq!(network.state(), &connected);
+        let advisory = network.poll_event().expect("advisory failure event");
+        assert!(matches!(
+            advisory,
+            ConnectionState::Failed { peer: None, .. }
+        ));
+        assert_eq!(network.state(), &connected);
+    }
+
+    /// A `Network` whose command and event receivers stay in the test, so queue
+    /// writes and cached-state transitions can be observed without a worker.
+    fn network_with_test_channels() -> (
+        Network,
+        tokio_mpsc::Sender<ConnectionState>,
+        tokio_mpsc::Receiver<Command>,
+    ) {
+        let (commands, command_rx) = tokio_mpsc::channel(16);
+        let (events, events_rx) = tokio_mpsc::channel(4);
+        let (_message_events, message_rx) = tokio_mpsc::channel(4);
+        let (_setup_events, setup_rx) = tokio_mpsc::channel(4);
+        let (_file_events, file_rx) = tokio_mpsc::channel(4);
+        let (_control_events, control_rx) = tokio_mpsc::channel(4);
+        let (_discovery_events, discovery_rx) = tokio_mpsc::channel(4);
+        let (_relay_events, relay_rx) = tokio_mpsc::channel(4);
+        let (_nat_events, nat_rx) = tokio_mpsc::channel(4);
+        let (_identify_events, identify_rx) = tokio_mpsc::channel(4);
+        let network = Network {
+            commands,
+            events: events_rx,
+            message_events: message_rx,
+            setup_events: setup_rx,
+            file_events: file_rx,
+            control_events: control_rx,
+            discovery_events: discovery_rx,
+            relay_events: relay_rx,
+            nat_events: nat_rx,
+            identify_events: identify_rx,
+            state: ConnectionState::Unknown,
+            privacy_status: NetworkPrivacyStatus::default(),
+            pending_addresses: HashMap::new(),
+            next_request_id: AtomicU64::new(1),
+            next_setup_request_id: AtomicU64::new(1),
+            next_file_request_id: AtomicU64::new(1),
+            next_control_request_id: AtomicU64::new(1),
+            worker: None,
+        };
+        (network, events, command_rx)
+    }
+
+    fn generated_peer_id() -> PeerId {
+        let identity = Identity::generate().expect("identity");
+        PeerId::from_str(&identity.peer_id().to_string()).expect("peer id")
+    }
+
+    #[test]
+    fn dial_rejects_circuit_address_before_queue_or_pending_insert() {
+        let (mut network, _events, mut commands) = network_with_test_channels();
+        let identity = Identity::generate().expect("identity");
+        let direct = Multiaddr::from_str(&format!(
+            "/ip4/127.0.0.1/tcp/4001/p2p/{}",
+            identity.peer_id()
+        ))
+        .expect("direct address");
+        let mut circuit = direct.clone();
+        circuit.push(Protocol::P2pCircuit);
+
+        assert!(matches!(
+            network.dial(circuit),
+            Err(NetworkError::InvalidAddress(_))
+        ));
+        assert!(network.pending_addresses.is_empty());
+        assert!(
+            matches!(
+                commands.try_recv(),
+                Err(tokio_mpsc::error::TryRecvError::Empty)
+            ),
+            "a circuit address must not reach the command queue"
+        );
+
+        assert!(network.dial(direct).is_ok());
+        assert_eq!(network.pending_addresses.len(), 1);
+        assert!(matches!(commands.try_recv(), Ok(Command::Dial { .. })));
+    }
+
+    #[test]
+    fn rate_limiter_removes_peer_entries_after_expiry() {
+        let config = NetworkConfig {
+            rate_window: Duration::from_secs(1),
+            max_requests_per_peer_per_window: 2,
+            max_request_bytes_per_peer_per_window: 10,
+            ..NetworkConfig::default()
+        };
+        let mut limiter = RateLimiter::new(&config);
+        let peers = [
+            generated_peer_id(),
+            generated_peer_id(),
+            generated_peer_id(),
+        ];
+        let now = Instant::now();
+
+        for peer in peers {
+            assert!(limiter.allow(peer, RequestProtocol::Message, 1, now));
+        }
+        assert_eq!(limiter.entries.len(), 3);
+        assert_eq!(limiter.protocol_entries.len(), 3);
+
+        let later = now + Duration::from_secs(2);
+        assert!(limiter.allow(peers[0], RequestProtocol::Message, 1, later));
+        assert_eq!(
+            limiter.entries.len(),
+            1,
+            "expired peer entries must be removed after retain"
+        );
+        assert_eq!(limiter.protocol_entries.len(), 1);
+        assert!(limiter.allow(peers[1], RequestProtocol::Message, 1, later));
+        assert_eq!(limiter.entries.len(), 2);
+        assert!(limiter.allow(peers[2], RequestProtocol::Message, 1, later));
+        assert_eq!(limiter.entries.len(), 3);
+
+        let zero_window = NetworkConfig {
+            max_requests_per_peer_per_window: 0,
+            ..config
+        };
+        let mut limiter = RateLimiter::new(&zero_window);
+        assert!(!limiter.allow(peers[0], RequestProtocol::Message, 1, now));
+        assert!(
+            limiter.entries.is_empty(),
+            "a rejected peer must not leave an empty entry behind"
+        );
+        assert!(limiter.protocol_entries.is_empty());
+    }
+
+    #[test]
+    fn relayed_inbound_file_request_emits_only_a_failed_event() {
+        let (events, mut received) = tokio_mpsc::channel(4);
+        let peer = generated_peer_id();
+        let relayed_peers = HashMap::from([(peer, 1usize)]);
+        let mut next_response_id = 7;
+
+        assert_eq!(
+            file_request_policy_response_id(peer, &relayed_peers, &mut next_response_id, &events),
+            None
+        );
+        assert_eq!(next_response_id, 8);
+        let event = received.try_recv().expect("failed event");
+        assert!(
+            matches!(
+                &event,
+                FileEvent::Failed {
+                    request_id: None,
+                    response_id: Some(FileResponseId(7)),
+                    ..
+                }
+            ),
+            "{event:?}"
+        );
+        assert!(matches!(
+            &event,
+            FileEvent::Failed { reason, .. } if reason == FILE_RELAY_POLICY_REASON
+        ));
+        assert!(
+            received.try_recv().is_err(),
+            "no RequestReceived event may be emitted for a relayed peer"
+        );
+
+        let direct_peers: HashMap<PeerId, usize> = HashMap::new();
+        assert_eq!(
+            file_request_policy_response_id(peer, &direct_peers, &mut next_response_id, &events),
+            Some(FileResponseId(8))
+        );
+        assert_eq!(next_response_id, 9);
+        assert!(
+            received.try_recv().is_err(),
+            "a direct peer must not produce a policy failure"
+        );
     }
 
     #[test]

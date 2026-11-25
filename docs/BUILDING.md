@@ -4,7 +4,7 @@ This document records the Milestones 11–13 build/release path for the pure Rus
 
 ## Toolchain
 
-- Workspace `rust-version`: **1.95** (required by `egui`/`eframe` 0.37).
+- Workspace `rust-version`: **1.95** (retained from the earlier egui/eframe 0.37 baseline; not lowered during the dependency refresh).
 - Build with `cargo build --locked --release -p p2p-desktop --features native`.
 - The `gui` feature describes widgets without display libraries; `native` adds `eframe` and the optional native-only `rfd` save dialog.
 
@@ -114,7 +114,7 @@ The bundle is unsigned and not notarized unless the builder sets `MACOS_SIGNING_
 
 ## CI and tagged releases
 
-`.github/workflows/build.yml` builds and packages all four targets on every push to `main`, every pull request, and every `v*` tag. Each build job uploads its `dist/` contents as a separate artifact. On a `v*` tag, a publish job downloads all artifacts, adds `packaging/NOTICE.md`, creates `SHA256SUMS`, verifies it locally with `sha256sum -c`, and attaches all files to the GitHub Release.
+`.github/workflows/build.yml` builds and packages all four targets on every push to `main`, every pull request, and every `v*` tag. Each build job uploads its `dist/` contents as a separate artifact. On a `v*` tag, a publish job downloads all artifacts, adds `packaging/NOTICE.md`, creates `SHA256SUMS`, verifies it locally with `sha256sum -c`, and attaches all files to the GitHub Release. External action refs in this workflow and the CI/security workflows are pinned to commit SHAs; see `SECURITY_TESTS.md` for the resolved mapping and its limits.
 
 Verify a published artifact with:
 
