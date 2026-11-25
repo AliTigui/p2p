@@ -69,7 +69,7 @@ The per-artifact `.sha256` sidecars contain bare filenames, so those `sha256sum 
 
 ## Windows (x86_64)
 
-Requirements: Rust MSVC target, Visual Studio C++ build tools, and **WiX Toolset 4+** with `candle.exe`/`light.exe`. GitHub-hosted `windows-latest` runners provide WiX via the `WIX` environment variable; local builders must set it to the WiX install directory. The script passes `-arch x64` so WiX 4+ derives x64 MSI bitness without the removed `Package/@Win64` attribute.
+Requirements: Rust MSVC target, Visual Studio C++ build tools, and **WiX Toolset 3.14+** with `candle.exe`/`light.exe`. GitHub-hosted `windows-latest` runners provide WiX via the `WIX` environment variable; local builders must set it to the WiX install directory. The script passes `-arch x64` so the MSI template is x64; `Package/@Win64` is not a valid schema attribute and is not used.
 
 ```powershell
 cargo build --locked --release -p p2p-desktop --features native --target x86_64-pc-windows-msvc
@@ -134,4 +134,4 @@ GitHub Releases are an optional download convenience only. The application has n
 
 ## Current validation limits
 
-This host is Linux-only and headless. Linux source builds, native compile/link, packaging scripts, archive contents, and checksum verification can be checked here. Windows/macOS installers, DMG verification, MSI installation, certificate signing, notarization, and visual GUI inspection require the corresponding platform runners or desktop hosts and are not claimed as locally verified.
+This host is Linux-only and headless. Linux source builds, native compile/link, packaging scripts, archive contents, and checksum verification can be checked here. The 2026-11-25 GitHub run built all four targets; downloaded TAR/ZIP/deb/DMG sidecars verified 8/8 here, archive contents and MSI x64 metadata were inspected, but MSI/DMG installation, certificate signing, notarization, and visual GUI inspection still require the corresponding platform hosts and are not claimed as locally verified.

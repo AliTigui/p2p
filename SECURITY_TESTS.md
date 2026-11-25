@@ -100,7 +100,7 @@ The following require external hardware or a controlled volunteer relay and are 
 
 A dependency-free deterministic smoke test still flips one bit at every offset of a signed `P2P1` envelope and asserts that any successfully parsed mutation fails signature verification; it also asserts that every truncated prefix is rejected. This is a regression guard, not proof of parser correctness.
 
-Not covered by these targets: internal transport codec state machines, backup/vault import formats (no such formats exist yet), and a long sanitizer-enabled corpus-building campaign. Treat fuzzing as a bounded smoke control until CI is green and a longer campaign is recorded.
+Not covered by these targets: internal transport codec state machines, backup/vault import formats (no such formats exist yet), and a long sanitizer-enabled corpus-building campaign. Treat fuzzing as a bounded smoke control; CI is green, but a longer coverage-guided campaign is still required before making a broader fuzzing claim.
 
 ## 6. Dependency and supply-chain checks
 
@@ -113,7 +113,7 @@ cargo audit --file fuzz/Cargo.lock
 cargo deny --locked --manifest-path fuzz/Cargo.toml check
 ```
 
-`deny.toml` defines advisory, license, bans, and source policy. A `security.yml` workflow runs these gates on pushes and pull requests. Locally installed `cargo-audit 0.23.0` and `cargo-deny 0.22.1` execute the same checks. After aligning `deny.toml` with cargo-deny 0.22, declaring the fuzz workspace license, moving to libp2p 0.57.1/libp2p-request-response 0.30.0, and moving to the OpenMLS 0.10.0-rc.1 provider stack, **all four local commands pass**: `cargo audit` reports zero vulnerabilities with five non-failing unmaintained warnings, and `cargo deny` ends with `advisories ok, bans ok, licenses ok, sources ok` for both lockfiles. The unmaintained warnings are `paste`, `proc-macro-error2`, `zbus_names`, `zvariant`, and `zvariant_derive`; they remain documented residual risk. No green GitHub CI result is claimed.
+`deny.toml` defines advisory, license, bans, and source policy. A `security.yml` workflow runs these gates on pushes and pull requests. Locally installed `cargo-audit 0.23.0` and `cargo-deny 0.22.1` execute the same checks. After aligning `deny.toml` with cargo-deny 0.22, declaring the fuzz workspace license, moving to libp2p 0.57.1/libp2p-request-response 0.30.0, and moving to the OpenMLS 0.10.0-rc.1 provider stack, **all four local commands pass**: `cargo audit` reports zero vulnerabilities with five non-failing unmaintained warnings, and `cargo deny` ends with `advisories ok, bans ok, licenses ok, sources ok` for both lockfiles. The unmaintained warnings are `paste`, `proc-macro-error2`, `zbus_names`, `zvariant`, and `zvariant_derive`; they remain documented residual risk. GitHub Security gates run `45690333396` passed all four jobs on 2026-11-25.
 
 ### Workflow action pinning
 
@@ -129,7 +129,7 @@ All external GitHub Actions used by `ci.yml`, `build.yml`, and `security.yml` ar
 | `actions/download-artifact` | `d3f86a106a0bac45b974a628896c90dbdf5c8093` | `v4` tag |
 | `softprops/action-gh-release` | `3bb12739c298aeb8a4eeaf626c5b8d85266b0e65` | `v2` tag |
 
-A SHA pin freezes the action revision used by a run; it does not review the action code, verify signatures or provenance, establish reproducible builds, or substitute for a green audit/deny CI result.
+A SHA pin freezes the action revision used by a run; it does not review the action code, verify signatures or provenance, or establish reproducible builds. The green audit/deny CI gate verifies the configured checks, not action-code trust.
 
 SBOM generation and determinism:
 
