@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=P2P Messenger
+Exec=p2p-desktop
+Comment=Decentralized end-to-end encrypted P2P messenger
+Categories=Network;Chat;
+Terminal=false

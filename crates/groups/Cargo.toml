@@ -1,0 +1,18 @@
+[package]
+name = "p2p-groups"
+description = "OpenMLS group encryption lifecycle for P2P conversations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+p2p-identity.workspace = true
+p2p-messaging.workspace = true
+libp2p-identity.workspace = true
+openmls.workspace = true
+openmls_rust_crypto.workspace = true
+openmls_traits.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true

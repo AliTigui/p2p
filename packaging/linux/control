@@ -1,0 +1,12 @@
+Package: p2p-messenger
+Version: 0.0.0
+Maintainer: P2P Messenger maintainers <maintainers@example.invalid>
+Section: net
+Priority: optional
+Architecture: amd64
+Depends: libc6, libgl1, libfontconfig1, libx11-6, libxcb1, libxrandr2,
+ libxinerama1, libxcursor1, libxi6, libxkbcommon0, libwayland-client0
+Description: Decentralized end-to-end encrypted P2P messenger
+ Pure Rust native desktop client using egui/eframe.
+ Direct connections use libp2p TCP, Noise, and Yamux with no mandatory
+ server, bootstrap peer, relay, webview, or browser runtime.

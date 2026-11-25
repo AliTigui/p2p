@@ -1,0 +1,15 @@
+[package]
+name = "p2p-core"
+description = "Shared types and protocol constants for the P2P messenger"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json = "1"

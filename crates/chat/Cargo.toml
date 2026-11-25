@@ -1,0 +1,24 @@
+[package]
+name = "p2p-chat"
+description = "Application-level MLS conversation controller over direct P2P transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+p2p-groups.workspace = true
+p2p-identity.workspace = true
+p2p-files.workspace = true
+p2p-security.workspace = true
+p2p-messaging.workspace = true
+p2p-network.workspace = true
+libp2p.workspace = true
+libp2p-identity.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+p2p-storage.workspace = true
+tempfile = "3"
+tokio.workspace = true

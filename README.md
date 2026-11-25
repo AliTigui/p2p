@@ -1,0 +1,99 @@
+# P2P Messenger
+
+A decentralized, end-to-end encrypted desktop messenger. **No mandatory centralized server**: users generate their own identities, exchange addresses/fingerprints directly, and communicate over libp2p. Relay and discovery peers are optional and user-operated.
+
+> **Status: Milestones 1–13 complete; Milestone 13 metadata/privacy hardening is implemented and verified on this Linux host. Optional discovery, relay, NAT, identify, ping, and control capabilities are all off/empty by default; zero-infrastructure direct connect is unchanged.** Direct P2P connect works with only the other peer's multiaddr: TCP + Noise + Yamux, vault-derived Ed25519 identity, real connection status, and zero bootstrap/DHT/relay infrastructure. Peers can complete a signed KeyPackage/Welcome MLS setup, exchange OpenMLS-encrypted text, and advance delivery only on explicit verified receipts. An admin can add, remove, and refresh keys in a multi-member MLS group; group changes use signed, bounded frames in the existing setup protocol and stay pending until required members acknowledge. Milestone 10 adds bounded `CHN1` channel frames inside the MLS application plaintext: every conversation starts with `general`, the admin can create/rename/set members of channels, allowed members can post text, and restricted sends go only to allowed members. Channel membership is local application policy, not cryptographic access control, because all MLS group members hold the group keys. Text composed while a peer is disconnected stays in an in-memory ciphertext queue and is retried only after a new observed connection. Saved user addresses get bounded exponential redial with honest retry state; duplicate dials, extra connections, and excess per-peer requests are rejected. A joined conversation can send files up to 64 MiB as signed, XChaCha20-Poly1305-encrypted chunks with manifest hash verification and ciphertext-only quarantine. Milestone 8 adds narrow TXT/PNG/GIF validation, a conservative scanner/release policy, explicit per-file approval/cancellation, an encrypted attachment store, a native-only OS save flow, and explicit deletion policies. The application configures **no** scanner, no allowed extensions, and `Retain` quarantine deletion by default: integrity verification is never presented as "clean" or "safe", release is denied, and no release or quarantine-deletion action is shown. Admin role delegation, general format/MIME parsing, a configured real scanner, and backups are not implemented yet. Milestone 12 adds cross-platform safe export names, an unraisable 64 MiB release cap, safer native plaintext save, Unix symlink refusal for vault/quarantine paths, redacted transport-event `Debug`, and bounded contact/envelope inputs. Windows ACL hardening, secure erasure, repository-wide log review, and dependency advisory tooling remain unimplemented. See [`PROJECT_STATUS.md`](PROJECT_STATUS.md).
+
+## Technology
+
+Pure Rust. No React, TypeScript, Node.js, npm, browser, or webview.
+
+- GUI: `egui` + `eframe`
+- Networking: `libp2p` direct connect (TCP + Noise + Yamux; `=0.56.0` for GUI compatibility), with opt-in mDNS/Kademlia discovery, peer-operated relays, AutoNAT/DCUtR and identify observations; all optional capabilities off by default
+- Messaging: canonical signed envelopes, replay cache, MLS-encrypted receipts, honest delivery state, ciphertext-only vault persistence
+- Application: `p2p-chat` controller for signed MLS setup and group control, memory-only conversations, compose/receive, verified receipts, an in-memory offline send queue with reconnect retry, bounded redial with honest `RedialState`, and encrypted file transfers
+- Wire: bounded `/p2p-messenger/message/1`, `/p2p-messenger/mls-setup/1`, `/p2p-messenger/file/1`, and M13's opaque `/p2p-messenger/control/1` request-response protocols over the Noise-authenticated connection, with duplicate-dial rejection, connection admission limits, bounded relayed connections, and shared per-peer request/byte budgets
+- Group crypto: `openmls` 0.9.2 with X25519/AES-128-GCM/SHA-256/Ed25519; signed multi-member Add/Remove/Update, admin policy, pending commit state, and memory-only group state
+- Files: fresh per-transfer XChaCha20-Poly1305 key, 256 KiB chunks, signed SHA-256 manifest, restricted ciphertext-only quarantine, bounded in-memory scanner input, narrow TXT/PNG/GIF structural validation, policy-gated in-memory release, encrypted attachment storage, and explicit deletion policies
+- Storage: bundled SQLite + Argon2id/XChaCha20-Poly1305 vault with schema v3 encrypted attachments; native-only OS save uses the optional `rfd` dialog
+- Hardening: safe release/suggested-save names, hard release byte cap, Unix symlink refusal for vault/quarantine paths, symlink-safe attachment deletion, redacted transport-event diagnostics, and bounded untrusted contact/export inputs
+
+## Quick start
+
+```bash
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+
+# Compile GUI widget code without display libraries:
+cargo check -p p2p-desktop --features gui
+
+# Open the real native window:
+cargo run -p p2p-desktop --features native
+```
+
+The `native` feature builds a real OS window on Linux/Windows/macOS. Widget code is separately checkable with `--features gui`, so core tests never need display libraries.
+
+## Release artifacts
+
+The build workflow produces locked, release-mode artifacts for Linux x86_64 (`.tar.gz`, `.deb`), Windows x86_64 (`.zip`, `.msi`), and macOS x86_64/arm64 (`.tar.gz`, `.dmg`). Tagged `v*` releases include a single `SHA256SUMS` manifest; verify it with `sha256sum -c SHA256SUMS` before installing. Exact build, inspection, and signing commands are in [docs/BUILDING.md](docs/BUILDING.md). Packages are unsigned by default and macOS DMGs are not notarized by default; GitHub Releases are only a download convenience, not application infrastructure. There is no auto-updater or phone-home service.
+
+On first launch the app asks you to create a local vault (profile name + password). Later launches ask for the password to unlock it. The identity is generated inside the vault, encrypted at rest, and only its public Peer ID and fingerprint are shown once unlocked. There is no account, server, or password recovery.
+
+After unlock, the network worker starts automatically and listens on an ephemeral local TCP port. To connect directly, paste a peer address that ends in `/p2p/<peer-id>`, for example `/ip4/192.0.2.10/tcp/4001/p2p/12D3Koo...`. The address must be supplied by you; the app has no default bootstrap peers. A connected PeerId means the Noise handshake authenticated that key, not that the person is your intended contact — verify fingerprints out of band.
+
+Optional network capabilities are off and their address lists are empty by default. In the unlocked network panel you can enable identify, ping, mDNS, Kademlia with user-supplied bootstrap addresses, relay client/server mode with user-supplied relay addresses, AutoNAT, and DCUtR; settings apply when the worker starts, so lock and unlock the vault after changing them. Discovery candidates are advisory only and are never auto-dialed, trusted, or treated as verified contacts. Relay operators can observe IPs, timing, and sizes and can deny service; file transfer over an observed relay path is disabled. AutoNAT/DCUtR are best-effort, not universal NAT traversal. There is no Tor/I2P/mixnet, anonymity, or metadata-privacy claim.
+
+For a 1:1 encrypted chat, connect first, then paste the peer's Peer ID into the MLS section and choose **Start encrypted chat**. The peer receives a signed KeyPackage request and replies with a signed KeyPackage; the inviter sends a signed Welcome; the invited peer joins and returns a signed acknowledgement. The UI shows the real setup status and epoch. Text messages are MLS-encrypted; local status remains "Sent to peer (delivery unconfirmed)" until a verified encrypted receipt arrives. All MLS state and decrypted text are session-only.
+
+The conversation creator is the group admin. Once a group is joined, the admin can add a directly connected peer, remove another member, or refresh its own MLS key. Each change is a signed MLS commit merged locally and sent to the required existing members; the group shows a pending operation until the Welcome and all required acknowledgements are verified. Messages and further changes are blocked while pending, and a disconnected required member can leave the operation pending until it reconnects. A removed member stays on the old epoch and cannot read later group messages. Group text is sent once as MLS ciphertext to every current member and is shown as delivered only after every expected receipt arrives. The app shows admin, members in its local view, and pending state; these are not inferred from transport events.
+
+If the peer disconnects, newly composed text is signed and encrypted immediately but shown as **Queued (offline)**. It is held in memory as ciphertext and retried only after a new authenticated connection to that peer is observed; a queued message is never shown as delivered without its verified receipt. The queue is not written to the vault and does not survive a restart or lock.
+
+Saved addresses trigger a bounded exponential redial after an observed disconnect or failed dial. The GUI shows the honest retry state separately from the observed connection state; **Disconnect all** suppresses redial until you enter a fresh address. No peer is discovered or contacted without your explicit address.
+
+For a joined conversation, enter a local file path and choose **Send encrypted file**. The offer carries a fresh random content key inside the signed frame over the existing Noise connection; the receiver quarantines ciphertext only. Both sides mark a transfer `Integrity verified; not scanned` only after signed chunk acknowledgements and a verified SHA-256 manifest. The Rust controller can validate the claimed TXT/PNG/GIF structure in memory, scan verified plaintext through an application-supplied `FileScanner`, then release it only if the format is valid, the scanner reports `CleanNoThreatDetected`, the extension/size policy allows it, and the user explicitly approves that file. Approval releases a zeroizing in-memory buffer that the desktop app copies into the encrypted attachment store; the release path writes no plaintext. In native builds, **Save via OS dialog** is the only plaintext disk write and requires you to choose the destination. Stored attachments and quarantine ciphertext are deleted only by separate explicit actions; quarantine deletion defaults to `Retain`. Cancelling a release decision is terminal for that transfer, retains ciphertext, and does not cancel the network transfer. The desktop app configures no scanner and no allowed extensions, so its UI shows "Scanning unavailable" and no approve/release/cancel action appears by default. Structural validation is not malware detection, and no file is presented as clean or safe without a real independent scanner result.
+
+## Repository layout
+
+```
+crates/core                  shared types, protocol version, errors
+crates/crypto                Argon2id, AEAD wrapping, HKDF subkeys, blind indexes
+crates/identity              Ed25519 identity, fingerprints, contact URIs, encrypted export
+crates/groups                OpenMLS lifecycle, encrypted payloads/receipts, sender binding, Add/Remove/Update commits
+crates/files                 signed file frames, chunk AEAD, manifest verification, ciphertext-only quarantine, scan/release gate, explicit quarantine deletion
+crates/security              independent scanner interface, exact result categories, conservative release policy
+crates/chat                  signed MLS setup/group-control frames, conversation controller, admin policy and pending-operation state, memory-only chat view, offline queue, bounded redial, file transfer state, scan/release/deletion API
+crates/messaging             signed envelopes, replay cache, receipt codec, delivery state
+crates/network               libp2p direct connect, four bounded wire protocols, opt-in discovery/relay/NAT/identify behaviours, real Swarm events, connection/rate limits, honest privacy status
+crates/storage               encrypted SQLite vault, schema v3 encrypted attachments, migrations, settings
+apps/desktop/src/model.rs    GUI state and pure helpers (tests)
+apps/desktop/src/app.rs      egui widget descriptions
+apps/desktop/src/lib.rs      feature-gated native runner
+packaging/                   Linux/Windows/macOS package scripts and notice
+docs/                        architecture, security, networking, crypto, storage, protocol, building
+docs/DECISIONS/              architecture decision records
+tests/                       cross-crate test plan (implemented tests live beside crates)
+```
+
+## Design documents
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [Security / threat model](docs/SECURITY.md)
+- [Networking](docs/NETWORKING.md)
+- [Cryptography](docs/CRYPTOGRAPHY.md)
+- [Storage](docs/STORAGE.md)
+- [Wire protocol](docs/PROTOCOL.md)
+- [Dependency validation](docs/DEPENDENCIES.md)
+- [Building and packaging](docs/BUILDING.md)
+- [Decision records](docs/DECISIONS/)
+
+## Non-goals for the initial release
+
+- No developer-operated bootstrap, relay, identity, or messaging service, and no auto-updater or telemetry in release packages.
+- No signed/notarized binaries or bit-for-bit reproducible builds by default; verify published checksums or build from source.
+- No Windows ACL hardening or filesystem secure-erasure guarantee: non-Unix permission helpers are no-ops, and deletion does not erase SSD/CoW blocks.
+- No claim of universal NAT traversal or metadata anonymity. Optional relays expose IPs, timing, and sizes to their operators; discovery candidates are advisory only and are never auto-dialed or trusted; control frames carry no capability, presence, receipt, or delivery meaning.
+- No multi-device shared identity (identities are device-specific in v1).
+- No password recovery without an encrypted backup and its passphrase.
+- No cryptographic channel access control: channels are MLS application partitions with local policy; no separate per-channel MLS keys. No admin role delegation or encrypted MLS state restoration in v1; MLS groups, channels, and pending operations are session-only.
+- No "clean", "safe", or "scanned" file claim from integrity checking or narrow structural validation alone: the desktop app configures no independent scanner, and the API only accepts an exact scanner result through `SecurityConfig::scan`.

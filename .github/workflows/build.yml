@@ -1,0 +1,140 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+    tags: [v*]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  packages:
+    name: ${{ matrix.asset_os }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset_os: linux-x86_64
+            package_arch: x86_64
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_os: windows-x86_64
+            package_arch: x86_64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset_os: macos-x86_64
+            package_arch: x86_64
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            asset_os: macos-aarch64
+            package_arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.asset_os }}-release
+
+      - name: Install Linux windowing dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxkbcommon-dev \
+            libwayland-dev libxcb1-dev libxrandr-dev libxinerama-dev \
+            libxcursor-dev libxi-dev libgl1-mesa-dev libfontconfig1-dev
+
+      - name: Resolve workspace version
+        id: version
+        shell: bash
+        run: |
+          version="$(awk -F '"' '
+            /^\[workspace\.package\]/ { in_workspace = 1; next }
+            /^\[/ { in_workspace = 0 }
+            in_workspace && /^version[[:space:]]*=/ { print $2; exit }
+          ' Cargo.toml)"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binary
+        run: cargo build --locked --release -p p2p-desktop --features native --target ${{ matrix.target }}
+
+      - name: Package Linux artifacts
+        if: runner.os == 'Linux'
+        run: |
+          bash packaging/linux/package.sh \
+            "target/${{ matrix.target }}/release/p2p-desktop" \
+            "${{ steps.version.outputs.version }}" \
+            "${{ matrix.package_arch }}" \
+            dist
+
+      - name: Package macOS artifacts
+        if: runner.os == 'macOS'
+        run: |
+          bash packaging/macos/package.sh \
+            "target/${{ matrix.target }}/release/p2p-desktop" \
+            "${{ steps.version.outputs.version }}" \
+            "${{ matrix.package_arch }}" \
+            dist
+
+      - name: Package Windows artifacts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./packaging/windows/package.ps1 `
+            -Binary "target/${{ matrix.target }}/release/p2p-desktop.exe" `
+            -Version "${{ steps.version.outputs.version }}" `
+            -OutDir dist
+
+      - name: List artifacts
+        shell: bash
+        run: ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.asset_os }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish tag release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: packages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Build checksum manifest
+        run: |
+          cp packaging/NOTICE.md dist/NOTICE.md
+          cd dist
+          find . -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort | xargs sha256sum > SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

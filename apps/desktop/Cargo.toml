@@ -1,0 +1,43 @@
+[package]
+name = "p2p-desktop"
+description = "Pure Rust native desktop GUI for the P2P messenger"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "p2p_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "p2p-desktop"
+path = "src/main.rs"
+
+[features]
+# `gui` describes the UI with egui only (pure Rust, no OS window libraries).
+# `native` adds eframe to open a real OS window and needs platform GL/X11 libs.
+default = []
+gui = ["dep:egui"]
+native = ["gui", "dep:eframe", "dep:rfd"]
+
+[dependencies]
+p2p-core.workspace = true
+p2p-chat.workspace = true
+p2p-crypto.workspace = true
+p2p-identity.workspace = true
+p2p-network.workspace = true
+p2p-storage.workspace = true
+dirs.workspace = true
+zeroize.workspace = true
+egui = { version = "0.37", optional = true }
+rfd = { workspace = true, optional = true }
+eframe = { version = "0.37", optional = true, default-features = false, features = [
+  "glow",
+  "default_fonts",
+  "clipboard",
+  "accesskit",
+  "x11",
+  "wayland",
+] }

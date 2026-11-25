@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="P2P Messenger"
+           Language="1033"
+           Version="$(var.Version)"
+           Manufacturer="P2P Messenger"
+           UpgradeCode="{7E5B3B4A-6C91-4A0C-9D2F-2C1B9E8A7D31}">
+    <Package InstallerVersion="200"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Win64="yes"
+             Manufacturer="P2P Messenger"
+             Description="Decentralized end-to-end encrypted P2P messenger" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of P2P Messenger is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="P2P Messenger">
+          <Component Id="ExecutableComponent" Guid="{B9E06E7C-3B7D-4F2A-8F4C-1D3A5C7E9B02}">
+            <File Id="p2pDesktopExe"
+                  Name="p2p-desktop.exe"
+                  Source="$(var.SourceDir)\p2p-desktop.exe"
+                  KeyPath="yes" />
+            <File Id="Readme"
+                  Name="README.md"
+                  Source="$(var.SourceDir)\README.md" />
+            <File Id="Notice"
+                  Name="NOTICE.md"
+                  Source="$(var.SourceDir)\NOTICE.md" />
+          </Component>
+        </Directory>
+      </Directory>
+
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="P2P Messenger">
+          <Component Id="StartMenuComponent" Guid="{2C8F1A4D-5E6B-4C3A-9D1F-7A0B2C3D4E5F}">
+            <Shortcut Id="ApplicationStartMenuShortcut"
+                      Name="P2P Messenger"
+                      Target="[INSTALLFOLDER]p2p-desktop.exe"
+                      WorkingDirectory="INSTALLFOLDER" />
+            <RemoveFolder Id="ApplicationProgramsFolder" On="uninstall" />
+            <RegistryValue Root="HKCU"
+                           Key="Software\P2P Messenger"
+                           Name="installed"
+                           Type="integer"
+                           Value="1"
+                           KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="MainFeature" Title="P2P Messenger" Level="1">
+      <ComponentRef Id="ExecutableComponent" />
+      <ComponentRef Id="StartMenuComponent" />
+    </Feature>
+  </Product>
+</Wix>

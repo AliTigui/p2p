@@ -1,0 +1,488 @@
+//! Canonical, signed message envelopes.
+//!
+//! The payload is opaque to this crate. It must be ciphertext produced by the
+//! `p2p-groups` MLS layer before the application sends it; this crate provides
+//! the envelope, verification, replay boundary, and local state machine only. The
+//! sender's protobuf public key is included because a PeerId is a multihash and
+//! cannot independently verify an Ed25519 signature. It is bound to the signed
+//! bytes and checked against the declared PeerId before verification.
+
+use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use libp2p_identity::PeerId;
+use p2p_identity::{Identity, verify_signature_with_public_bytes};
+
+use crate::MessageError;
+
+/// Wire version implemented by this build.
+pub const ENVELOPE_VERSION: u16 = 1;
+/// Fixed protocol magic. Unknown magic is rejected, never negotiated.
+pub const PROTOCOL_MAGIC: &[u8; 4] = b"P2P1";
+/// Maximum total size of an encoded envelope.
+pub const MAX_ENVELOPE_BYTES: usize = 1024 * 1024;
+/// Maximum opaque payload size, leaving room for bounded metadata fields.
+pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024 - 1024;
+const MAX_PUBLIC_KEY_BYTES: usize = 256;
+const MAX_PEER_ID_BYTES: usize = 128;
+const SIGNATURE_LEN: usize = 64;
+
+const KIND_TEXT: u8 = 1;
+const KIND_REPLY: u8 = 2;
+const KIND_RECEIPT: u8 = 3;
+const KIND_PIN: u8 = 4;
+const KIND_UNPIN: u8 = 5;
+const KIND_POLICY: u8 = 6;
+const KIND_FILE: u8 = 7;
+const KIND_CHANNEL: u8 = 8;
+
+/// Application message category. Codes are fixed and never renumbered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    Text,
+    Reply,
+    Receipt,
+    Pin,
+    Unpin,
+    Policy,
+    File,
+    Channel,
+}
+
+impl MessageKind {
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Text => KIND_TEXT,
+            Self::Reply => KIND_REPLY,
+            Self::Receipt => KIND_RECEIPT,
+            Self::Pin => KIND_PIN,
+            Self::Unpin => KIND_UNPIN,
+            Self::Policy => KIND_POLICY,
+            Self::File => KIND_FILE,
+            Self::Channel => KIND_CHANNEL,
+        }
+    }
+
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            KIND_TEXT => Some(Self::Text),
+            KIND_REPLY => Some(Self::Reply),
+            KIND_RECEIPT => Some(Self::Receipt),
+            KIND_PIN => Some(Self::Pin),
+            KIND_UNPIN => Some(Self::Unpin),
+            KIND_POLICY => Some(Self::Policy),
+            KIND_FILE => Some(Self::File),
+            KIND_CHANNEL => Some(Self::Channel),
+            _ => None,
+        }
+    }
+}
+
+/// Non-secret inputs to a new envelope. Callers choose IDs and timestamps so
+/// tests are deterministic; the local conversation supplies the sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnvelopeParams {
+    pub conversation_id: [u8; 16],
+    pub epoch: u64,
+    pub message_id: [u8; 16],
+    pub sender_sequence: u64,
+    pub created_at: i64,
+    pub kind: MessageKind,
+}
+
+/// A signed wire envelope. `payload` is opaque ciphertext from a higher layer.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Envelope {
+    pub version: u16,
+    pub protocol: [u8; 4],
+    pub conversation_id: [u8; 16],
+    pub epoch: u64,
+    pub message_id: [u8; 16],
+    pub sender_public_key: Vec<u8>,
+    pub sender: PeerId,
+    pub sender_sequence: u64,
+    pub created_at: i64,
+    pub kind: MessageKind,
+    pub payload: Vec<u8>,
+    pub signature: [u8; SIGNATURE_LEN],
+}
+
+impl Envelope {
+    /// Create and sign an envelope with the local identity.
+    pub fn new(
+        identity: &Identity,
+        params: EnvelopeParams,
+        payload: Vec<u8>,
+    ) -> Result<Self, MessageError> {
+        if params.sender_sequence == 0 {
+            return Err(MessageError::InvalidStateTransition);
+        }
+        let mut envelope = Self {
+            version: ENVELOPE_VERSION,
+            protocol: *PROTOCOL_MAGIC,
+            conversation_id: params.conversation_id,
+            epoch: params.epoch,
+            message_id: params.message_id,
+            sender_public_key: identity.public_key_bytes(),
+            sender: identity.peer_id(),
+            sender_sequence: params.sender_sequence,
+            created_at: params.created_at,
+            kind: params.kind,
+            payload,
+            signature: [0; SIGNATURE_LEN],
+        };
+        let signing_bytes = envelope.signing_bytes()?;
+        let signature = identity.sign(&signing_bytes)?;
+        envelope.signature = signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| MessageError::BadSignature)?;
+        Ok(envelope)
+    }
+
+    /// Parse a canonical envelope. This does not verify the signature or replay
+    /// state; callers must do both before trusting any field.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, MessageError> {
+        if bytes.len() > MAX_ENVELOPE_BYTES {
+            return Err(MessageError::TooLarge {
+                len: bytes.len(),
+                max: MAX_ENVELOPE_BYTES,
+            });
+        }
+        let mut reader = Reader::new(bytes);
+        let protocol: [u8; 4] = reader.fixed().map_err(|_| MessageError::BadProtocol)?;
+        if &protocol != PROTOCOL_MAGIC {
+            return Err(MessageError::BadProtocol);
+        }
+        let version = reader.u16()?;
+        if version != ENVELOPE_VERSION {
+            return Err(MessageError::UnsupportedVersion(version));
+        }
+        let conversation_id = reader.fixed()?;
+        let epoch = reader.u64()?;
+        let message_id = reader.fixed()?;
+        let sender_public_key = reader.var(MAX_PUBLIC_KEY_BYTES)?;
+        let sender_bytes = reader.var(MAX_PEER_ID_BYTES)?;
+        let sender = PeerId::from_bytes(&sender_bytes).map_err(|_| MessageError::BadPeerId)?;
+        let sender_sequence = reader.u64()?;
+        let created_at = reader.i64()?;
+        let kind_code = reader.u8()?;
+        let kind = MessageKind::from_code(kind_code).ok_or(MessageError::BadKind(kind_code))?;
+        let payload = reader.var(MAX_PAYLOAD_BYTES)?;
+        let signature = reader.fixed()?;
+        reader.finish()?;
+
+        let envelope = Self {
+            version,
+            protocol,
+            conversation_id,
+            epoch,
+            message_id,
+            sender_public_key,
+            sender,
+            sender_sequence,
+            created_at,
+            kind,
+            payload,
+            signature,
+        };
+        envelope.check_sizes()?;
+        Ok(envelope)
+    }
+
+    /// Encode the full signed envelope.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, MessageError> {
+        let mut bytes = self.signing_bytes()?;
+        bytes.extend_from_slice(&self.signature);
+        if bytes.len() > MAX_ENVELOPE_BYTES {
+            return Err(MessageError::TooLarge {
+                len: bytes.len(),
+                max: MAX_ENVELOPE_BYTES,
+            });
+        }
+        Ok(bytes)
+    }
+
+    /// Bytes covered by the Ed25519 signature. The signature itself is excluded.
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, MessageError> {
+        self.check_sizes()?;
+        let mut bytes = Vec::with_capacity(self.payload.len() + 128);
+        bytes.extend_from_slice(&self.protocol);
+        bytes.extend_from_slice(&self.version.to_le_bytes());
+        bytes.extend_from_slice(&self.conversation_id);
+        bytes.extend_from_slice(&self.epoch.to_le_bytes());
+        bytes.extend_from_slice(&self.message_id);
+        put_bytes(&mut bytes, &self.sender_public_key)?;
+        put_bytes(&mut bytes, &self.sender.to_bytes())?;
+        bytes.extend_from_slice(&self.sender_sequence.to_le_bytes());
+        bytes.extend_from_slice(&self.created_at.to_le_bytes());
+        bytes.push(self.kind.code());
+        put_bytes(&mut bytes, &self.payload)?;
+        Ok(bytes)
+    }
+
+    /// Verify protocol version and signature, binding the embedded public key
+    /// to the declared PeerId. Replay and conversation checks are separate.
+    pub fn verify(&self) -> Result<(), MessageError> {
+        if self.version != ENVELOPE_VERSION {
+            return Err(MessageError::UnsupportedVersion(self.version));
+        }
+        if &self.protocol != PROTOCOL_MAGIC {
+            return Err(MessageError::BadProtocol);
+        }
+        self.check_sizes()?;
+        let signing_bytes = self.signing_bytes()?;
+        match verify_signature_with_public_bytes(
+            &signing_bytes,
+            &self.signature,
+            &self.sender_public_key,
+            &self.sender,
+        ) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(MessageError::BadSignature),
+            Err(p2p_identity::IdentityError::PeerIdMismatch) => Err(MessageError::BadPeerId),
+            Err(p2p_identity::IdentityError::NotEd25519) => Err(MessageError::NotEd25519),
+            Err(error) => Err(MessageError::Identity(error)),
+        }
+    }
+
+    fn check_sizes(&self) -> Result<(), MessageError> {
+        if &self.protocol != PROTOCOL_MAGIC {
+            return Err(MessageError::BadProtocol);
+        }
+        if self.version != ENVELOPE_VERSION {
+            return Err(MessageError::UnsupportedVersion(self.version));
+        }
+        if self.payload.len() > MAX_PAYLOAD_BYTES {
+            return Err(MessageError::TooLarge {
+                len: self.payload.len(),
+                max: MAX_PAYLOAD_BYTES,
+            });
+        }
+        if self.sender_public_key.is_empty() || self.sender_public_key.len() > MAX_PUBLIC_KEY_BYTES
+        {
+            return Err(MessageError::BadPeerId);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for Envelope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Envelope")
+            .field("version", &self.version)
+            .field("conversation_id", &hex(&self.conversation_id))
+            .field("message_id", &hex(&self.message_id))
+            .field("epoch", &self.epoch)
+            .field("sender", &self.sender.to_string())
+            .field("sender_sequence", &self.sender_sequence)
+            .field("kind", &self.kind)
+            .field("payload_len", &self.payload.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Generate a random 16-byte identifier.
+pub fn random_id() -> Result<[u8; 16], MessageError> {
+    let mut id = [0u8; 16];
+    getrandom::fill(&mut id).map_err(|_| MessageError::Randomness)?;
+    Ok(id)
+}
+
+/// Sender-supplied timestamp hint. Display only; never used for ordering.
+pub(crate) fn now_seconds() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), MessageError> {
+    let len = u32::try_from(bytes.len()).map_err(|_| MessageError::Truncated)?;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+struct Reader<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8], MessageError> {
+        let end = self
+            .position
+            .checked_add(len)
+            .ok_or(MessageError::Truncated)?;
+        let slice = self
+            .bytes
+            .get(self.position..end)
+            .ok_or(MessageError::Truncated)?;
+        self.position = end;
+        Ok(slice)
+    }
+
+    fn u8(&mut self) -> Result<u8, MessageError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, MessageError> {
+        let bytes: [u8; 2] = self
+            .take(2)?
+            .try_into()
+            .map_err(|_| MessageError::Truncated)?;
+        Ok(u16::from_le_bytes(bytes))
+    }
+
+    fn u64(&mut self) -> Result<u64, MessageError> {
+        let bytes: [u8; 8] = self
+            .take(8)?
+            .try_into()
+            .map_err(|_| MessageError::Truncated)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn i64(&mut self) -> Result<i64, MessageError> {
+        Ok(i64::from_le_bytes(self.u64()?.to_le_bytes()))
+    }
+
+    fn fixed<const N: usize>(&mut self) -> Result<[u8; N], MessageError> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| MessageError::Truncated)
+    }
+
+    fn var(&mut self, max: usize) -> Result<Vec<u8>, MessageError> {
+        let len = self.u32()? as usize;
+        if len > max {
+            return Err(MessageError::TooLarge { len, max });
+        }
+        Ok(self.take(len)?.to_vec())
+    }
+
+    fn u32(&mut self) -> Result<u32, MessageError> {
+        let bytes: [u8; 4] = self
+            .take(4)?
+            .try_into()
+            .map_err(|_| MessageError::Truncated)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn finish(self) -> Result<(), MessageError> {
+        if self.position == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(MessageError::TrailingBytes)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params() -> EnvelopeParams {
+        EnvelopeParams {
+            conversation_id: [7u8; 16],
+            epoch: 0,
+            message_id: [9u8; 16],
+            sender_sequence: 1,
+            created_at: 1_700_000_000,
+            kind: MessageKind::Text,
+        }
+    }
+
+    #[test]
+    fn envelope_round_trip_preserves_fields_and_verifies() {
+        let identity = Identity::generate().expect("identity");
+        let envelope = Envelope::new(&identity, params(), b"opaque ciphertext".to_vec())
+            .expect("signed envelope");
+        let bytes = envelope.to_bytes().expect("encoded envelope");
+        let decoded = Envelope::from_bytes(&bytes).expect("decoded envelope");
+        assert_eq!(decoded, envelope);
+        decoded.verify().expect("valid signature");
+    }
+
+    #[test]
+    fn tampering_with_payload_or_key_is_rejected() {
+        let identity = Identity::generate().expect("identity");
+        let envelope = Envelope::new(&identity, params(), b"opaque ciphertext".to_vec())
+            .expect("signed envelope");
+        let mut changed = envelope.clone();
+        changed.payload.push(0);
+        assert!(changed.verify().is_err());
+
+        let other = Identity::generate().expect("other identity");
+        let mut mismatched = envelope;
+        mismatched.sender_public_key = other.public_key_bytes();
+        assert!(mismatched.verify().is_err());
+    }
+
+    #[test]
+    fn malformed_encodings_are_rejected_without_panics() {
+        assert!(matches!(
+            Envelope::from_bytes(&[]),
+            Err(MessageError::BadProtocol)
+        ));
+        let identity = Identity::generate().expect("identity");
+        let envelope = Envelope::new(&identity, params(), vec![]).expect("envelope");
+        let mut bytes = envelope.to_bytes().expect("bytes");
+        bytes.push(0);
+        assert!(matches!(
+            Envelope::from_bytes(&bytes),
+            Err(MessageError::TrailingBytes)
+        ));
+        bytes.truncate(bytes.len() - 1);
+        bytes[4] = 2;
+        assert!(matches!(
+            Envelope::from_bytes(&bytes),
+            Err(MessageError::UnsupportedVersion(2))
+        ));
+    }
+
+    #[test]
+    fn oversized_payload_is_rejected() {
+        let identity = Identity::generate().expect("identity");
+        let result = Envelope::new(&identity, params(), vec![0u8; MAX_PAYLOAD_BYTES + 1]);
+        assert!(matches!(result, Err(MessageError::TooLarge { .. })));
+    }
+
+    #[test]
+    fn debug_output_omits_payload_and_signature() {
+        let identity = Identity::generate().expect("identity");
+        let envelope =
+            Envelope::new(&identity, params(), b"SECRET_PAYLOAD".to_vec()).expect("envelope");
+        let debug = format!("{envelope:?}");
+        assert!(!debug.contains("SECRET_PAYLOAD"));
+        assert!(debug.contains("payload_len"));
+    }
+
+    #[test]
+    fn channel_kind_has_a_fixed_wire_code_and_round_trips() {
+        assert_eq!(MessageKind::Channel.code(), 8);
+        assert_eq!(MessageKind::from_code(8), Some(MessageKind::Channel));
+
+        let mut channel_params = params();
+        channel_params.kind = MessageKind::Channel;
+        let identity = Identity::generate().expect("identity");
+        let envelope = Envelope::new(&identity, channel_params, b"opaque CHN1 body".to_vec())
+            .expect("signed channel envelope");
+        let bytes = envelope.to_bytes().expect("encoded envelope");
+        let decoded = Envelope::from_bytes(&bytes).expect("decoded envelope");
+        assert_eq!(decoded.kind, MessageKind::Channel);
+        assert_eq!(decoded, envelope);
+        decoded.verify().expect("valid channel signature");
+    }
+}

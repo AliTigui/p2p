@@ -1,0 +1,20 @@
+[package]
+name = "p2p-crypto"
+description = "Established-primitive wrappers for key derivation, AEAD, and domain-separated subkeys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+p2p-core.workspace = true
+thiserror.workspace = true
+argon2.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+aead.workspace = true
+chacha20poly1305.workspace = true
+getrandom.workspace = true
+zeroize.workspace = true

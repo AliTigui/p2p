@@ -1,0 +1,76 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/crypto",
+    "crates/identity",
+    "crates/groups",
+    "crates/chat",
+    "crates/messaging",
+    "crates/files",
+    "crates/security",
+    "crates/network",
+    "crates/storage",
+    "apps/desktop",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+p2p-core = { path = "crates/core" }
+p2p-crypto = { path = "crates/crypto" }
+p2p-identity = { path = "crates/identity" }
+p2p-groups = { path = "crates/groups" }
+p2p-chat = { path = "crates/chat" }
+p2p-messaging = { path = "crates/messaging" }
+p2p-files = { path = "crates/files" }
+p2p-security = { path = "crates/security" }
+p2p-network = { path = "crates/network" }
+p2p-storage = { path = "crates/storage" }
+
+# Verified in docs/DEPENDENCIES.md. Feature gates are explicit so no browser,
+# image, or webview backend is pulled in by the identity layer.
+libp2p = { version = "=0.56.0", default-features = false, features = [
+  "autonat",
+  "dcutr",
+  "ed25519",
+  "identify",
+  "kad",
+  "macros",
+  "mdns",
+  "ping",
+  "relay",
+  "tcp",
+  "noise",
+  "yamux",
+  "tokio",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+libp2p-identity = { version = "0.3.1", features = ["ed25519", "rand", "peerid"] }
+libp2p-request-response = "=0.29.0"
+async-trait = "0.1"
+openmls = "=0.9.2"
+openmls_rust_crypto = "=0.6.0"
+openmls_traits = "=0.6.0"
+argon2 = "0.6"
+hkdf = "0.13"
+hmac = "0.13"
+rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }
+aead = { version = "0.6", features = ["alloc"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
+sha2 = "0.11"
+data-encoding = "2.11"
+base64 = "0.23"
+percent-encoding = "2.3"
+qrcode = { version = "0.15", default-features = false, features = ["std", "svg"] }
+getrandom = "0.3"
+zeroize = "1.9"
+dirs = "7"
+rfd = "0.18"
