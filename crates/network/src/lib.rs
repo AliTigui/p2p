@@ -60,6 +60,10 @@ pub use protocol::{
 /// Combined libp2p behaviour. The four application protocols are always present;
 /// discovery, identify, NAT, and relay behaviours are wrapped in `Toggle` and
 /// disabled unless the local user explicitly opts in at `Network::start`.
+// The derive emits an `unreachable!()` arm for event variants that cannot occur
+// with the selected behaviour set; newer Clippy versions flag that generated
+// code under `-D warnings`.
+#[allow(unreachable_code)]
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     messages: request_response::Behaviour<MessageCodec>,
@@ -2362,7 +2366,10 @@ fn build_swarm(
     let swarm = SwarmBuilder::with_existing_identity(keypair.clone())
         .with_tokio()
         .with_other_transport(move |_| direct_transport)
-        .map_err(|error| error.to_string())?
+        // `with_other_transport` is infallible for a ready-made transport.
+        // Matching `Infallible` avoids an unreachable `Display` call that
+        // newer Clippy versions reject under `-D warnings`.
+        .map_err(|never| -> String { match never {} })?
         // The relay transport is present so client behaviour can be opted in.
         // With the behaviour toggled off it never dials or listens on a relay.
         // Relay upgrades are composed around the wrapped direct transport, so
@@ -2426,7 +2433,9 @@ fn build_swarm(
                 .into(),
             connection_limits: ConnectionLimitBehaviour::new(transport_limits.libp2p()),
         })
-        .map_err(|error| error.to_string())?
+        // `with_behaviour` is infallible when given a ready-made behaviour;
+        // see the `Infallible` note on `with_other_transport` above.
+        .map_err(|never| -> String { match never {} })?
         .with_swarm_config(std::convert::identity)
         .with_connection_timeout(connection_timeout)
         .build();

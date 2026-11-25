@@ -6,7 +6,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+# This script lives in <repo>/packaging/windows, so walk up two directories.
+$repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $manifest = Get-Content -LiteralPath (Join-Path $repoRoot 'Cargo.toml') -Raw
