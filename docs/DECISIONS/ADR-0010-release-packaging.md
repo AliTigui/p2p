@@ -16,7 +16,7 @@ The application has strong privacy constraints: no plaintext sensitive state on 
 2. Use native GitHub-hosted runners for the release matrix: Linux x86_64, Windows x86_64 MSVC, macOS x86_64, and macOS arm64. No cross-compiler or web technology is introduced.
 3. Produce portable archives plus one native installer per desktop platform:
    - Linux: `.tar.gz` and `.deb` built with `dpkg-deb`.
-   - Windows: `.zip` and `.msi` built with WiX Toolset 3.x.
+   - Windows: `.zip` and `.msi` built with WiX Toolset 4+ (`candle.exe`/`light.exe`, `-arch x64`).
    - macOS: `.app` inside `.tar.gz` and `.dmg` built with `hdiutil`.
 4. Each package includes `README.md` and a short `NOTICE.md` that states the license, absence of centralized runtime services, default unsigned status, and memory-only MLS/chat state.
 5. Tagged releases upload all artifacts, a single `SHA256SUMS` manifest, and generated release notes. Checksums are verified in CI before publishing.
@@ -27,7 +27,7 @@ The application has strong privacy constraints: no plaintext sensitive state on 
 ## Consequences
 
 - Users receive conventional platform artifacts and can independently build from source.
-- Windows MSI manufacturing requires WiX 3.x; macOS signing/notarization requires platform credentials not present in the repository.
+- Windows MSI manufacturing requires WiX 4+; the current Windows CI image provides it through `WIX` and rejects the WiX 3.x `Package/@Win64` attribute. macOS signing/notarization requires platform credentials not present in the repository.
 - Unsigned macOS builds may be blocked by Gatekeeper unless the user explicitly allows them or a release operator signs/notarizes with Apple credentials.
 - Linux ARM64 and Windows ARM64 are not built by the default matrix; add appropriate runners before claiming support.
 - Windows/macOS artifacts cannot be produced or visually inspected on the current headless Linux host. CI results and per-platform verification commands in `docs/BUILDING.md` are the evidence for those targets.

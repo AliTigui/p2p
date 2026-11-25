@@ -9,7 +9,6 @@
     <Package InstallerVersion="200"
              Compressed="yes"
              InstallScope="perMachine"
-             Win64="yes"
              Manufacturer="P2P Messenger"
              Description="Decentralized end-to-end encrypted P2P messenger" />
 

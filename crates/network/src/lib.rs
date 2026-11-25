@@ -57,32 +57,41 @@ pub use protocol::{
     MessageCodec,
 };
 
-/// Combined libp2p behaviour. The four application protocols are always present;
-/// discovery, identify, NAT, and relay behaviours are wrapped in `Toggle` and
-/// disabled unless the local user explicitly opts in at `Network::start`.
 // The derive emits an `unreachable!()` arm for event variants that cannot occur
-// with the selected behaviour set; newer Clippy versions flag that generated
-// code under `-D warnings`.
-#[allow(unreachable_code)]
-#[derive(NetworkBehaviour)]
-struct Behaviour {
-    messages: request_response::Behaviour<MessageCodec>,
-    setup: request_response::Behaviour<MessageCodec>,
-    files: request_response::Behaviour<MessageCodec>,
-    control: request_response::Behaviour<MessageCodec>,
-    identify: Toggle<identify::Behaviour>,
-    ping: Toggle<ping::Behaviour>,
-    mdns: Toggle<mdns::tokio::Behaviour>,
-    kad: Toggle<kad::Behaviour<kad::store::MemoryStore>>,
-    relay_client: Toggle<relay::client::Behaviour>,
-    relay_server: Toggle<relay::Behaviour>,
-    autonat: Toggle<autonat::v1::Behaviour>,
-    dcutr: Toggle<dcutr::Behaviour>,
-    // Enforces socket admission limits before Noise authentication. The
-    // established-connection counters below remain authoritative for
-    // per-peer/per-IP policy and relayed-path accounting.
-    connection_limits: ConnectionLimitBehaviour,
+// with the selected behaviour set. Keep the lint allowance module-local so it
+// covers the generated impls without hiding unreachable code in the rest of the
+// network crate.
+mod behaviour {
+    #![allow(unreachable_code)]
+
+    use super::*;
+
+    /// Combined libp2p behaviour. The four application protocols are always
+    /// present; discovery, identify, NAT, and relay behaviours are wrapped in
+    /// `Toggle` and disabled unless the local user explicitly opts in at
+    /// `Network::start`.
+    #[derive(NetworkBehaviour)]
+    pub(super) struct Behaviour {
+        pub(super) messages: request_response::Behaviour<MessageCodec>,
+        pub(super) setup: request_response::Behaviour<MessageCodec>,
+        pub(super) files: request_response::Behaviour<MessageCodec>,
+        pub(super) control: request_response::Behaviour<MessageCodec>,
+        pub(super) identify: Toggle<identify::Behaviour>,
+        pub(super) ping: Toggle<ping::Behaviour>,
+        pub(super) mdns: Toggle<mdns::tokio::Behaviour>,
+        pub(super) kad: Toggle<kad::Behaviour<kad::store::MemoryStore>>,
+        pub(super) relay_client: Toggle<relay::client::Behaviour>,
+        pub(super) relay_server: Toggle<relay::Behaviour>,
+        pub(super) autonat: Toggle<autonat::v1::Behaviour>,
+        pub(super) dcutr: Toggle<dcutr::Behaviour>,
+        // Enforces socket admission limits before Noise authentication. The
+        // established-connection counters below remain authoritative for
+        // per-peer/per-IP policy and relayed-path accounting.
+        pub(super) connection_limits: ConnectionLimitBehaviour,
+    }
 }
+
+use behaviour::{Behaviour, BehaviourEvent};
 
 /// Errors from the direct-connect network layer.
 #[derive(Debug, Error)]

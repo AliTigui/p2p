@@ -69,7 +69,7 @@ try {
 
     $wix = $env:WIX
     if ([string]::IsNullOrWhiteSpace($wix)) {
-        throw 'WIX environment variable is not set. Install WiX Toolset 3.x.'
+        throw 'WIX environment variable is not set. Install WiX Toolset 4+ with candle.exe and light.exe.'
     }
     $candle = Join-Path $wix 'bin\candle.exe'
     $light = Join-Path $wix 'bin\light.exe'
@@ -81,7 +81,10 @@ try {
 
     $wxs = Join-Path $repoRoot 'packaging\windows\p2p-messenger.wxs'
     $wixobj = Join-Path $stage 'p2p-messenger.wixobj'
-    & $candle -nologo "-dVersion=$Version" "-dSourceDir=$stage" $wxs -out $wixobj
+    # WiX 4+ derives package and component bitness from the compiler platform.
+    # The explicit Win64 attribute was removed from WiX schemas; -arch x64 keeps
+    # the MSI aligned with the x86_64 executable and ProgramFiles64Folder.
+    & $candle -nologo -arch x64 "-dVersion=$Version" "-dSourceDir=$stage" $wxs -out $wixobj
     if ($LASTEXITCODE -ne 0) { throw 'WiX compilation failed.' }
 
     $msiPath = Join-Path $OutDir "$base.msi"

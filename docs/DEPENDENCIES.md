@@ -83,7 +83,7 @@ Milestones 9 and 10 add **no new external dependency and no fourth wire protocol
 
 ### Release packaging decision (Milestone 11)
 
-Milestone 11 adds **no new Cargo dependency and no new Cargo feature**. Source builds continue to use the committed `Cargo.lock` with `--locked`. Packaging relies only on platform-native build tools outside the Rust dependency graph: `dpkg-deb` on Linux, WiX Toolset 3.x (`candle.exe`/`light.exe`) on Windows, and `hdiutil`/`codesign` on macOS. These tools are used by CI/package scripts only; the application does not link, invoke, or depend on them at runtime. No npm, Node.js, browser, webview, auto-updater, telemetry SDK, or centralized service client was added. Optional signing is operator-controlled through environment-provided platform credentials and is not configured in this repository.
+Milestone 11 adds **no new Cargo dependency and no new Cargo feature**. Source builds continue to use the committed `Cargo.lock` with `--locked`. Packaging relies only on platform-native build tools outside the Rust dependency graph: `dpkg-deb` on Linux, WiX Toolset 4+ (`candle.exe`/`light.exe`) on Windows, and `hdiutil`/`codesign` on macOS. These tools are used by CI/package scripts only; the application does not link, invoke, or depend on them at runtime. No npm, Node.js, browser, webview, auto-updater, telemetry SDK, or centralized service client was added. Optional signing is operator-controlled through environment-provided platform credentials and is not configured in this repository.
 
 ### Local hardening dependency decision (Milestone 12)
 

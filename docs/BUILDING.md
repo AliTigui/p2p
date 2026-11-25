@@ -69,7 +69,7 @@ The per-artifact `.sha256` sidecars contain bare filenames, so those `sha256sum 
 
 ## Windows (x86_64)
 
-Requirements: Rust MSVC target, Visual Studio C++ build tools, and **WiX Toolset 3.x**. GitHub-hosted `windows-latest` runners provide WiX via the `WIX` environment variable; local builders must set it to the WiX install directory.
+Requirements: Rust MSVC target, Visual Studio C++ build tools, and **WiX Toolset 4+** with `candle.exe`/`light.exe`. GitHub-hosted `windows-latest` runners provide WiX via the `WIX` environment variable; local builders must set it to the WiX install directory. The script passes `-arch x64` so WiX 4+ derives x64 MSI bitness without the removed `Package/@Win64` attribute.
 
 ```powershell
 cargo build --locked --release -p p2p-desktop --features native --target x86_64-pc-windows-msvc
