@@ -164,7 +164,9 @@ impl MessengerApp {
 
     /// Start the direct-connect worker and MLS controller with the unlocked
     /// vault identity. No peer is contacted until the user supplies an address.
-    fn start_chat(&mut self, session: &Session) {
+    /// An encrypted-state restore failure is returned so the caller can keep the
+    /// vault in a real failed state instead of showing a fabricated session.
+    fn start_chat(&mut self, session: &Session) -> Result<(), String> {
         self.chat = None;
         self.chat_error = None;
         self.peer_address.clear();
@@ -173,24 +175,13 @@ impl MessengerApp {
         self.message_text.clear();
         self.channel_name.clear();
         self.file_path.clear();
-        let config = match self.network_options.to_config() {
-            Ok(config) => config,
-            Err(error) => {
-                self.chat_error = Some(error);
-                return;
-            }
-        };
-        let storage = match session.try_clone() {
-            Ok(storage) => storage,
-            Err(error) => {
-                self.chat_error = Some(error.to_string());
-                return;
-            }
-        };
-        match MessengerController::start_with_control_log(session.identity(), config, storage) {
-            Ok(chat) => self.chat = Some(chat),
-            Err(error) => self.chat_error = Some(error.to_string()),
-        }
+        let config = self.network_options.to_config()?;
+        let storage = session.try_clone().map_err(|error| error.to_string())?;
+        self.chat = Some(
+            MessengerController::start_with_control_log(session.identity(), config, storage)
+                .map_err(|error| error.to_string())?,
+        );
+        Ok(())
     }
 
     fn connect_peer(&mut self) {
@@ -1243,7 +1234,7 @@ impl MessengerApp {
         ui.add_space(6.0);
         ui.label(
             RichText::new(
-                "MLS group state and decrypted messages are memory-only. Receipts advance status only after verified MLS decryption; file chunks are encrypted and integrity-checked, but no malware scanner is configured.",
+                "Joined MLS group state is restored from encrypted vault storage when present; decrypted messages remain memory-only. Pending group operations, receipts, and offline queues are not restored. Receipts advance status only after verified MLS decryption; file chunks are encrypted and integrity-checked, but no malware scanner is configured.",
             )
             .small()
             .weak(),
@@ -1366,7 +1357,16 @@ impl MessengerApp {
                             params.parallelism
                         ),
                     };
-                    self.start_chat(&session);
+                    if let Err(error) = self.start_chat(&session) {
+                        self.session = None;
+                        self.chat_error = Some(error.clone());
+                        self.state = VaultState::Failed {
+                            operation: outcome.operation,
+                            message: error,
+                        };
+                        self.form_error = None;
+                        return;
+                    }
                     self.session = Some(session);
                     self.state = VaultState::Unlocked(info);
                     self.form_error = None;
@@ -1449,5 +1449,65 @@ fn vault_directory() -> PathBuf {
 impl eframe::App for MessengerApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.render(ui);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controller_start_failure_keeps_vault_failed() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let vault = Vault::open(directory.path()).expect("vault");
+        let identity = Identity::generate().expect("identity");
+        let mut session = vault
+            .create("gui", "vault-password", &identity)
+            .expect("vault session");
+        session
+            .store_mls_state(&[7u8; 16], "gui-test", b"gui-test", 0, b"value")
+            .expect("orphan MLS group without application metadata");
+        let (sender, receiver) = mpsc::channel();
+        let mut app = MessengerApp {
+            info: p2p_core::app_info(),
+            vault,
+            session: None,
+            state: VaultState::Busy(VaultOperation::Unlocking),
+            receiver,
+            chat: None,
+            chat_error: None,
+            peer_address: String::new(),
+            contact_peer_id: String::new(),
+            member_peer_id: String::new(),
+            network_options: NetworkOptions::default(),
+            message_text: String::new(),
+            channel_name: String::new(),
+            file_path: String::new(),
+            username: String::new(),
+            password: String::new(),
+            confirm_password: String::new(),
+            form_error: None,
+            theme: Theme::Dark,
+            search: String::new(),
+        };
+        sender
+            .send(VaultOutcome {
+                operation: VaultOperation::Unlocking,
+                result: Ok(session),
+            })
+            .expect("send unlock outcome");
+
+        app.poll_worker();
+
+        assert!(matches!(
+            app.state,
+            VaultState::Failed {
+                operation: VaultOperation::Unlocking,
+                ..
+            }
+        ));
+        assert!(app.chat.is_none());
+        assert!(app.session.is_none());
+        assert!(app.chat_error.is_some());
     }
 }

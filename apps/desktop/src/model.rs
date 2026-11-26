@@ -340,7 +340,9 @@ pub fn security_rows(
     };
 
     let message_encryption = match state {
-        VaultState::Unlocked(_) => "MLS available (memory-only session)".to_owned(),
+        VaultState::Unlocked(_) => {
+            "MLS available (joined groups restored from encrypted vault when present)".to_owned()
+        }
         VaultState::Missing | VaultState::Locked | VaultState::Failed { .. } => {
             "Not active (vault locked)".to_owned()
         }
@@ -791,6 +793,11 @@ mod tests {
             .find(|row| row.label == "Local identity")
             .expect("identity row");
         assert!(identity.value.contains("Not available"));
+        let encryption = rows
+            .iter()
+            .find(|row| row.label == "Message encryption")
+            .expect("encryption row");
+        assert_eq!(encryption.value, "Not active (vault locked)");
         assert!(
             runtime_banner(&p2p_core::app_info(), &state, None).contains("vault operation failed")
         );

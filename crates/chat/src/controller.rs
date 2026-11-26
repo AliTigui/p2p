@@ -22,9 +22,13 @@ use p2p_network::{
 };
 use p2p_security::{ScanRequest, ScanStatus, SecurityConfig};
 use p2p_storage::{ControlRecordOutcome, Session};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::channel::{ChannelFrame, ChannelFrameKind, DEFAULT_CHANNEL_ID, MAX_CHANNELS_PER_GROUP};
+use crate::channel::{
+    ChannelFrame, ChannelFrameKind, DEFAULT_CHANNEL_ID, MAX_CHANNEL_MEMBERS,
+    MAX_CHANNEL_NAME_BYTES, MAX_CHANNELS_PER_GROUP,
+};
 use crate::setup::TransactionId;
 use crate::{ChatError, SetupEnvelope, SetupMessage};
 
@@ -39,18 +43,18 @@ pub const MAX_FILE_TRANSFER_TIMEOUT: Duration = Duration::from_secs(3600);
 /// How far a 1:1 MLS setup has progressed. A `Joined` status on the inviter
 /// requires a verified WelcomeAck; on the joiner it requires a verified
 /// Welcome that OpenMLS accepted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConversationStatus {
     KeyPackageRequested,
     KeyPackageReceived,
     WelcomeSent,
     Joined,
-    Failed(&'static str),
+    Failed(String),
 }
 
 impl ConversationStatus {
     /// Honest, user-facing text. It never claims verification or delivery.
-    pub fn description(self) -> &'static str {
+    pub fn description(&self) -> &str {
         match self {
             Self::KeyPackageRequested => "KeyPackage requested (not joined)",
             Self::KeyPackageReceived => "KeyPackage received (not joined)",
@@ -141,6 +145,134 @@ impl fmt::Debug for ChannelInfo {
             .field("revision", &self.revision)
             .field("acknowledged", &self.acknowledged)
             .finish_non_exhaustive()
+    }
+}
+
+/// Encrypted application-policy snapshot for one joined conversation. This is
+/// `CHN1` application state, not an OpenMLS provider entry; it is stored under
+/// the group blind index with a distinct authenticated label.
+const PERSISTED_CONVERSATION_LABEL: &str = "p2p.app.conversation/v1";
+const PERSISTED_CONVERSATION_VERSION: u8 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct PersistedChannel {
+    id: [u8; 16],
+    name: String,
+    creator: Vec<u8>,
+    members: Vec<Vec<u8>>,
+    revision: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedConversation {
+    version: u8,
+    conversation_id: [u8; 16],
+    peer: Vec<u8>,
+    admin: Vec<u8>,
+    members: Vec<Vec<u8>>,
+    status_code: u8,
+    status_reason: Option<String>,
+    channels: Vec<PersistedChannel>,
+    active_channel: Option<[u8; 16]>,
+    /// Pending operations are not restored by this phase. Their persisted flag
+    /// makes restart fail closed instead of silently clearing the operation.
+    pending_operation: bool,
+}
+
+struct RestoredConversations {
+    conversations: HashMap<[u8; 16], ConversationState>,
+    peer_conversations: HashMap<PeerId, [u8; 16]>,
+    active_channel: HashMap<[u8; 16], [u8; 16]>,
+    active: Option<[u8; 16]>,
+}
+
+impl PersistedConversation {
+    fn from_state(
+        state: &ConversationState,
+        peer: PeerId,
+        active_channel: Option<[u8; 16]>,
+    ) -> Self {
+        let (status_code, status_reason) = status_code(&state.status);
+        Self {
+            version: PERSISTED_CONVERSATION_VERSION,
+            conversation_id: state.conversation.id(),
+            peer: peer.to_bytes().to_vec(),
+            admin: state.admin.to_bytes().to_vec(),
+            members: state
+                .members
+                .iter()
+                .map(|peer| peer.to_bytes().to_vec())
+                .collect(),
+            status_code,
+            status_reason,
+            channels: state
+                .channels
+                .iter()
+                .map(|(id, channel)| PersistedChannel {
+                    id: *id,
+                    name: channel.name.clone(),
+                    creator: channel.creator.to_bytes().to_vec(),
+                    members: channel
+                        .members
+                        .iter()
+                        .map(|peer| peer.to_bytes().to_vec())
+                        .collect(),
+                    revision: channel.revision,
+                })
+                .collect(),
+            active_channel,
+            pending_operation: state.pending_operation.is_some(),
+        }
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, ChatError> {
+        let decoded: Self = serde_json::from_slice(bytes)
+            .map_err(|_| ChatError::MlsRestore("invalid encrypted conversation metadata"))?;
+        if decoded.version != PERSISTED_CONVERSATION_VERSION
+            || decoded.channels.len() > MAX_CHANNELS_PER_GROUP
+            || decoded.members.len() > MAX_CHANNEL_MEMBERS
+        {
+            return Err(ChatError::MlsRestore(
+                "unsupported restored conversation metadata",
+            ));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for channel in &decoded.channels {
+            if !ids.insert(channel.id)
+                || channel.name.len() > MAX_CHANNEL_NAME_BYTES
+                || channel.members.len() > MAX_CHANNEL_MEMBERS
+            {
+                return Err(ChatError::MlsRestore("invalid restored channel metadata"));
+            }
+        }
+        Ok(decoded)
+    }
+}
+
+fn parse_persisted_peer(bytes: &[u8]) -> Result<PeerId, ChatError> {
+    PeerId::from_bytes(bytes).map_err(|_| ChatError::MlsRestore("invalid restored peer id"))
+}
+
+fn status_code(status: &ConversationStatus) -> (u8, Option<String>) {
+    match status {
+        ConversationStatus::KeyPackageRequested => (1, None),
+        ConversationStatus::KeyPackageReceived => (2, None),
+        ConversationStatus::WelcomeSent => (3, None),
+        ConversationStatus::Joined => (4, None),
+        ConversationStatus::Failed(reason) => (5, Some(reason.clone())),
+    }
+}
+
+fn status_from_code(code: u8, reason: Option<String>) -> Result<ConversationStatus, ChatError> {
+    match (code, reason) {
+        (1, None) => Ok(ConversationStatus::KeyPackageRequested),
+        (2, None) => Ok(ConversationStatus::KeyPackageReceived),
+        (3, None) => Ok(ConversationStatus::WelcomeSent),
+        (4, None) => Ok(ConversationStatus::Joined),
+        (5, Some(reason)) if !reason.is_empty() => Ok(ConversationStatus::Failed(reason)),
+        _ => Err(ChatError::MlsRestore(
+            "invalid restored conversation status",
+        )),
     }
 }
 
@@ -642,6 +774,147 @@ impl MessengerController {
         )
     }
 
+    /// Restore only explicitly joined conversations. Every persisted group must
+    /// have authenticated application metadata; missing, inconsistent, or
+    /// pending state fails startup instead of fabricating a joined view.
+    fn restore_joined_conversations(
+        identity: &Identity,
+        storage: &Session,
+    ) -> Result<RestoredConversations, ChatError> {
+        let local = identity.peer_id();
+        let mut restored = RestoredConversations {
+            conversations: HashMap::new(),
+            peer_conversations: HashMap::new(),
+            active_channel: HashMap::new(),
+            active: None,
+        };
+        let mut first_joined = None;
+        for conversation_id in storage.mls_group_ids()? {
+            let bytes = storage
+                .load_mls_state(
+                    &conversation_id,
+                    PERSISTED_CONVERSATION_LABEL,
+                    PERSISTED_CONVERSATION_LABEL.as_bytes(),
+                )?
+                .ok_or(ChatError::MlsRestore(
+                    "encrypted conversation metadata is missing",
+                ))?;
+            let record = PersistedConversation::decode(&bytes)?;
+            if record.conversation_id != conversation_id {
+                return Err(ChatError::MlsRestore(
+                    "restored conversation id does not match its group",
+                ));
+            }
+            if record.pending_operation {
+                return Err(ChatError::MlsRestore(
+                    "a group operation was pending at shutdown",
+                ));
+            }
+            let status = status_from_code(record.status_code, record.status_reason)?;
+            if status != ConversationStatus::Joined {
+                // Setup and failed conversations are deliberately not restored
+                // in this phase. Their metadata remains encrypted in the vault.
+                continue;
+            }
+
+            let peer = parse_persisted_peer(&record.peer)?;
+            let admin = parse_persisted_peer(&record.admin)?;
+            if peer == local {
+                return Err(ChatError::MlsRestore(
+                    "restored conversation has no remote peer",
+                ));
+            }
+            let mut members = BTreeSet::new();
+            for encoded in &record.members {
+                if !members.insert(parse_persisted_peer(encoded)?) {
+                    return Err(ChatError::MlsRestore(
+                        "restored member list contains a duplicate",
+                    ));
+                }
+            }
+            if !members.contains(&local) || !members.contains(&admin) || !members.contains(&peer) {
+                return Err(ChatError::MlsRestore(
+                    "restored group policy is inconsistent",
+                ));
+            }
+
+            let conversation = MlsConversation::load_with_storage(
+                identity,
+                conversation_id,
+                storage.try_clone()?,
+            )?;
+            let group_members: BTreeSet<PeerId> = conversation.members()?.into_iter().collect();
+            if group_members != members {
+                return Err(ChatError::MlsRestore(
+                    "restored membership does not match MLS group state",
+                ));
+            }
+
+            let mut state = ConversationState::new(conversation, admin, members.clone());
+            state.channels.clear();
+            for channel in record.channels {
+                let creator = parse_persisted_peer(&channel.creator)?;
+                if !members.contains(&creator) {
+                    return Err(ChatError::MlsRestore(
+                        "restored channel creator is not a group member",
+                    ));
+                }
+                let mut channel_members = BTreeSet::new();
+                for encoded in &channel.members {
+                    let member = parse_persisted_peer(encoded)?;
+                    if !members.contains(&member) || !channel_members.insert(member) {
+                        return Err(ChatError::MlsRestore(
+                            "restored channel membership is inconsistent",
+                        ));
+                    }
+                }
+                if channel.id == DEFAULT_CHANNEL_ID && channel_members != members {
+                    return Err(ChatError::MlsRestore(
+                        "restored default channel membership is inconsistent",
+                    ));
+                }
+                if channel.id != DEFAULT_CHANNEL_ID && channel.revision == 0 {
+                    return Err(ChatError::MlsRestore(
+                        "restored channel revision is invalid",
+                    ));
+                }
+                state.channels.insert(
+                    channel.id,
+                    ChannelState {
+                        name: channel.name,
+                        creator,
+                        members: channel_members,
+                        revision: channel.revision,
+                        last_frame_id: None,
+                    },
+                );
+            }
+            if !state.channels.contains_key(&DEFAULT_CHANNEL_ID) {
+                return Err(ChatError::MlsRestore("restored default channel is missing"));
+            }
+            let selected = match record.active_channel {
+                Some(id) if state.channels.contains_key(&id) => id,
+                None => DEFAULT_CHANNEL_ID,
+                Some(_) => {
+                    return Err(ChatError::MlsRestore("restored active channel is unknown"));
+                }
+            };
+            state.status = ConversationStatus::Joined;
+            for member in &members {
+                if *member != local {
+                    restored.peer_conversations.insert(*member, conversation_id);
+                }
+            }
+            restored.active_channel.insert(conversation_id, selected);
+            restored.conversations.insert(conversation_id, state);
+            if first_joined.is_none() {
+                first_joined = Some(conversation_id);
+            }
+        }
+        restored.active = first_joined;
+        Ok(restored)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build(
         identity: &Identity,
@@ -662,13 +935,22 @@ impl MessengerController {
         {
             return Err(ChatError::ControlLogIdentityMismatch);
         }
+        let restored = match storage.as_ref() {
+            Some(storage) => Self::restore_joined_conversations(identity, storage)?,
+            None => RestoredConversations {
+                conversations: HashMap::new(),
+                peer_conversations: HashMap::new(),
+                active_channel: HashMap::new(),
+                active: None,
+            },
+        };
         let redial_config = RedialConfig::from(&config);
         let network = Network::start(identity, config)?;
         Ok(Self {
             identity: identity.clone(),
             network,
-            conversations: HashMap::new(),
-            peer_conversations: HashMap::new(),
+            conversations: restored.conversations,
+            peer_conversations: restored.peer_conversations,
             pending_key_packages: HashMap::new(),
             outstanding_setup: HashMap::new(),
             group_requests: HashMap::new(),
@@ -683,8 +965,8 @@ impl MessengerController {
             redial: HashMap::new(),
             connected_peers: BTreeSet::new(),
             messages: Vec::new(),
-            active: None,
-            active_channel: HashMap::new(),
+            active: restored.active,
+            active_channel: restored.active_channel,
             file_config,
             security_config,
             outgoing_files: HashMap::new(),
@@ -961,7 +1243,12 @@ impl MessengerController {
             return Err(ChatError::AlreadyEstablished);
         }
 
-        let conversation = MlsConversation::new(&self.identity)?;
+        let conversation = match self.storage.as_ref() {
+            Some(storage) => {
+                MlsConversation::new_with_storage(&self.identity, storage.try_clone()?)?
+            }
+            None => MlsConversation::new(&self.identity)?,
+        };
         let conversation_id = conversation.id();
         let transaction_id = random_id()?;
         self.send_setup(
@@ -981,6 +1268,7 @@ impl MessengerController {
         self.active = Some(conversation_id);
         self.active_channel
             .insert(conversation_id, DEFAULT_CHANNEL_ID);
+        self.persist_conversation(conversation_id)?;
         Ok(conversation_id)
     }
 
@@ -1070,7 +1358,7 @@ impl MessengerController {
             Self::check_admin(
                 state.admin,
                 local,
-                state.status,
+                &state.status,
                 state.pending_operation.is_some(),
             )?;
             if state.channels.len() >= MAX_CHANNELS_PER_GROUP {
@@ -1123,6 +1411,7 @@ impl MessengerController {
                 last_frame_id: Some(message_id),
             },
         );
+        self.persist_conversation(conversation_id)?;
         Ok(channel_id)
     }
 
@@ -1142,7 +1431,7 @@ impl MessengerController {
             Self::check_admin(
                 state.admin,
                 local,
-                state.status,
+                &state.status,
                 state.pending_operation.is_some(),
             )?;
             let channel = state
@@ -1172,6 +1461,7 @@ impl MessengerController {
             channel.revision = frame.revision;
             channel.last_frame_id = Some(message_id);
         }
+        self.persist_conversation(conversation_id)?;
         Ok(())
     }
 
@@ -1192,7 +1482,7 @@ impl MessengerController {
             Self::check_admin(
                 state.admin,
                 local,
-                state.status,
+                &state.status,
                 state.pending_operation.is_some(),
             )?;
             let channel = state
@@ -1229,6 +1519,7 @@ impl MessengerController {
             channel.revision = frame.revision;
             channel.last_frame_id = Some(message_id);
         }
+        self.persist_conversation(conversation_id)?;
         Ok(())
     }
 
@@ -1250,7 +1541,7 @@ impl MessengerController {
         Self::check_admin(
             state.admin,
             local,
-            state.status,
+            &state.status,
             state.pending_operation.is_some(),
         )?;
         if state.members.contains(&peer) {
@@ -1289,7 +1580,7 @@ impl MessengerController {
             Self::check_admin(
                 state.admin,
                 local,
-                state.status,
+                &state.status,
                 state.pending_operation.is_some(),
             )?;
             if !state.members.contains(&peer) {
@@ -1318,6 +1609,7 @@ impl MessengerController {
                 welcome_acked: true,
             });
         }
+        self.persist_conversation(conversation_id)?;
         self.dispatch_group_operation(conversation_id)
     }
 
@@ -1334,7 +1626,7 @@ impl MessengerController {
             Self::check_admin(
                 state.admin,
                 local,
-                state.status,
+                &state.status,
                 state.pending_operation.is_some(),
             )?;
             let commit = state.conversation.self_update_commit()?;
@@ -1356,6 +1648,7 @@ impl MessengerController {
                 welcome_acked: true,
             });
         }
+        self.persist_conversation(conversation_id)?;
         self.dispatch_group_operation(conversation_id)
     }
 
@@ -1395,6 +1688,7 @@ impl MessengerController {
         }
         self.active = Some(conversation_id);
         self.active_channel.insert(conversation_id, channel_id);
+        self.persist_conversation(conversation_id)?;
         Ok(())
     }
 
@@ -1769,7 +2063,7 @@ impl MessengerController {
             admin: state.admin,
             members: state.members.iter().copied().collect(),
             epoch: state.conversation.epoch(),
-            status: state.status,
+            status: state.status.clone(),
             pending_operation: state.pending_operation.as_ref().map(|op| op.operation),
             channels,
             active_channel,
@@ -1792,22 +2086,56 @@ impl MessengerController {
         self.connected_peers.contains(peer)
     }
 
-    fn set_status(&mut self, conversation_id: [u8; 16], status: ConversationStatus) {
+    /// Persist the encrypted application-policy snapshot for one conversation.
+    /// Memory-only controllers are a no-op; vault-backed controllers write the
+    /// snapshot under the group blind index at the group's current epoch.
+    fn persist_conversation(&mut self, conversation_id: [u8; 16]) -> Result<(), ChatError> {
+        let (epoch, bytes) = {
+            let Some(state) = self.conversations.get(&conversation_id) else {
+                return Ok(());
+            };
+            let peer = Self::display_peer(state, &self.identity.peer_id())
+                .ok_or(ChatError::MlsRestore("conversation has no display peer"))?;
+            let active_channel = self.active_channel.get(&conversation_id).copied();
+            let record = PersistedConversation::from_state(state, peer, active_channel);
+            let bytes = serde_json::to_vec(&record)
+                .map_err(|_| ChatError::MlsRestore("conversation metadata encoding failed"))?;
+            (state.conversation.epoch(), bytes)
+        };
+        if let Some(storage) = self.storage.as_mut() {
+            storage.store_mls_state(
+                &conversation_id,
+                PERSISTED_CONVERSATION_LABEL,
+                PERSISTED_CONVERSATION_LABEL.as_bytes(),
+                epoch,
+                &bytes,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn set_status(
+        &mut self,
+        conversation_id: [u8; 16],
+        status: ConversationStatus,
+    ) -> Result<(), ChatError> {
         if let Some(state) = self.conversations.get_mut(&conversation_id) {
             state.status = status;
+            self.persist_conversation(conversation_id)?;
         }
+        Ok(())
     }
 
     fn check_admin(
         admin: PeerId,
         local: PeerId,
-        status: ConversationStatus,
+        status: &ConversationStatus,
         pending: bool,
     ) -> Result<(), ChatError> {
         if admin != local {
             return Err(ChatError::NotAdmin);
         }
-        if status != ConversationStatus::Joined {
+        if *status != ConversationStatus::Joined {
             return Err(ChatError::ConversationNotReady);
         }
         if pending {
@@ -1994,7 +2322,7 @@ impl MessengerController {
         }
     }
 
-    fn finish_operation_if_ready(&mut self, conversation_id: [u8; 16]) {
+    fn finish_operation_if_ready(&mut self, conversation_id: [u8; 16]) -> Result<(), ChatError> {
         let ready = self
             .conversations
             .get(&conversation_id)
@@ -2004,7 +2332,9 @@ impl MessengerController {
             });
         if ready && let Some(state) = self.conversations.get_mut(&conversation_id) {
             state.pending_operation = None;
+            self.persist_conversation(conversation_id)?;
         }
+        Ok(())
     }
 
     fn refresh_peer_conversations(&mut self, conversation_id: [u8; 16], local: &PeerId) {
@@ -2047,6 +2377,13 @@ impl MessengerController {
         }
         if self.active == Some(conversation_id) {
             self.active = None;
+        }
+        let deletion = self
+            .storage
+            .as_mut()
+            .map(|storage| storage.delete_mls_state_group(&conversation_id));
+        if let Some(Err(error)) = deletion {
+            self.last_error = Some(error.to_string());
         }
     }
 
@@ -2187,8 +2524,8 @@ impl MessengerController {
                     } else if let Some(setup) = self.outstanding_setup.remove(&request_id) {
                         self.set_status(
                             setup.conversation_id,
-                            ConversationStatus::Failed("setup request failed"),
-                        );
+                            ConversationStatus::Failed("setup request failed".to_owned()),
+                        )?;
                     }
                 }
                 Ok(())
@@ -2335,6 +2672,7 @@ impl MessengerController {
                 } else if refresh_members {
                     let local = self.identity.peer_id();
                     self.refresh_peer_conversations(conversation_id, &local);
+                    self.persist_conversation(conversation_id)?;
                 }
                 let ack = SetupMessage::GroupCommitAck {
                     conversation_id,
@@ -2402,7 +2740,12 @@ impl MessengerController {
                 "another setup transaction is already pending for this conversation",
             ));
         }
-        let key_package = MlsConversation::key_package(&self.identity)?;
+        let key_package = match self.storage.as_ref() {
+            Some(storage) => {
+                MlsConversation::key_package_with_storage(&self.identity, storage.try_clone()?)?
+            }
+            None => MlsConversation::key_package(&self.identity)?,
+        };
         let bytes = key_package.bytes().to_vec();
         self.pending_key_packages.insert(
             key,
@@ -2491,6 +2834,7 @@ impl MessengerController {
                     .insert(conversation_id, DEFAULT_CHANNEL_ID);
                 self.refresh_peer_conversations(conversation_id, &self.identity.peer_id());
                 self.active = Some(conversation_id);
+                self.persist_conversation(conversation_id)?;
                 Ok(ack(true))
             }
             Err(error) => {
@@ -2539,6 +2883,7 @@ impl MessengerController {
                     state.status = ConversationStatus::WelcomeSent;
                     welcome
                 };
+                self.persist_conversation(conversation_id)?;
                 self.send_setup(
                     &peer,
                     SetupMessage::Welcome {
@@ -2574,7 +2919,7 @@ impl MessengerController {
                     Self::check_admin(
                         state.admin,
                         local,
-                        state.status,
+                        &state.status,
                         state.pending_operation.is_some(),
                     )?;
                     if state.members.contains(&peer) {
@@ -2605,6 +2950,7 @@ impl MessengerController {
                         welcome_acked: false,
                     });
                 }
+                self.persist_conversation(conversation_id)?;
                 self.refresh_peer_conversations(conversation_id, &local);
                 self.dispatch_group_operation(conversation_id)
             }
@@ -2640,8 +2986,9 @@ impl MessengerController {
                 state.status = if accepted {
                     ConversationStatus::Joined
                 } else {
-                    ConversationStatus::Failed("setup rejected by peer")
+                    ConversationStatus::Failed("setup rejected by peer".to_owned())
                 };
+                self.persist_conversation(conversation_id)?;
                 Ok(())
             }
             _ => Err(ChatError::InvalidSetup("unexpected setup response type")),
@@ -2697,7 +3044,7 @@ impl MessengerController {
                     .and_then(|state| state.pending_operation.as_mut())
                     .ok_or(ChatError::InvalidSetup("no group operation is pending"))?
                     .welcome_acked = true;
-                self.finish_operation_if_ready(conversation_id);
+                self.finish_operation_if_ready(conversation_id)?;
                 Ok(())
             }
             (
@@ -2742,7 +3089,7 @@ impl MessengerController {
                     .get_mut(&peer)
                     .ok_or(ChatError::UnexpectedSender)?;
                 *awaited = true;
-                self.finish_operation_if_ready(conversation_id);
+                self.finish_operation_if_ready(conversation_id)?;
                 Ok(())
             }
             _ => Err(ChatError::InvalidSetup("unexpected group acknowledgement")),
@@ -3450,6 +3797,9 @@ impl MessengerController {
                 delivery: None,
             });
         }
+        if kind == MessageKind::Channel {
+            self.persist_conversation(conversation_id)?;
+        }
         Ok(())
     }
 
@@ -3791,6 +4141,263 @@ mod tests {
 
         assert_eq!(controller.pending_key_packages.len(), 1);
         assert_eq!(controller.setup_replay.seen.len(), 1);
+    }
+
+    fn vault_session(directory: &Path) -> (Identity, Vault, Session) {
+        let identity = Identity::generate().expect("identity");
+        let vault = Vault::open(directory).expect("vault");
+        let session = vault
+            .create("phase4", "phase4-password", &identity)
+            .expect("vault session");
+        (identity, vault, session)
+    }
+
+    fn group_with_peer(
+        identity: &Identity,
+        peer: &Identity,
+        conversation_id: [u8; 16],
+        storage: Session,
+    ) -> MlsConversation {
+        let mut conversation =
+            MlsConversation::create_with_storage(identity, conversation_id, storage)
+                .expect("vault-backed MLS group");
+        let key_package = MlsConversation::key_package(peer).expect("peer key package");
+        let public_key = peer.public_key_bytes();
+        conversation
+            .add_member(key_package.bytes(), peer.peer_id(), &public_key)
+            .expect("add peer to MLS group");
+        conversation
+    }
+
+    fn persist_state(
+        identity: &Identity,
+        session: &mut Session,
+        conversation_id: [u8; 16],
+        state: ConversationState,
+        active_channel: Option<[u8; 16]>,
+    ) {
+        let peer =
+            MessengerController::display_peer(&state, &identity.peer_id()).expect("display peer");
+        let record = PersistedConversation::from_state(&state, peer, active_channel);
+        let bytes = serde_json::to_vec(&record).expect("encode conversation policy");
+        session
+            .store_mls_state(
+                &conversation_id,
+                PERSISTED_CONVERSATION_LABEL,
+                PERSISTED_CONVERSATION_LABEL.as_bytes(),
+                state.conversation.epoch(),
+                &bytes,
+            )
+            .expect("store conversation policy");
+    }
+
+    #[test]
+    fn joined_conversation_and_channel_policy_restore_after_restart() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (identity, vault, mut session) = vault_session(directory.path());
+        let peer = Identity::generate().expect("peer");
+        let conversation_id = [41u8; 16];
+        let channel_id = [42u8; 16];
+        let members = BTreeSet::from([identity.peer_id(), peer.peer_id()]);
+        let conversation = group_with_peer(
+            &identity,
+            &peer,
+            conversation_id,
+            session.try_clone().unwrap(),
+        );
+        let mut state = ConversationState::new(conversation, identity.peer_id(), members);
+        state.channels.insert(
+            channel_id,
+            ChannelState {
+                name: "room".to_owned(),
+                creator: identity.peer_id(),
+                members: state.members.clone(),
+                revision: 3,
+                last_frame_id: None,
+            },
+        );
+        persist_state(
+            &identity,
+            &mut session,
+            conversation_id,
+            state,
+            Some(channel_id),
+        );
+        drop(session);
+
+        let storage = vault
+            .unlock("phase4-password")
+            .expect("unlock after restart");
+        let controller = MessengerController::start_with_control_log(
+            &identity,
+            NetworkConfig::default(),
+            storage,
+        )
+        .expect("restore controller");
+        let infos = controller.conversation_infos();
+        assert_eq!(infos.len(), 1);
+        let info = &infos[0];
+        assert_eq!(info.conversation_id, conversation_id);
+        assert_eq!(info.status, ConversationStatus::Joined);
+        assert_eq!(info.admin, identity.peer_id());
+        assert_eq!(
+            info.members,
+            vec![identity.peer_id(), peer.peer_id()]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(info.channels.len(), 2);
+        let restored_channel = info
+            .channels
+            .iter()
+            .find(|channel| channel.channel_id == channel_id)
+            .expect("restored channel");
+        assert_eq!(restored_channel.name, "room");
+        assert_eq!(restored_channel.revision, 3);
+        assert_eq!(restored_channel.members.len(), 2);
+        assert_eq!(info.active_channel, Some(channel_id));
+    }
+
+    #[test]
+    fn restart_fails_when_joined_metadata_is_missing() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (identity, vault, session) = vault_session(directory.path());
+        let peer = Identity::generate().expect("peer");
+        let conversation_id = [43u8; 16];
+        let _conversation = group_with_peer(
+            &identity,
+            &peer,
+            conversation_id,
+            session.try_clone().unwrap(),
+        );
+        drop(session);
+
+        let storage = vault
+            .unlock("phase4-password")
+            .expect("unlock after restart");
+        assert!(matches!(
+            MessengerController::start_with_control_log(
+                &identity,
+                NetworkConfig::default(),
+                storage
+            ),
+            Err(ChatError::MlsRestore(_))
+        ));
+    }
+
+    #[test]
+    fn restart_fails_when_restored_membership_disagrees_with_mls_state() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (identity, vault, mut session) = vault_session(directory.path());
+        let peer = Identity::generate().expect("peer");
+        let outsider = Identity::generate().expect("outsider");
+        let conversation_id = [44u8; 16];
+        let conversation = group_with_peer(
+            &identity,
+            &peer,
+            conversation_id,
+            session.try_clone().unwrap(),
+        );
+        let members = BTreeSet::from([identity.peer_id(), peer.peer_id(), outsider.peer_id()]);
+        let state = ConversationState::new(conversation, identity.peer_id(), members);
+        persist_state(&identity, &mut session, conversation_id, state, None);
+        drop(session);
+
+        let storage = vault
+            .unlock("phase4-password")
+            .expect("unlock after restart");
+        assert!(matches!(
+            MessengerController::start_with_control_log(
+                &identity,
+                NetworkConfig::default(),
+                storage
+            ),
+            Err(ChatError::MlsRestore(_))
+        ));
+    }
+
+    #[test]
+    fn restart_fails_when_a_group_operation_was_pending() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (identity, vault, mut session) = vault_session(directory.path());
+        let peer = Identity::generate().expect("peer");
+        let conversation_id = [45u8; 16];
+        let conversation = group_with_peer(
+            &identity,
+            &peer,
+            conversation_id,
+            session.try_clone().unwrap(),
+        );
+        let mut state = ConversationState::new(
+            conversation,
+            identity.peer_id(),
+            BTreeSet::from([identity.peer_id(), peer.peer_id()]),
+        );
+        state.pending_operation = Some(PendingOperation {
+            transaction_id: [46u8; 16],
+            operation: GroupOperation::Add,
+            target: Some(peer.peer_id()),
+            commit: vec![1, 2, 3],
+            awaited: BTreeMap::new(),
+            welcome_target: Some(peer.peer_id()),
+            welcome: None,
+            welcome_acked: false,
+        });
+        persist_state(&identity, &mut session, conversation_id, state, None);
+        drop(session);
+
+        let storage = vault
+            .unlock("phase4-password")
+            .expect("unlock after restart");
+        assert!(matches!(
+            MessengerController::start_with_control_log(
+                &identity,
+                NetworkConfig::default(),
+                storage
+            ),
+            Err(ChatError::MlsRestore(_))
+        ));
+    }
+
+    #[test]
+    fn restart_fails_when_restored_active_channel_is_unknown() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (identity, vault, mut session) = vault_session(directory.path());
+        let peer = Identity::generate().expect("peer");
+        let conversation_id = [47u8; 16];
+        let conversation = group_with_peer(
+            &identity,
+            &peer,
+            conversation_id,
+            session.try_clone().unwrap(),
+        );
+        let state = ConversationState::new(
+            conversation,
+            identity.peer_id(),
+            BTreeSet::from([identity.peer_id(), peer.peer_id()]),
+        );
+        persist_state(
+            &identity,
+            &mut session,
+            conversation_id,
+            state,
+            Some([48u8; 16]),
+        );
+        drop(session);
+
+        let storage = vault
+            .unlock("phase4-password")
+            .expect("unlock after restart");
+        assert!(matches!(
+            MessengerController::start_with_control_log(
+                &identity,
+                NetworkConfig::default(),
+                storage
+            ),
+            Err(ChatError::MlsRestore(_))
+        ));
     }
 
     fn joined_state(identity: &Identity, peer: PeerId, admin: PeerId) -> ConversationState {

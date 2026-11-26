@@ -3101,6 +3101,8 @@ dependencies = [
  "p2p-network",
  "p2p-security",
  "p2p-storage",
+ "serde",
+ "serde_json",
  "sha2 0.11.2",
  "thiserror 2.0.21",
 ]
@@ -3165,6 +3167,7 @@ dependencies = [
  "openmls_traits",
  "p2p-identity",
  "p2p-messaging",
+ "p2p-storage",
  "thiserror 2.0.21",
  "zeroize",
 ]

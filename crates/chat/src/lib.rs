@@ -6,11 +6,12 @@
 //! comes from verified signed frames, and delivery state changes only when a
 //! verified MLS-encrypted receipt is received.
 //!
-//! MLS state and displayed plaintext are memory-only. Nothing here persists a
-//! restored conversation or claims that encrypted envelope rows can rebuild
-//! MLS group state. When a vault `Session` is attached, a separate bounded
-//! control-frame digest log preserves replay decisions across restart; it is
-//! not an MLS state restore or a general replay-proof protocol.
+//! Decrypted plaintext remains memory-only. With a vault `Session`, joined
+//! MLS groups and their application policy are restored on startup through
+//! `MlsGroup::load` over encrypted provider state; setup, pending-operation,
+//! receipt, and offline-queue restoration remain explicit follow-ups. The
+//! bounded control-frame digest log preserves replay decisions across restart;
+//! it is not a general replay-proof protocol.
 
 #![forbid(unsafe_code)]
 
@@ -59,6 +60,8 @@ pub enum ChatError {
     ControlLog(#[from] p2p_storage::StorageError),
     #[error("control-log vault identity does not match this session")]
     ControlLogIdentityMismatch,
+    #[error("encrypted MLS state could not be restored: {0}")]
+    MlsRestore(&'static str),
     #[error("a file transfer is already active with this peer")]
     FileTransferLimit,
     #[error("file transfer is not tracked for this peer")]
