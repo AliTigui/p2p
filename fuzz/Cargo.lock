@@ -3224,10 +3224,13 @@ name = "p2p-storage"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
+ "openmls_traits",
  "p2p-core",
  "p2p-crypto",
  "p2p-identity",
  "rusqlite",
+ "serde",
+ "serde_json",
  "sha2 0.11.2",
  "thiserror 2.0.21",
  "zeroize",
