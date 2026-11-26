@@ -15,6 +15,7 @@ const MESSAGE_PAYLOAD: &str = "SENTINEL_MESSAGE_PAYLOAD_77";
 const ATTACHMENT_NAME: &str = "SENTINEL_ATTACHMENT_42.txt";
 const ATTACHMENT_PAYLOAD: &[u8] = b"SENTINEL_ATTACHMENT_PAYLOAD_77";
 const ATTACHMENT_FORMAT: &str = "TXT";
+const MLS_STATE_SENTINEL: &str = "SENTINEL_MLS_STATE_PAYLOAD_88";
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.is_empty()
@@ -70,6 +71,7 @@ fn assert_no_plaintext(directory: &std::path::Path, private_key: &[u8]) {
             MESSAGE_PAYLOAD,
             ATTACHMENT_NAME,
             ATTACHMENT_FORMAT,
+            MLS_STATE_SENTINEL,
         ] {
             assert!(
                 !contains(&bytes, sentinel.as_bytes()),
@@ -661,4 +663,346 @@ fn tampered_control_anchor_is_detected() {
         vault.unlock(PASSWORD),
         Err(StorageError::RollbackDetected)
     ));
+}
+
+#[test]
+fn mls_state_round_trips_as_ciphertext_and_explicit_delete_removes_it() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let vault = Vault::open(directory.path()).expect("open vault");
+    let identity = Identity::generate().expect("identity");
+    let private_key = identity.export_keypair_bytes();
+    let group = [7u8; 16];
+
+    {
+        let mut session = vault.create(USERNAME, PASSWORD, &identity).expect("create");
+        session
+            .store_mls_state(
+                &group,
+                "tree",
+                b"group-node",
+                3,
+                MLS_STATE_SENTINEL.as_bytes(),
+            )
+            .expect("store tree");
+        session
+            .store_mls_state(&group, "secrets", b"epoch-3", 3, b"MLS_SECRET_42")
+            .expect("store secrets");
+        assert_eq!(
+            session
+                .load_mls_state(&group, "tree", b"group-node")
+                .expect("load tree")
+                .as_deref()
+                .map(|value| value.as_slice()),
+            Some(MLS_STATE_SENTINEL.as_bytes())
+        );
+        assert_eq!(session.mls_group_ids().expect("group ids"), vec![group]);
+        assert_eq!(
+            session
+                .load_mls_state_group(&group)
+                .expect("load group")
+                .len(),
+            2
+        );
+
+        let replaced = [8u8; 16];
+        session
+            .store_mls_state(&replaced, "tree", b"node", 5, b"MLS_EPOCH_5")
+            .expect("store newer epoch");
+        session
+            .store_mls_state(&replaced, "tree", b"node", 2, b"MLS_EPOCH_2")
+            .expect("replace with older epoch");
+    }
+
+    assert_no_plaintext(directory.path(), &private_key);
+
+    {
+        let session = vault.unlock(PASSWORD).expect("unlock");
+        session.verify_mls_state().expect("verified on unlock");
+        assert_eq!(
+            session
+                .load_mls_state(&group, "secrets", b"epoch-3")
+                .expect("load secrets")
+                .as_deref()
+                .map(|value| value.as_slice()),
+            Some(b"MLS_SECRET_42".as_slice())
+        );
+        assert!(
+            session
+                .load_mls_state(&group, "missing", b"none")
+                .expect("missing entry")
+                .is_none()
+        );
+        assert_eq!(
+            session
+                .load_mls_state(&[8u8; 16], "tree", b"node")
+                .expect("load replaced state")
+                .as_deref()
+                .map(|value| value.as_slice()),
+            Some(b"MLS_EPOCH_2".as_slice())
+        );
+    }
+
+    {
+        let mut session = vault.unlock(PASSWORD).expect("unlock again");
+        session
+            .delete_mls_state_group(&group)
+            .expect("delete group");
+        session
+            .delete_mls_state_group(&[8u8; 16])
+            .expect("delete replaced group");
+        session.verify_mls_state().expect("empty state verifies");
+        assert!(session.mls_group_ids().expect("no groups").is_empty());
+    }
+
+    let reopened = vault.unlock(PASSWORD).expect("unlock after delete");
+    assert!(reopened.mls_group_ids().expect("no groups").is_empty());
+}
+
+#[test]
+fn tampered_mls_state_is_rejected_on_unlock() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let identity = Identity::generate().expect("identity");
+    let vault = Vault::open(directory.path()).expect("open vault");
+
+    let mut session = vault.create(USERNAME, PASSWORD, &identity).expect("create");
+    session
+        .store_mls_state(
+            &[11u8; 16],
+            "tree",
+            b"node",
+            1,
+            MLS_STATE_SENTINEL.as_bytes(),
+        )
+        .expect("store");
+    drop(session);
+
+    let conn = rusqlite::Connection::open(vault.database_path()).expect("open database");
+    conn.execute(
+        "UPDATE mls_state SET ciphertext = ?1",
+        rusqlite::params![vec![0u8; 40]],
+    )
+    .expect("tamper ciphertext");
+    drop(conn);
+
+    assert!(vault.unlock(PASSWORD).is_err());
+}
+
+#[test]
+fn password_change_keeps_encrypted_mls_state_readable() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let identity = Identity::generate().expect("identity");
+    let vault = Vault::open(directory.path()).expect("open vault");
+    let group = [13u8; 16];
+
+    {
+        let mut session = vault.create(USERNAME, PASSWORD, &identity).expect("create");
+        session
+            .store_mls_state(&group, "policy", b"channel", 2, b"MLS_POLICY_77")
+            .expect("store");
+        session
+            .change_password(PASSWORD, "NEW_SENTINEL_PASSWORD_12")
+            .expect("change password");
+    }
+
+    let reopened = vault
+        .unlock("NEW_SENTINEL_PASSWORD_12")
+        .expect("unlock with new password");
+    assert_eq!(
+        reopened
+            .load_mls_state(&group, "policy", b"channel")
+            .expect("load")
+            .as_deref()
+            .map(|value| value.as_slice()),
+        Some(b"MLS_POLICY_77".as_slice())
+    );
+}
+
+#[test]
+fn mls_state_rejects_oversized_and_empty_values() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let identity = Identity::generate().expect("identity");
+    let vault = Vault::open(directory.path()).expect("open vault");
+    let mut session = vault.create(USERNAME, PASSWORD, &identity).expect("create");
+
+    assert!(
+        session
+            .store_mls_state(&[15u8; 16], "tree", b"node", 1, &[])
+            .is_err()
+    );
+    assert!(
+        session
+            .store_mls_state(
+                &[15u8; 16],
+                "tree",
+                b"node",
+                1,
+                &vec![7u8; p2p_storage::MAX_MLS_STATE_BYTES + 1],
+            )
+            .is_err()
+    );
+    assert!(
+        session
+            .store_mls_state(&[15u8; 16], &"x".repeat(65), b"node", 1, b"value",)
+            .is_err()
+    );
+}
+
+#[test]
+fn restoring_database_before_mls_write_is_detected_by_anchor() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let identity = Identity::generate().expect("identity");
+    let vault = Vault::open(directory.path()).expect("open vault");
+
+    {
+        let session = vault.create(USERNAME, PASSWORD, &identity).expect("create");
+        drop(session);
+    }
+    let empty_snapshot = database_snapshot(directory.path());
+
+    {
+        let mut session = vault.unlock(PASSWORD).expect("unlock");
+        session
+            .store_mls_state(&[21u8; 16], "tree", b"node", 1, b"MLS_ANCHOR_WRITE_21")
+            .expect("store MLS state");
+    }
+
+    restore_database_snapshot(&empty_snapshot);
+    assert!(matches!(
+        vault.unlock(PASSWORD),
+        Err(StorageError::RollbackDetected)
+    ));
+}
+
+#[test]
+fn restoring_database_before_mls_deletion_is_detected_by_anchor() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let identity = Identity::generate().expect("identity");
+    let vault = Vault::open(directory.path()).expect("open vault");
+    let group = [22u8; 16];
+
+    {
+        let mut session = vault.create(USERNAME, PASSWORD, &identity).expect("create");
+        session
+            .store_mls_state(&group, "tree", b"node", 1, b"MLS_ANCHOR_DELETE_22")
+            .expect("store MLS state");
+    }
+    let populated_snapshot = database_snapshot(directory.path());
+
+    {
+        let mut session = vault.unlock(PASSWORD).expect("unlock");
+        session
+            .delete_mls_state_group(&group)
+            .expect("delete MLS group");
+    }
+
+    restore_database_snapshot(&populated_snapshot);
+    assert!(matches!(
+        vault.unlock(PASSWORD),
+        Err(StorageError::RollbackDetected)
+    ));
+}
+
+#[test]
+fn control_log_and_mls_state_share_one_anchor() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let identity = Identity::generate().expect("identity");
+    let vault = Vault::open(directory.path()).expect("open vault");
+    let group = [24u8; 16];
+
+    {
+        let mut session = vault.create(USERNAME, PASSWORD, &identity).expect("create");
+        assert_eq!(
+            session
+                .record_control_frame(b"12D3KooWMLSANCHOR", &[4u8; 32], false)
+                .expect("record control frame"),
+            ControlRecordOutcome::Appended(1)
+        );
+        session
+            .store_mls_state(&group, "tree", b"node", 3, b"MLS_ANCHOR_SHARED_24")
+            .expect("store MLS state");
+    }
+
+    let reopened = vault.unlock(PASSWORD).expect("unlock");
+    assert_eq!(
+        reopened
+            .control_log_state()
+            .expect("control state")
+            .sequence,
+        1
+    );
+    assert_eq!(
+        reopened
+            .load_mls_state(&group, "tree", b"node")
+            .expect("load MLS state")
+            .as_deref()
+            .map(|value| value.as_slice()),
+        Some(b"MLS_ANCHOR_SHARED_24".as_slice())
+    );
+    reopened.verify_control_log().expect("verify control log");
+    reopened.verify_mls_state().expect("verify MLS state");
+    assert_no_plaintext(directory.path(), &identity.export_keypair_bytes());
+}
+
+#[test]
+fn restoring_whole_vault_including_anchor_is_not_detected() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let backup = tempfile::tempdir().expect("backup dir");
+    let identity = Identity::generate().expect("identity");
+    let vault = Vault::open(directory.path()).expect("open vault");
+    let group = [25u8; 16];
+
+    {
+        let mut session = vault.create(USERNAME, PASSWORD, &identity).expect("create");
+        session
+            .store_mls_state(&group, "tree", b"node", 1, b"MLS_ANCHOR_WHOLE_VAULT_25")
+            .expect("store MLS state");
+    }
+
+    for entry in fs::read_dir(directory.path())
+        .expect("read vault dir")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.is_file() {
+            fs::copy(&path, backup.path().join(entry.file_name())).expect("back up file");
+        }
+    }
+
+    {
+        let mut session = vault.unlock(PASSWORD).expect("unlock");
+        session
+            .delete_mls_state_group(&group)
+            .expect("delete MLS group");
+    }
+
+    for entry in fs::read_dir(directory.path())
+        .expect("read vault dir")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.is_file() {
+            fs::remove_file(path).expect("remove current file");
+        }
+    }
+    for entry in fs::read_dir(backup.path())
+        .expect("read backup dir")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.is_file() {
+            fs::copy(&path, directory.path().join(entry.file_name())).expect("restore file");
+        }
+    }
+
+    let reopened = vault
+        .unlock(PASSWORD)
+        .expect("whole-vault-plus-anchor restore is not locally detectable");
+    assert_eq!(
+        reopened
+            .load_mls_state(&group, "tree", b"node")
+            .expect("load restored MLS state")
+            .as_deref()
+            .map(|value| value.as_slice()),
+        Some(b"MLS_ANCHOR_WHOLE_VAULT_25".as_slice())
+    );
 }

@@ -9,6 +9,8 @@
 
 mod attachments;
 mod control_log;
+mod mls_provider;
+mod mls_state;
 
 use std::fmt;
 use std::fs;
@@ -29,6 +31,8 @@ pub use attachments::{AttachmentInfo, MAX_ATTACHMENT_BYTES};
 pub use control_log::{
     ControlLogState, ControlRecordOutcome, MAX_CONTROL_LOG_ENTRIES, MAX_CONTROL_PEER_BYTES,
 };
+pub use mls_provider::{MlsProviderError, StagedMlsProvider};
+pub use mls_state::{MAX_MLS_GROUPS, MAX_MLS_STATE_BYTES, MAX_MLS_STATE_ENTRIES, MlsStateEntry};
 
 const DATABASE_NAME: &str = "profile.db";
 const MASTER_AAD: &[u8] = b"p2p-messenger/master-key-wrap/v1";
@@ -74,6 +78,10 @@ pub enum StorageError {
     ControlLogFull,
     #[error("vault rollback was detected")]
     RollbackDetected,
+    #[error("encrypted MLS state is invalid: {0}")]
+    MlsStateIntegrity(String),
+    #[error("encrypted MLS state store is full")]
+    MlsStateFull,
     #[error("filesystem error: {0}")]
     Io(#[from] io::Error),
     #[error("cryptographic error: {0}")]
@@ -245,6 +253,7 @@ impl Vault {
             vault_dir: self.directory.clone(),
         };
         session.verify_control_log()?;
+        session.verify_mls_state()?;
         Ok(session)
     }
 
@@ -543,7 +552,7 @@ fn message_aad(profile_id: &[u8; 16], conversation_id: &[u8; 16]) -> Vec<u8> {
     aad
 }
 
-fn index_input(label: &[u8], first: &[u8; 16], second: &[u8]) -> Vec<u8> {
+pub(crate) fn index_input(label: &[u8], first: &[u8; 16], second: &[u8]) -> Vec<u8> {
     let mut input = Vec::with_capacity(label.len() + first.len() + second.len());
     input.extend_from_slice(label);
     input.extend_from_slice(first);
@@ -631,7 +640,28 @@ CREATE TABLE control_state (
 INSERT INTO control_state (id, sequence, chain) VALUES (1, 0, zeroblob(32));
 ";
 
-const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4];
+const SCHEMA_V5: &str = "
+CREATE TABLE mls_groups (
+    group_bi BLOB PRIMARY KEY,
+    ciphertext BLOB NOT NULL,
+    epoch INTEGER NOT NULL CHECK (epoch >= 0),
+    chain BLOB NOT NULL
+);
+
+CREATE TABLE mls_state (
+    group_bi BLOB NOT NULL,
+    entity_bi BLOB NOT NULL,
+    epoch INTEGER NOT NULL CHECK (epoch >= 0),
+    ciphertext BLOB NOT NULL,
+    chain_hash BLOB NOT NULL,
+    PRIMARY KEY (group_bi, entity_bi),
+    FOREIGN KEY (group_bi) REFERENCES mls_groups(group_bi)
+);
+
+CREATE INDEX mls_state_by_group ON mls_state(group_bi, entity_bi);
+";
+
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5];
 
 fn run_migrations(conn: &mut Connection) -> Result<(), StorageError> {
     let transaction = conn.transaction()?;

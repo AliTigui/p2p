@@ -10,23 +10,27 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use p2p_crypto::{Purpose, decrypt_bytes, encrypt_bytes};
-use rusqlite::{OptionalExtension, params};
+use p2p_crypto::{NONCE_LEN, Purpose, Subkeys, TAG_LEN, decrypt_bytes, encrypt_bytes};
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use super::mls_state::{MAX_MLS_GROUPS, MlsWatermark, collect_mls_watermarks};
 use super::{Session, StorageError, fixed, reject_symlink, restrict_file, tagged_aad};
 
 const ANCHOR_FILE: &str = "control.anchor";
 const ANCHOR_TEMP: &str = "control.anchor.tmp";
-const ANCHOR_AAD: &[u8] = b"p2p-messenger/control-anchor/v1";
+const ANCHOR_AAD_V1: &[u8] = b"p2p-messenger/control-anchor/v1";
+const ANCHOR_AAD_V2: &[u8] = b"p2p-messenger/control-anchor/v2";
 const RECORD_AAD: &[u8] = b"p2p-messenger/control-log/v1";
 const INDEX_LABEL: &[u8] = b"p2p-messenger/control-frame/v1";
 const CHAIN_LABEL: &[u8] = b"p2p-messenger/control-chain/v1";
-const ANCHOR_MAGIC: &[u8] = b"P2PANCH1";
-const ANCHOR_VERSION: u8 = 1;
+const ANCHOR_MAGIC_V1: &[u8] = b"P2PANCH1";
+const ANCHOR_MAGIC_V2: &[u8] = b"P2PANCH2";
+const ANCHOR_VERSION_V1: u8 = 1;
+const ANCHOR_VERSION_V2: u8 = 2;
 const RECORD_VERSION: u8 = 1;
 const ZERO_CHAIN: [u8; 32] = [0u8; 32];
 
@@ -35,8 +39,12 @@ pub const MAX_CONTROL_PEER_BYTES: usize = 64;
 /// Finite replay window. The log fails closed instead of dropping old records.
 pub const MAX_CONTROL_LOG_ENTRIES: u64 = 4096;
 
-const MAX_ANCHOR_BYTES: usize = 256;
-const ANCHOR_PLAINTEXT_BYTES: usize = 8 + 1 + 8 + 32;
+const ANCHOR_V1_PLAINTEXT_BYTES: usize = 8 + 1 + 8 + 32;
+const ANCHOR_V2_HEADER_BYTES: usize = 8 + 1 + 8 + 32 + 2;
+const MLS_WATERMARK_BYTES: usize = 32 + 8 + 32;
+const ANCHOR_V2_PLAINTEXT_BYTES: usize =
+    ANCHOR_V2_HEADER_BYTES + MAX_MLS_GROUPS as usize * MLS_WATERMARK_BYTES;
+const MAX_ANCHOR_BYTES: usize = ANCHOR_V2_PLAINTEXT_BYTES + NONCE_LEN + TAG_LEN;
 
 /// Result of recording one authenticated control frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +78,17 @@ impl ControlRecordOutcome {
 pub struct ControlLogState {
     pub sequence: u64,
     pub chain: [u8; 32],
+}
+
+/// Versioned contents of the local anchor file. Version 1 covers only the
+/// control log; version 2 also carries bounded per-group MLS watermarks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AnchorState {
+    V1(ControlLogState),
+    V2 {
+        control: ControlLogState,
+        mls: Vec<MlsWatermark>,
+    },
 }
 
 #[derive(Clone)]
@@ -157,26 +176,209 @@ fn parse_record(bytes: &[u8]) -> Result<ControlRecord, StorageError> {
     })
 }
 
-fn anchor_plaintext(state: &ControlLogState) -> [u8; ANCHOR_PLAINTEXT_BYTES] {
-    let mut bytes = [0u8; ANCHOR_PLAINTEXT_BYTES];
-    bytes[..8].copy_from_slice(ANCHOR_MAGIC);
-    bytes[8] = ANCHOR_VERSION;
+fn anchor_plaintext_v1(state: &ControlLogState) -> [u8; ANCHOR_V1_PLAINTEXT_BYTES] {
+    let mut bytes = [0u8; ANCHOR_V1_PLAINTEXT_BYTES];
+    bytes[..8].copy_from_slice(ANCHOR_MAGIC_V1);
+    bytes[8] = ANCHOR_VERSION_V1;
     bytes[9..17].copy_from_slice(&state.sequence.to_le_bytes());
     bytes[17..].copy_from_slice(&state.chain);
     bytes
 }
 
-fn parse_anchor(bytes: &[u8]) -> Result<ControlLogState, StorageError> {
+fn anchor_plaintext_v2(state: &AnchorState) -> Result<Zeroizing<Vec<u8>>, StorageError> {
+    let AnchorState::V2 { control, mls } = state else {
+        return Err(StorageError::RollbackDetected);
+    };
+    if u64::try_from(mls.len()).unwrap_or(u64::MAX) > MAX_MLS_GROUPS {
+        return Err(StorageError::RollbackDetected);
+    }
+    let mut bytes = Zeroizing::new(Vec::with_capacity(ANCHOR_V2_HEADER_BYTES));
+    bytes.extend_from_slice(ANCHOR_MAGIC_V2);
+    bytes.push(ANCHOR_VERSION_V2);
+    bytes.extend_from_slice(&control.sequence.to_le_bytes());
+    bytes.extend_from_slice(&control.chain);
+    bytes.extend_from_slice(&(mls.len() as u16).to_le_bytes());
+    for entry in mls {
+        bytes.extend_from_slice(&entry.group_bi);
+        bytes.extend_from_slice(&entry.epoch.to_le_bytes());
+        bytes.extend_from_slice(&entry.chain);
+    }
+    Ok(bytes)
+}
+
+fn parse_anchor(bytes: &[u8]) -> Result<AnchorState, StorageError> {
     let invalid = || StorageError::RollbackDetected;
-    if bytes.len() != ANCHOR_PLAINTEXT_BYTES || &bytes[..8] != ANCHOR_MAGIC {
+    let magic = bytes.get(..8).ok_or_else(invalid)?;
+    if magic == ANCHOR_MAGIC_V1 {
+        if bytes.len() != ANCHOR_V1_PLAINTEXT_BYTES || bytes[8] != ANCHOR_VERSION_V1 {
+            return Err(invalid());
+        }
+        let sequence = u64::from_le_bytes(bytes[9..17].try_into().map_err(|_| invalid())?);
+        let chain: [u8; 32] = fixed(&bytes[17..], "control anchor chain")?;
+        return Ok(AnchorState::V1(ControlLogState { sequence, chain }));
+    }
+    if magic != ANCHOR_MAGIC_V2 {
         return Err(invalid());
     }
-    if bytes[8] != ANCHOR_VERSION {
+    if bytes.len() < ANCHOR_V2_HEADER_BYTES || bytes[8] != ANCHOR_VERSION_V2 {
         return Err(invalid());
     }
     let sequence = u64::from_le_bytes(bytes[9..17].try_into().map_err(|_| invalid())?);
-    let chain: [u8; 32] = fixed(&bytes[17..], "control anchor chain")?;
-    Ok(ControlLogState { sequence, chain })
+    let chain: [u8; 32] = fixed(&bytes[17..49], "control anchor chain")?;
+    let count = usize::from(u16::from_le_bytes(
+        bytes[49..51].try_into().map_err(|_| invalid())?,
+    ));
+    if count > MAX_MLS_GROUPS as usize {
+        return Err(invalid());
+    }
+    let expected_len = ANCHOR_V2_HEADER_BYTES + count * MLS_WATERMARK_BYTES;
+    if bytes.len() != expected_len {
+        return Err(invalid());
+    }
+    let mut mls = Vec::with_capacity(count);
+    let mut cursor = ANCHOR_V2_HEADER_BYTES;
+    let mut previous: Option<[u8; 32]> = None;
+    for _ in 0..count {
+        let group_bi: [u8; 32] = fixed(&bytes[cursor..cursor + 32], "MLS anchor group index")?;
+        cursor += 32;
+        if previous.is_some_and(|previous| group_bi <= previous) {
+            return Err(invalid());
+        }
+        previous = Some(group_bi);
+        let epoch = u64::from_le_bytes(
+            bytes[cursor..cursor + 8]
+                .try_into()
+                .map_err(|_| invalid())?,
+        );
+        cursor += 8;
+        if epoch > i64::MAX as u64 {
+            return Err(invalid());
+        }
+        let anchor_chain: [u8; 32] = fixed(&bytes[cursor..cursor + 32], "MLS anchor chain")?;
+        cursor += 32;
+        mls.push(MlsWatermark {
+            group_bi,
+            epoch,
+            chain: anchor_chain,
+        });
+    }
+    Ok(AnchorState::V2 {
+        control: ControlLogState { sequence, chain },
+        mls,
+    })
+}
+
+/// Accept an exact anchor match or a one-record lag left by the database-first
+/// control-log write. Larger gaps fail closed instead of being silently brought
+/// forward.
+fn check_control_anchor(
+    anchor: &ControlLogState,
+    expected: &ControlLogState,
+) -> Result<(), StorageError> {
+    let too_far_behind = match anchor.sequence.checked_add(1) {
+        Some(next) => next < expected.sequence,
+        None => true,
+    };
+    if too_far_behind
+        || anchor.sequence > expected.sequence
+        || (anchor.sequence == expected.sequence && anchor.chain != expected.chain)
+    {
+        return Err(StorageError::RollbackDetected);
+    }
+    Ok(())
+}
+
+fn control_log_state_from(conn: &Connection) -> Result<ControlLogState, StorageError> {
+    let (sequence, chain): (i64, Vec<u8>) = conn.query_row(
+        "SELECT sequence, chain FROM control_state WHERE id = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let sequence = u64::try_from(sequence)
+        .map_err(|_| StorageError::ControlLogIntegrity("negative log sequence".to_owned()))?;
+    if sequence > MAX_CONTROL_LOG_ENTRIES {
+        return Err(StorageError::ControlLogIntegrity(
+            "log sequence exceeds the configured bound".to_owned(),
+        ));
+    }
+    Ok(ControlLogState {
+        sequence,
+        chain: fixed(&chain, "control state chain")?,
+    })
+}
+
+pub(crate) fn anchor_state_from_conn(
+    conn: &Connection,
+    key: &Zeroizing<[u8; 32]>,
+    subkeys: &Subkeys,
+    profile_id: &[u8; 16],
+) -> Result<AnchorState, StorageError> {
+    Ok(AnchorState::V2 {
+        control: control_log_state_from(conn)?,
+        mls: collect_mls_watermarks(conn, key, subkeys, profile_id)?,
+    })
+}
+
+fn anchor_aad_for(profile_id: &[u8; 16], version: u8) -> Vec<u8> {
+    let tag = match version {
+        ANCHOR_VERSION_V1 => ANCHOR_AAD_V1,
+        ANCHOR_VERSION_V2 => ANCHOR_AAD_V2,
+        _ => ANCHOR_AAD_V2,
+    };
+    tagged_aad(tag, profile_id)
+}
+
+fn anchor_path_in(vault_dir: &Path) -> PathBuf {
+    vault_dir.join(ANCHOR_FILE)
+}
+
+fn write_anchor_state_to(
+    vault_dir: &Path,
+    subkeys: &Subkeys,
+    profile_id: &[u8; 16],
+    state: &AnchorState,
+) -> Result<(), StorageError> {
+    let path = anchor_path_in(vault_dir);
+    reject_symlink(&path)?;
+    let (version, plaintext) = match state {
+        AnchorState::V1(control) => (
+            ANCHOR_VERSION_V1,
+            Zeroizing::new(anchor_plaintext_v1(control).to_vec()),
+        ),
+        AnchorState::V2 { .. } => (ANCHOR_VERSION_V2, anchor_plaintext_v2(state)?),
+    };
+    let bytes = encrypt_bytes(
+        &subkeys.derive(Purpose::Db),
+        &plaintext,
+        &anchor_aad_for(profile_id, version),
+    )?;
+    let temporary = vault_dir.join(ANCHOR_TEMP);
+    if temporary.exists() {
+        fs::remove_file(&temporary)?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    restrict_file(&temporary)?;
+    fs::rename(&temporary, &path)?;
+    Ok(())
+}
+
+/// Write a complete anchor from a connection, including one still inside an
+/// open MLS write transaction. Callers pass the derived fields separately so
+/// the transaction can keep its mutable borrow of the session connection.
+pub(crate) fn write_current_anchor_to(
+    vault_dir: &Path,
+    subkeys: &Subkeys,
+    profile_id: &[u8; 16],
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    let key = subkeys.derive(Purpose::Db);
+    let state = anchor_state_from_conn(conn, &key, subkeys, profile_id)?;
+    write_anchor_state_to(vault_dir, subkeys, profile_id, &state)
 }
 
 impl Session {
@@ -184,8 +386,8 @@ impl Session {
         self.vault_dir.join(ANCHOR_FILE)
     }
 
-    fn anchor_aad(&self) -> Vec<u8> {
-        tagged_aad(ANCHOR_AAD, &self.profile_id)
+    fn anchor_aad(&self, version: u8) -> Vec<u8> {
+        anchor_aad_for(&self.profile_id, version)
     }
 
     fn frame_index(&self, peer: &[u8], digest: &[u8; 32], repeatable: bool) -> Vec<u8> {
@@ -199,22 +401,7 @@ impl Session {
 
     /// Read the current authenticated control-log high-water mark.
     pub fn control_log_state(&self) -> Result<ControlLogState, StorageError> {
-        let (sequence, chain): (i64, Vec<u8>) = self.conn.query_row(
-            "SELECT sequence, chain FROM control_state WHERE id = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let sequence = u64::try_from(sequence)
-            .map_err(|_| StorageError::ControlLogIntegrity("negative log sequence".to_owned()))?;
-        if sequence > MAX_CONTROL_LOG_ENTRIES {
-            return Err(StorageError::ControlLogIntegrity(
-                "log sequence exceeds the configured bound".to_owned(),
-            ));
-        }
-        Ok(ControlLogState {
-            sequence,
-            chain: fixed(&chain, "control state chain")?,
-        })
+        control_log_state_from(&self.conn)
     }
 
     /// Verify every encrypted record, its chain link, and the separate anchor.
@@ -268,7 +455,7 @@ impl Session {
                 "control state does not match the record chain".to_owned(),
             ));
         }
-        self.verify_anchor(&state)?;
+        self.verify_anchor_full()?;
         Ok(state)
     }
 
@@ -357,12 +544,16 @@ impl Session {
         )?;
         transaction.commit()?;
 
-        let new_state = ControlLogState { sequence, chain };
-        self.write_anchor(&new_state)?;
+        self.write_current_anchor(&self.conn)?;
         Ok(ControlRecordOutcome::Appended(sequence))
     }
 
-    fn read_anchor(&self) -> Result<Option<ControlLogState>, StorageError> {
+    /// Write a complete anchor snapshot derived from a connection.
+    pub(crate) fn write_current_anchor(&self, conn: &Connection) -> Result<(), StorageError> {
+        write_current_anchor_to(&self.vault_dir, &self.subkeys, &self.profile_id, conn)
+    }
+
+    fn read_anchor(&self) -> Result<Option<AnchorState>, StorageError> {
         let path = self.anchor_path();
         reject_symlink(&path)?;
         let bytes = match fs::read(&path) {
@@ -373,61 +564,70 @@ impl Session {
         if bytes.len() > MAX_ANCHOR_BYTES {
             return Err(StorageError::RollbackDetected);
         }
-        let plaintext = decrypt_bytes(
-            &self.subkeys.derive(Purpose::Db),
-            &bytes,
-            &self.anchor_aad(),
-        )
-        .map_err(|_| StorageError::RollbackDetected)?;
-        Ok(Some(
-            parse_anchor(&plaintext).map_err(|_| StorageError::RollbackDetected)?,
-        ))
-    }
-
-    fn write_anchor(&self, state: &ControlLogState) -> Result<(), StorageError> {
-        let path = self.anchor_path();
-        reject_symlink(&path)?;
-        let bytes = encrypt_bytes(
-            &self.subkeys.derive(Purpose::Db),
-            &anchor_plaintext(state),
-            &self.anchor_aad(),
-        )?;
-        let temporary = self.vault_dir.join(ANCHOR_TEMP);
-        if temporary.exists() {
-            fs::remove_file(&temporary)?;
+        let key = self.subkeys.derive(Purpose::Db);
+        for version in [ANCHOR_VERSION_V2, ANCHOR_VERSION_V1] {
+            if let Ok(plaintext) = decrypt_bytes(&key, &bytes, &self.anchor_aad(version)) {
+                let state = parse_anchor(&plaintext).map_err(|_| StorageError::RollbackDetected)?;
+                return Ok(Some(state));
+            }
         }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        restrict_file(&temporary)?;
-        fs::rename(&temporary, &path)?;
-        Ok(())
+        Err(StorageError::RollbackDetected)
     }
 
-    fn verify_anchor(&self, state: &ControlLogState) -> Result<(), StorageError> {
+    fn write_anchor_state(&self, state: &AnchorState) -> Result<(), StorageError> {
+        write_anchor_state_to(&self.vault_dir, &self.subkeys, &self.profile_id, state)
+    }
+
+    /// Verify the v2 anchor against both the control log and the encrypted MLS
+    /// state. A v1 anchor is migrated after both databases verify. A control
+    /// log anchor that lags by one crash window is brought forward; larger gaps
+    /// fail closed. Any MLS mismatch fails closed instead of being silently
+    /// blessed.
+    pub(crate) fn verify_anchor_full(&self) -> Result<AnchorState, StorageError> {
+        let control = self.control_log_state()?;
+        let key = self.subkeys.derive(Purpose::Db);
+        let mls = collect_mls_watermarks(&self.conn, &key, &self.subkeys, &self.profile_id)?;
         match self.read_anchor()? {
-            None if state.sequence == 0 => self.write_anchor(state),
-            None => Err(StorageError::RollbackDetected),
-            Some(anchor) => {
-                if anchor.sequence > state.sequence
-                    || (anchor.sequence == state.sequence && anchor.chain != state.chain)
-                {
+            None => {
+                if control.sequence == 0 && control.chain == ZERO_CHAIN && mls.is_empty() {
+                    let state = AnchorState::V2 { control, mls };
+                    self.write_anchor_state(&state)?;
+                    Ok(state)
+                } else {
+                    Err(StorageError::RollbackDetected)
+                }
+            }
+            Some(AnchorState::V1(anchor_control)) => {
+                check_control_anchor(&anchor_control, &control)?;
+                let state = AnchorState::V2 { control, mls };
+                self.write_anchor_state(&state)?;
+                Ok(state)
+            }
+            Some(AnchorState::V2 {
+                control: anchor_control,
+                mls: anchor_mls,
+            }) => {
+                check_control_anchor(&anchor_control, &control)?;
+                if anchor_mls != mls {
                     return Err(StorageError::RollbackDetected);
                 }
-                if anchor.sequence < state.sequence {
-                    // A crash after the database commit but before the anchor
-                    // rename leaves the anchor behind; bring it forward.
-                    self.write_anchor(state)?;
+                if anchor_control != control {
+                    // A crash after the control database commit but before the
+                    // anchor rename leaves only the control field behind.
+                    let state = AnchorState::V2 { control, mls };
+                    self.write_anchor_state(&state)?;
+                    Ok(state)
+                } else {
+                    Ok(AnchorState::V2 {
+                        control: anchor_control,
+                        mls: anchor_mls,
+                    })
                 }
-                Ok(())
             }
         }
     }
 
-    /// Create the initial zero-sequence anchor for a new vault.
+    /// Create the initial v2 anchor for a new vault.
     pub(crate) fn initialize_control_log(&self) -> Result<(), StorageError> {
         let state = self.control_log_state()?;
         if state.sequence != 0 || state.chain != ZERO_CHAIN {
@@ -435,6 +635,146 @@ impl Session {
                 "new vault has a non-empty control log".to_owned(),
             ));
         }
-        self.write_anchor(&state)
+        self.write_current_anchor(&self.conn)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Vault;
+    use p2p_identity::Identity;
+
+    const USERNAME: &str = "anchor-user";
+    const PASSWORD: &str = "anchor-password";
+
+    #[test]
+    fn v1_anchor_is_migrated_and_control_log_stays_verified() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let identity = Identity::generate().expect("identity");
+        let vault = Vault::open(directory.path()).expect("open vault");
+
+        let mut session = vault.create(USERNAME, PASSWORD, &identity).expect("create");
+        session
+            .record_control_frame(b"12D3KooWANCHORV1", &[6u8; 32], false)
+            .expect("record frame");
+        let state = session.control_log_state().expect("control state");
+        session
+            .write_anchor_state(&AnchorState::V1(state))
+            .expect("write v1 anchor");
+        drop(session);
+
+        let reopened = vault.unlock(PASSWORD).expect("unlock migrates v1 anchor");
+        assert_eq!(
+            reopened.control_log_state().expect("state").sequence,
+            1,
+            "control log survives migration"
+        );
+        reopened.verify_control_log().expect("verify control log");
+        reopened.verify_mls_state().expect("verify MLS state");
+        assert!(
+            matches!(
+                reopened.read_anchor().expect("read migrated anchor"),
+                Some(AnchorState::V2 { .. })
+            ),
+            "anchor is now version 2"
+        );
+    }
+
+    #[test]
+    fn valid_v2_anchor_with_wrong_mls_epoch_is_rejected() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let identity = Identity::generate().expect("identity");
+        let vault = Vault::open(directory.path()).expect("open vault");
+
+        let mut session = vault.create(USERNAME, PASSWORD, &identity).expect("create");
+        session
+            .store_mls_state(&[31u8; 16], "tree", b"node", 4, b"ANCHOR_WATERMARK_31")
+            .expect("store MLS state");
+        let mut anchor = session
+            .read_anchor()
+            .expect("read anchor")
+            .expect("anchor exists");
+        let AnchorState::V2 { mls, .. } = &mut anchor else {
+            panic!("new vault must use a v2 anchor");
+        };
+        assert_eq!(mls.len(), 1);
+        mls[0].epoch = 5;
+        session
+            .write_anchor_state(&anchor)
+            .expect("write authenticated but mismatched anchor");
+        drop(session);
+
+        assert!(matches!(
+            vault.unlock(PASSWORD),
+            Err(StorageError::RollbackDetected)
+        ));
+    }
+
+    #[test]
+    fn control_anchor_lagging_by_one_crash_window_is_brought_forward() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let identity = Identity::generate().expect("identity");
+        let vault = Vault::open(directory.path()).expect("open vault");
+
+        let mut session = vault.create(USERNAME, PASSWORD, &identity).expect("create");
+        session
+            .record_control_frame(b"12D3KooWANCHORLAG", &[7u8; 32], false)
+            .expect("first frame");
+        let stale = session
+            .read_anchor()
+            .expect("read stale anchor")
+            .expect("anchor exists");
+        session
+            .record_control_frame(b"12D3KooWANCHORLAG", &[8u8; 32], false)
+            .expect("second frame");
+        session
+            .write_anchor_state(&stale)
+            .expect("write one-record stale anchor");
+        drop(session);
+
+        let reopened = vault.unlock(PASSWORD).expect("one-window lag catch-up");
+        assert_eq!(
+            reopened
+                .control_log_state()
+                .expect("control state")
+                .sequence,
+            2
+        );
+        assert!(matches!(
+            reopened.read_anchor().expect("catch-up anchor"),
+            Some(AnchorState::V2 { control, .. }) if control.sequence == 2
+        ));
+    }
+
+    #[test]
+    fn control_anchor_lagging_by_more_than_one_window_is_rejected() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let identity = Identity::generate().expect("identity");
+        let vault = Vault::open(directory.path()).expect("open vault");
+
+        let mut session = vault.create(USERNAME, PASSWORD, &identity).expect("create");
+        session
+            .record_control_frame(b"12D3KooWANCHORLAG", &[9u8; 32], false)
+            .expect("first frame");
+        let stale = session
+            .read_anchor()
+            .expect("read stale anchor")
+            .expect("anchor exists");
+        session
+            .record_control_frame(b"12D3KooWANCHORLAG", &[10u8; 32], false)
+            .expect("second frame");
+        session
+            .record_control_frame(b"12D3KooWANCHORLAG", &[11u8; 32], false)
+            .expect("third frame");
+        session
+            .write_anchor_state(&stale)
+            .expect("write multi-record stale anchor");
+        drop(session);
+
+        assert!(matches!(
+            vault.unlock(PASSWORD),
+            Err(StorageError::RollbackDetected)
+        ));
     }
 }
