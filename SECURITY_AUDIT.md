@@ -47,7 +47,7 @@ Remediation status is recorded separately so that a planned fix is never mistake
 - **Severity:** Medium.
 - **Correction:** Signed transaction ID on every setup frame, state and ack binding by `(conversation_id, transaction_id, peer)`, a bounded in-memory exact-frame cache, and a durable chained digest log with a vault anchor.
 - **Verification test:** Duplicate request with a different transaction cannot overwrite; stale ack rejected; tampered transaction ID fails signature; cross-transaction substitution rejected; exact terminal-frame replay after restart ignored; idempotent request retry after restart preserved; durable chain, blind indexes, and anchor verified on unlock.
-- **Status:** Implemented and verified in the final 207-test workspace run. `MLS1` v2 adds signed 16-byte transaction IDs; pending state, acks, retries, and Welcomes are bound to `(conversation_id, transaction_id, peer)`, and v1 is rejected. A bounded 512-entry in-memory cache stores only `(PeerId, SHA-256 digest)` pairs. Schema v4 adds `control_log` (`sequence`, `record_bi`, `ciphertext`, `chain_hash`) and `control_state` (`id`, `sequence`, `chain`) with transactional migrations. `crates/storage/src/control_log.rs` records already authenticated signed frames as bounded XChaCha20-Poly1305 records (`Purpose::Db`) containing public PeerId bytes (at most 64), a SHA-256 frame digest, and a repeatable flag, with HMAC blind indexes (`Purpose::BlindIndex`) and a chained SHA-256 hash; the log is capped at 4096 entries and fails closed when full or malformed. `KeyPackageRequest` and `GroupJoinRequest` are repeatable; KeyPackage responses, Welcomes, `GroupWelcome`, `GroupCommit`, and all acks are non-repeatable. `MessengerController::start_with_control_log` accepts a cloned vault `Session` (the GUI passes `session.try_clone()`), and a vault/controller identity mismatch fails startup. `<vault>/control.anchor` holds AEAD-protected high-water-mark state (`sequence`, `chain`) with `<vault>/control.anchor.tmp` for atomic replace; `Vault::unlock` calls `verify_control_log`, which verifies every record, chain continuity, blind indexes, and the anchor. Storage has 15 tests including durable idempotence/replay, DB-only rollback detection, and anchor tamper; chat has two controller restart regressions. This is not OpenMLS persistence: digests are not a backup and do not restore group state, ratchets, channels, or decrypted messages.
+- **Status:** Implemented in the 207-test workspace run and re-verified in the final 257-test workspace run. `MLS1` v2 adds signed 16-byte transaction IDs; pending state, acks, retries, and Welcomes are bound to `(conversation_id, transaction_id, peer)`, and v1 is rejected. A bounded 512-entry in-memory cache stores only `(PeerId, SHA-256 digest)` pairs. Schema v4 adds `control_log` (`sequence`, `record_bi`, `ciphertext`, `chain_hash`) and `control_state` (`id`, `sequence`, `chain`) with transactional migrations. `crates/storage/src/control_log.rs` records already authenticated signed frames as bounded XChaCha20-Poly1305 records (`Purpose::Db`) containing public PeerId bytes (at most 64), a SHA-256 frame digest, and a repeatable flag, with HMAC blind indexes (`Purpose::BlindIndex`) and a chained SHA-256 hash; the log is capped at 4096 entries and fails closed when full or malformed. `KeyPackageRequest` and `GroupJoinRequest` are repeatable; KeyPackage responses, Welcomes, `GroupWelcome`, `GroupCommit`, and all acks are non-repeatable. `MessengerController::start_with_control_log` accepts a cloned vault `Session` (the GUI passes `session.try_clone()`), and a vault/controller identity mismatch fails startup. `<vault>/control.anchor` holds AEAD-protected high-water-mark state (`sequence`, `chain`) with `<vault>/control.anchor.tmp` for atomic replace; `Vault::unlock` calls `verify_control_log`, which verifies every record, chain continuity, blind indexes, and the anchor. Storage has 15 tests including durable idempotence/replay, DB-only rollback detection, and anchor tamper; chat has two controller restart regressions. Phase 4 hardening also stores encrypted per-request outcomes so byte-identical group-commit and group-Welcome retries after restart receive the original ack without a second MLS transition; this is not a general replay cache for arbitrary frames. This is not OpenMLS persistence: digests are not a backup and do not restore group state, ratchets, channels, or decrypted messages.
 
 ### SA-004 — Replay state is memory-only; legacy load loses delivery fidelity
 
@@ -61,17 +61,17 @@ Remediation status is recorded separately so that a planned fix is never mistake
 - **Verification test:** Reload and reinject an old envelope; assert replay rejection and accurate delivery state.
 - **Status:** Open; documented as a library limitation.
 
-### SA-005 — MLS group state is memory-only
+### SA-005 — MLS group state was memory-only
 
-- **Classification:** Confirmed (state model); Partially confirmed (security impact).
-- **Files:** `crates/groups/src/lib.rs:1-6`, `crates/groups/src/lib.rs:170-176`, `crates/chat/src/lib.rs:9-11`, `crates/messaging/src/conversation.rs:284-287`.
-- **Weakness:** OpenMLS state, key packages, pending commits, ratchet state, and replay state are not persisted.
-- **Attack scenario:** Not an active attack; restart causes loss of decryption continuity and forces fresh setup.
+- **Classification:** Confirmed (original state model; now partially remediated); Partially confirmed (security impact).
+- **Files:** `crates/groups/src/lib.rs`, `crates/chat/src/controller.rs`, `crates/chat/src/lib.rs`, `crates/messaging/src/conversation.rs`, `crates/storage/src/mls_provider.rs`, `docs/DECISIONS/ADR-0014-encrypted-mls-state-persistence.md`.
+- **Weakness:** OpenMLS state, key packages, pending commits, ratchet state, and replay state were originally memory-only.
+- **Attack scenario:** Not an active attack; restart originally caused loss of decryption continuity and forced fresh setup.
 - **Impact:** Availability/continuity loss, not plaintext leakage.
 - **Severity:** Low–Medium.
 - **Correction:** Use a supported OpenMLS storage provider with purpose-specific encrypted keys, transactional state, schema versioning, and epoch/replay binding.
 - **Verification test:** Restart after add/remove/message and assert no inconsistent group/epoch/ratchet combination is restored.
-- **Status:** Open; explicitly documented. The new control-log digest log does **not** restore OpenMLS ratchet/group state, pending key packages, channels, or decrypted messages.
+- **Status:** Partially remediated by ADR-0014 Phase 4 and its hardening pass. With an attached vault session, joined group/ratchet state, channel policy, bounded pending operations, receipt expectations, and queued ciphertext restore from authenticated encrypted records and fail startup closed on inconsistent state. Rejection of wrong-vault/controller and KeyPackage identities, per-class provider tamper/bounds/cross-profile coverage, interrupted anchor-first recovery, controlled-restart group flows, removed-peer receipt/queue pruning, and encrypted durable outcomes for byte-identical group-commit/Welcome retries are verified. Pending setup KeyPackage/Welcome material, decrypted messages, general replay-proof control frames, full-vault-plus-anchor rollback detection, and crash recovery for an anchor-first write remain open. The control-log digest log alone does **not** restore OpenMLS state.
 
 ### SA-006 — Partial authenticated rollback protection for the encrypted vault
 
@@ -83,7 +83,7 @@ Remediation status is recorded separately so that a planned fix is never mistake
 - **Severity:** Low–Medium.
 - **Correction:** Keep the authenticated monotonic chain and add an integrity anchor outside replaceable files where feasible; reject stale state.
 - **Verification test:** Restore an older database while keeping the current anchor and assert unlock fails; flip the anchor and assert unlock fails. A full-vault-plus-anchor restore has no local negative test and is recorded as a residual limitation (SA-020).
-- **Status:** Partially addressed. The schema v4 chain plus `<vault>/control.anchor` detects database-only rollback and anchor tamper in the final 207-test workspace run. Full-vault-including-anchor rollback remains open; no external anchor is claimed.
+- **Status:** Partially addressed. The schema v4 chain plus `<vault>/control.anchor`, extended to authoritative MLS watermarks, detects database-only rollback and anchor tamper in the 207-test workspace run and is re-verified with bytewise/provider-class tamper coverage in the final 257-test workspace run. Full-vault-including-anchor rollback remains open; no external anchor is claimed.
 
 ### SA-007 — Filesystem path hardening is Unix-only and final-path-only
 
@@ -95,7 +95,7 @@ Remediation status is recorded separately so that a planned fix is never mistake
 - **Severity:** Low–Medium.
 - **Correction:** Verify every path component under a trusted root; use `O_NOFOLLOW`/openat-style admission; add Windows reparse-point checks.
 - **Verification test:** Pre-place symlink/junction at base and intermediate path; assert fail-closed.
-- **Status:** Partially addressed for file quarantine: generic ancestor-component and parent-traversal rejection is implemented in `crates/files/src/transfer.rs` with two new Unix tests; targeted and final 207-test workspace runs pass. Vault parent-path hardening and Windows reparse points remain open.
+- **Status:** Partially addressed for file quarantine: generic ancestor-component and parent-traversal rejection is implemented in `crates/files/src/transfer.rs` with two new Unix tests; targeted runs, the 2026-11-25 207-test workspace run, and the final 257-test workspace run pass. Vault parent-path hardening and Windows reparse points remain open.
 
 ### SA-008 — File transfer cancellation is release-only; no transfer expiration
 
@@ -118,7 +118,7 @@ Remediation status is recorded separately so that a planned fix is never mistake
 - **Impact:** No cryptographic breach; a false rationale could drive unsafe future design decisions.
 - **Correction:** State that relays see ciphertext, PeerIds, IPs, timing, and sizes only. Keep the conservative file-over-relay policy but describe it accurately.
 - **Verification test:** Three-node loopback relay harness with sentinel bytes; assert relay does not observe decoded Offer/key and Noise tampering fails.
-- **Status:** Rationale corrected in code and docs; targeted and final 207-test workspace runs pass. The external three-node relay capture harness remains pending.
+- **Status:** Rationale corrected in code and docs; targeted runs, the 2026-11-25 207-test workspace run, and the final 257-test workspace run pass. The external three-node relay capture harness remains pending.
 
 ### SA-010 — File-over-relay policy enforced only on outbound sends
 
@@ -231,7 +231,7 @@ Remediation status is recorded separately so that a planned fix is never mistake
 - **Severity:** Low.
 - **Correction:** Retain the aggregate per-peer request/byte ceiling and add derived per-protocol request/byte buckets for message, setup, file, and control. Denied requests are not charged to either bucket, so a per-protocol rejection cannot consume another protocol's aggregate capacity. When a custom aggregate byte ceiling is below four full frames, the byte reservation falls back to that ceiling; the aggregate limit remains authoritative.
 - **Verification test:** `rate_limiter_reserves_protocol_shares_inside_the_aggregate_ceiling`, `rate_limiter_denied_request_does_not_charge_the_aggregate_budget`, and `saturated_control_traffic_does_not_block_messages` pass, along with the existing one-request aggregate ceiling test.
-- **Status:** Implemented and verified in the final 207-test workspace run. Per-protocol reservations are bounded by the aggregate configuration; this is DoS isolation for one authenticated peer, not a distributed-flood capacity guarantee.
+- **Status:** Implemented and verified in the 2026-11-25 207-test workspace run and re-verified in the final 257-test workspace run. Per-protocol reservations are bounded by the aggregate configuration; this is DoS isolation for one authenticated peer, not a distributed-flood capacity guarantee.
 
 ### SA-020 — Full-vault rollback including the control anchor remains locally undetectable
 
@@ -273,13 +273,13 @@ Remediation status is recorded separately so that a planned fix is never mistake
 
 ## 3. Remediation priority
 
-1. Done: setup transaction binding, a bounded memory-only `(PeerId, SHA-256 digest)` replay cache, and schema v4 durable chained, blind-indexed digest continuity with an AEAD vault anchor (SA-003). Rollback detection remains partial (SA-006), full-vault-including-anchor rollback is an accepted residual limitation (SA-020), and MLS persistence remains open (SA-005).
+1. Done: setup transaction binding, a bounded memory-only `(PeerId, SHA-256 digest)` replay cache, and schema v4 durable chained, blind-indexed digest continuity with an AEAD vault anchor (SA-003). Rollback detection remains partial (SA-006), full-vault-including-anchor rollback is an accepted residual limitation (SA-020), and encrypted MLS persistence is partially implemented with hardening bounds (SA-005).
 2. Done: symmetric relay policy, accurate relay rationale, direct dial validation, rate-limiter cleanup, honest status fields, explicit global and per-IP pre-authentication socket caps, per-protocol request isolation, repository-wide diagnostic redaction review, and automated CI diagnostic guard (SA-009–SA-014, SA-018, SA-019, PC-004).
 3. Partial: supply-chain workflow/config, SHA-pinned external actions, deterministic smoke test, six libFuzzer targets, a CI fuzz-smoke job, deterministic locked SBOM generation/release inclusion, locally passing audit/deny gates, and green 2026-11-25 CI added (SA-015); unmaintained-crate warnings, OpenMLS RC dependence, a coverage-guided campaign, signed artifacts, and provenance remain.
 4. Done: transfer inactivity deadlines, separate abort from release cancellation, and partial-quarantine cleanup (SA-008).
 5. Design separate MLS groups per channel (SA-001).
 6. Design role-separated identity certificates (SA-002).
-7. Open: implement encrypted MLS persistence with a rollback-aware schema (SA-005). The control digest log is not MLS state or a backup; SA-006 is only partially addressed and SA-020 remains an accepted residual limitation.
+7. Partially implemented: encrypted MLS persistence with a rollback-aware schema and bounded restore/hardening tests (SA-005). Pending setup KeyPackage/Welcome material, decrypted messages, general replay-proof control frames, and anchor-first crash recovery remain open. The control digest log is not MLS state or a backup; SA-006 is only partially addressed and SA-020 remains an accepted residual limitation.
 8. Treat Tor/anonymity as a separate architecture milestone with external testing (SA-017).
 
 No finding is marked complete in this register until its verification test is present and passing in the recorded full test run.

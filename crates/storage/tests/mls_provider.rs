@@ -4,6 +4,8 @@
 //! `MlsGroup::new_with_group_id` / `MlsGroup::load` round trip.
 
 use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use openmls::prelude::*;
 use openmls::treesync::TreeSync;
@@ -55,6 +57,8 @@ impl TestProvider {
         }
     }
 }
+
+type RequiredEntryDeletion<'a> = (&'a str, Box<dyn Fn(&TestProvider) + 'a>);
 
 impl OpenMlsProvider for TestProvider {
     type CryptoProvider = RustCrypto;
@@ -319,4 +323,249 @@ fn mls_group_loads_from_the_vault_after_reopen() {
     let loaded = MlsGroup::load(restored.storage(), &id).expect("load group");
     let loaded = loaded.expect("group was persisted");
     assert_eq!(loaded.group_id(), &id);
+}
+
+#[test]
+fn global_provider_entries_are_not_reported_as_groups() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let vault = Vault::open(directory.path()).expect("open vault");
+    let identity = Identity::generate().expect("identity");
+    let session = vault
+        .create(USERNAME, PASSWORD, &identity)
+        .expect("create vault");
+    let provider = TestProvider::new(session.try_clone().expect("clone vault session"));
+    let credential = CredentialWithKey {
+        credential: BasicCredential::new(identity.peer_id().to_bytes()).into(),
+        signature_key: identity
+            .ed25519_public_bytes()
+            .expect("ed25519 public key")
+            .to_vec()
+            .into(),
+    };
+    let _key_package = KeyPackage::builder()
+        .build(
+            CIPHERSUITE,
+            &provider,
+            &TestSigner(identity.clone()),
+            credential,
+        )
+        .expect("generate key package");
+    provider.storage().flush().expect("persist global entries");
+    assert!(
+        session.mls_group_ids().expect("group ids").is_empty(),
+        "the reserved global provider bucket must not look like a conversation"
+    );
+}
+
+#[test]
+fn consumed_key_package_deletion_is_committed_with_the_joined_group() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let vault = Vault::open(directory.path()).expect("open vault");
+    let identity = Identity::generate().expect("identity");
+    let joiner = Identity::generate().expect("joiner");
+    let group_bytes = [62u8; 16];
+    let group = group_id(62);
+    let session = vault
+        .create(USERNAME, PASSWORD, &identity)
+        .expect("create vault");
+    let provider = TestProvider::new(session);
+
+    let credential = CredentialWithKey {
+        credential: BasicCredential::new(joiner.peer_id().to_bytes()).into(),
+        signature_key: joiner
+            .ed25519_public_bytes()
+            .expect("ed25519 public key")
+            .to_vec()
+            .into(),
+    };
+    let key_package = KeyPackage::builder()
+        .build(
+            CIPHERSUITE,
+            &provider,
+            &TestSigner(joiner.clone()),
+            credential,
+        )
+        .expect("generate key package");
+    let hash_ref = key_package
+        .key_package()
+        .hash_ref(provider.crypto())
+        .expect("key package hash reference");
+    let before: Option<KeyPackageBundle> = provider
+        .storage()
+        .key_package(&hash_ref)
+        .expect("read staged key package");
+    assert!(before.is_some(), "generated KeyPackage must be persisted");
+    provider
+        .storage()
+        .flush()
+        .expect("persist KeyPackage before consumption");
+
+    // One OpenMLS operation creates the group and consumes the KeyPackage. Both
+    // the surviving group writes and the deletion must land in one flush.
+    let _created = create_group(&provider, &identity, group.clone());
+    provider
+        .storage()
+        .delete_key_package(&hash_ref)
+        .expect("stage consumed KeyPackage deletion");
+    provider
+        .storage()
+        .flush()
+        .expect("flush group and deletion");
+
+    drop(provider);
+    let reopened = vault.unlock(PASSWORD).expect("unlock after restart");
+    reopened.verify_mls_state().expect("anchor verifies");
+    assert_eq!(
+        reopened.mls_group_ids().expect("group ids"),
+        vec![group_bytes]
+    );
+    let restored = TestProvider::new(reopened);
+    let loaded = MlsGroup::load(restored.storage(), &group)
+        .expect("load committed group")
+        .expect("group was persisted");
+    assert_eq!(loaded.group_id(), &group);
+    let after: Option<KeyPackageBundle> = restored
+        .storage()
+        .key_package(&hash_ref)
+        .expect("read consumed KeyPackage");
+    assert!(after.is_none(), "consumed KeyPackage must be deleted");
+}
+
+fn vault_snapshot(directory: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fs::read_dir(directory)
+        .expect("read vault directory")
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() {
+                return None;
+            }
+            Some((path.clone(), fs::read(&path).expect("read vault file")))
+        })
+        .collect()
+}
+
+fn restore_vault_snapshot(snapshot: &[(PathBuf, Vec<u8>)]) {
+    for (path, bytes) in snapshot {
+        fs::write(path, bytes).expect("restore vault file");
+    }
+}
+
+#[test]
+fn missing_required_provider_entries_fail_group_load() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let vault = Vault::open(directory.path()).expect("open vault");
+    let identity = Identity::generate().expect("identity");
+    let id = group_id(81);
+
+    {
+        let session = vault
+            .create(USERNAME, PASSWORD, &identity)
+            .expect("create vault");
+        let provider = TestProvider::new(session);
+        let _group = create_group(&provider, &identity, id.clone());
+        provider.storage().flush().expect("persist group");
+    }
+    let snapshot = vault_snapshot(directory.path());
+
+    let deletions: Vec<RequiredEntryDeletion<'_>> = vec![
+        (
+            "MlsGroupJoinConfig",
+            Box::new(|provider| {
+                provider
+                    .storage()
+                    .delete_group_config(&id)
+                    .expect("delete config")
+            }),
+        ),
+        (
+            "GroupState",
+            Box::new(|provider| {
+                provider
+                    .storage()
+                    .delete_group_state(&id)
+                    .expect("delete state")
+            }),
+        ),
+        (
+            "OwnLeafNodeIndex",
+            Box::new(|provider| {
+                provider
+                    .storage()
+                    .delete_own_leaf_index(&id)
+                    .expect("delete leaf index")
+            }),
+        ),
+        (
+            "EpochSecrets",
+            Box::new(|provider| {
+                provider
+                    .storage()
+                    .delete_group_epoch_secrets(&id)
+                    .expect("delete epoch secrets")
+            }),
+        ),
+        (
+            "ResumptionPsk",
+            Box::new(|provider| {
+                provider
+                    .storage()
+                    .delete_all_resumption_psk_secrets(&id)
+                    .expect("delete resumption secrets")
+            }),
+        ),
+        (
+            "MessageSecrets",
+            Box::new(|provider| {
+                provider
+                    .storage()
+                    .delete_message_secrets(&id)
+                    .expect("delete message secrets")
+            }),
+        ),
+        (
+            "Tree",
+            Box::new(|provider| provider.storage().delete_tree(&id).expect("delete tree")),
+        ),
+        (
+            "GroupContext",
+            Box::new(|provider| {
+                provider
+                    .storage()
+                    .delete_context(&id)
+                    .expect("delete context")
+            }),
+        ),
+        (
+            "InterimTranscriptHash",
+            Box::new(|provider| {
+                provider
+                    .storage()
+                    .delete_interim_transcript_hash(&id)
+                    .expect("delete transcript hash")
+            }),
+        ),
+        (
+            "ConfirmationTag",
+            Box::new(|provider| {
+                provider
+                    .storage()
+                    .delete_confirmation_tag(&id)
+                    .expect("delete confirmation tag")
+            }),
+        ),
+    ];
+
+    for (label, delete) in deletions {
+        restore_vault_snapshot(&snapshot);
+        let session = vault.unlock(PASSWORD).expect("unlock after restore");
+        let provider = TestProvider::new(session);
+        delete(&provider);
+        provider.storage().flush().expect("flush deletion");
+        let loaded = MlsGroup::load(provider.storage(), &id);
+        assert!(
+            matches!(loaded, Ok(None) | Err(_)),
+            "missing {label} must not produce a usable group"
+        );
+    }
 }

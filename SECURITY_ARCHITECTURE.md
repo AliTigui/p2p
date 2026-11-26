@@ -57,7 +57,7 @@ Trust boundaries:
 - On receive, the controller checks envelope signature, PeerId/public-key binding, conversation ID, epoch, replay state, MLS group ID, MLS credential, leaf signature key, and sender before accepting plaintext.
 - Replay protection uses a bounded message-ID cache plus a per-sender sequence high-water mark. Sequence gaps are not treated as proof of suppression; failed or abandoned outgoing sends intentionally create gaps.
 - Signed setup and group-control frames use v2 transaction IDs, strict `(conversation_id, transaction_id, peer)` binding, and a bounded 512-entry in-memory cache keyed by peer and SHA-256 digest. Schema v4 adds a durable chained log of digests for already authenticated frames: encrypted XChaCha20-Poly1305 records contain public PeerId bytes (at most 64), a SHA-256 frame digest, and a repeatable flag, with HMAC blind indexes and a chained SHA-256 hash; the log holds at most 4096 entries and fails closed when full or malformed. `KeyPackageRequest` and `GroupJoinRequest` are repeatable; responses, Welcomes, `GroupWelcome`, `GroupCommit`, and all acks are non-repeatable. `Vault::unlock` verifies every record, chain link, blind index, and the AEAD-protected `<vault>/control.anchor` high-water mark; `MessengerController::start_with_control_log` takes a cloned vault `Session` (the GUI passes `session.try_clone()`) and rejects a vault/controller identity mismatch. This is partial continuity across restart, not a replay-proof log or an external anchor.
-- MLS group state, pending key packages, ratchets, channels, and decrypted messages remain memory-only. The digest log is not a backup and provides no encrypted MLS persistence or restore path.
+- With an attached vault session, ADR-0014 Phase 4 restores joined MLS group/ratchet state, channel policy, bounded pending operations, receipt expectations, and queued ciphertext from authenticated encrypted records. Setup KeyPackages/Welcomes and decrypted messages remain memory-only. The digest log itself is not a backup and does not restore MLS state.
 
 ### 3.3 Groups and channels
 
@@ -109,7 +109,7 @@ There is no Tor, SOCKS5, onion-service, I2P, or mixnet integration. There is no 
 6. Receiver verifies envelope and MLS state before accepting plaintext.
 7. `Delivered`/`Read` state changes only on verified MLS receipts from every expected member.
 
-The offline queue is in-memory and is lost on restart or vault lock. It stores ciphertext, never plaintext.
+The offline queue stores ciphertext, never plaintext. It is encrypted in the vault and restored after restart when a session is attached; without a session it is in-memory and is lost on restart or lock.
 
 ## 6. Metadata inventory
 

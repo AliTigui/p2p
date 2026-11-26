@@ -28,6 +28,26 @@ fn pair() -> (Identity, Identity, MlsConversation, MlsConversation) {
 }
 
 #[test]
+fn join_rejects_an_identity_that_does_not_own_the_key_package() {
+    let alice_identity = Identity::generate().expect("alice identity");
+    let bob_identity = Identity::generate().expect("bob identity");
+    let mallory_identity = Identity::generate().expect("mallory identity");
+    let mut alice = MlsConversation::new(&alice_identity).expect("alice MLS conversation");
+    let key_package = MlsConversation::key_package(&bob_identity).expect("bob key package");
+    let welcome = alice
+        .add_member(
+            key_package.bytes(),
+            bob_identity.peer_id(),
+            &bob_identity.public_key_bytes(),
+        )
+        .expect("add bob");
+
+    let error = MlsConversation::join(&mallory_identity, alice.id(), key_package, &welcome)
+        .expect_err("mallory must not join with bob's key package");
+    assert!(matches!(error, GroupError::WrongLocalIdentity));
+}
+
+#[test]
 fn two_member_group_encrypts_application_text() {
     let (alice_identity, _bob_identity, mut alice, mut bob) = pair();
     let plaintext = b"message plaintext must never appear on the wire";

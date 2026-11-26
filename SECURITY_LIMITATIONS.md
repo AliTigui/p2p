@@ -15,7 +15,7 @@ This document is intentionally conservative. It lists what the implementation do
 - There is no independent MLS group per channel, no per-channel ratchet, no per-channel epoch, and no separate channel membership commit.
 - The creator is the only administrator. Delegated administrators, role rotation, revocation, conflicting concurrent admin operations, and cryptographic role enforcement are not implemented.
 - Setup and group-control frames have signed v2 transaction IDs, strict `(conversation_id, transaction_id, peer)` binding, and a bounded 512-entry in-memory cache of `(PeerId, SHA-256 digest)` pairs. Schema v4 adds a durable chained, blind-indexed digest log with a vault anchor: `Vault::unlock` verifies every authenticated record, chain link, blind index, and `<vault>/control.anchor`. `KeyPackageRequest` and `GroupJoinRequest` repeats stay idempotent; responses, Welcomes, `GroupWelcome`, `GroupCommit`, and all acks are non-repeatable. The log is capped at 4096 entries and fails closed when full or malformed. This is partial detection, not a replay-proof log: a full vault restored together with its anchor is not locally detectable, and state guards still carry the primary defense.
-- MLS group state, pending commits, key packages, ratchets, channels, and decrypted messages remain memory-only. Restart loses them. The digest log is not a backup and does not restore OpenMLS state.
+- Without an attached vault session, MLS group state, pending commits, key packages, ratchets, channels, and decrypted messages remain memory-only and restart loses them. With a session, ADR-0014 Phase 4 restores joined groups, channel policy, bounded pending operations, receipt expectations, and queued ciphertext from authenticated encrypted records; setup KeyPackages/Welcomes and decrypted messages still do not survive restart. The digest log is not a backup and does not restore OpenMLS state.
 
 ## 3. Storage and recovery limitations
 
@@ -41,7 +41,7 @@ This document is intentionally conservative. It lists what the implementation do
 
 ## 5. Message delivery limitations
 
-- The offline queue is in-memory and lost on restart or vault lock.
+- The offline queue is encrypted in the vault when a session is attached and can be restored after restart; without a session it is in-memory and lost on restart or lock. Restored entries remain unconfirmed until a verified receipt arrives.
 - Transport `SentToPeer` is not delivery. Only verified MLS receipts from every expected member advance delivery state.
 - Sequence gaps are not proof of malicious suppression: failed or abandoned outgoing messages intentionally create gaps.
 - There is no decentralized mailbox or peer-operated store-and-forward protocol.

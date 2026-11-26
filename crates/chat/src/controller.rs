@@ -21,7 +21,7 @@ use p2p_network::{
     Network, NetworkConfig, NetworkPrivacyStatus, SetupEvent, SetupResponseId,
 };
 use p2p_security::{ScanRequest, ScanStatus, SecurityConfig};
-use p2p_storage::{ControlRecordOutcome, Session};
+use p2p_storage::{ControlRecordOutcome, GLOBAL_PROVIDER_GROUP, Session};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -150,9 +150,31 @@ impl fmt::Debug for ChannelInfo {
 
 /// Encrypted application-policy snapshot for one joined conversation. This is
 /// `CHN1` application state, not an OpenMLS provider entry; it is stored under
-/// the group blind index with a distinct authenticated label.
+/// the group blind index with a distinct authenticated label. The label remains
+/// `/v1` so existing records stay readable; the authenticated record version is
+/// `/v2` and adds pending receipts, queued ciphertext, and sequence state.
 const PERSISTED_CONVERSATION_LABEL: &str = "p2p.app.conversation/v1";
-const PERSISTED_CONVERSATION_VERSION: u8 = 1;
+const PERSISTED_CONVERSATION_V1: u8 = 1;
+const PERSISTED_CONVERSATION_VERSION: u8 = 2;
+/// Durable replay outcomes for non-repeatable group requests. These live in
+/// the reserved global provider bucket so they survive restart without being
+/// mistaken for a conversation by `mls_group_ids()`.
+const PERSISTED_GROUP_ACK_LABEL: &str = "p2p.app.group-ack/v1";
+const GROUP_ACK_VERSION: u8 = 1;
+const GROUP_ACK_COMMIT_CODE: u8 = 1;
+const GROUP_ACK_WELCOME_CODE: u8 = 2;
+
+const MAX_PENDING_RECEIPTS: usize = 64;
+const MAX_OFFLINE_QUEUE: usize = 16;
+const MAX_QUEUED_ENVELOPE_BYTES: usize = 8 * 1024;
+const MAX_PENDING_OPERATION_BYTES: usize = 16 * 1024;
+
+const OUTGOING_QUEUED_CODE: u8 = 2;
+const OUTGOING_SENT_CODE: u8 = 3;
+
+fn default_next_sequence() -> u64 {
+    1
+}
 
 #[derive(Serialize, Deserialize)]
 struct PersistedChannel {
@@ -161,6 +183,68 @@ struct PersistedChannel {
     creator: Vec<u8>,
     members: Vec<Vec<u8>>,
     revision: u32,
+    #[serde(default)]
+    last_frame_id: Option<[u8; 16]>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedReceiptExpectation {
+    message_id: [u8; 16],
+    peers: Vec<Vec<u8>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedOutgoing {
+    message_id: [u8; 16],
+    state_code: u8,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedQueuedMessage {
+    peer: Vec<u8>,
+    conversation_id: [u8; 16],
+    message_id: [u8; 16],
+    envelope_bytes: Vec<u8>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedPendingDetail {
+    transaction_id: [u8; 16],
+    operation: u8,
+    target: Option<Vec<u8>>,
+    commit: Vec<u8>,
+    awaited: Vec<(Vec<u8>, bool)>,
+    welcome_target: Option<Vec<u8>>,
+    welcome: Option<Vec<u8>>,
+    welcome_acked: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum PersistedPendingOperation {
+    Flag(bool),
+    Detail(PersistedPendingDetail),
+}
+
+impl PersistedPendingOperation {
+    fn is_pending(&self) -> bool {
+        match self {
+            Self::Flag(pending) => *pending,
+            Self::Detail(_) => true,
+        }
+    }
+}
+
+/// Encrypted outcome of one already-applied group request. A replayed commit or
+/// Welcome is answered from this record without touching MLS state again.
+#[derive(Serialize, Deserialize)]
+struct PersistedGroupAck {
+    version: u8,
+    response: u8,
+    conversation_id: [u8; 16],
+    transaction_id: [u8; 16],
+    operation: u8,
+    accepted: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -174,9 +258,19 @@ struct PersistedConversation {
     status_reason: Option<String>,
     channels: Vec<PersistedChannel>,
     active_channel: Option<[u8; 16]>,
-    /// Pending operations are not restored by this phase. Their persisted flag
-    /// makes restart fail closed instead of silently clearing the operation.
-    pending_operation: bool,
+    /// v1 stores only a flag; v2 stores the authenticated operation payload.
+    pending_operation: PersistedPendingOperation,
+    /// Present only in v2. A missing epoch on a v2 record fails decode.
+    #[serde(default)]
+    epoch: Option<u64>,
+    #[serde(default = "default_next_sequence")]
+    next_sequence: u64,
+    #[serde(default)]
+    outgoing: Vec<PersistedOutgoing>,
+    #[serde(default)]
+    receipts: Vec<PersistedReceiptExpectation>,
+    #[serde(default)]
+    queued: Vec<PersistedQueuedMessage>,
 }
 
 struct RestoredConversations {
@@ -184,6 +278,23 @@ struct RestoredConversations {
     peer_conversations: HashMap<PeerId, [u8; 16]>,
     active_channel: HashMap<[u8; 16], [u8; 16]>,
     active: Option<[u8; 16]>,
+    pending_receipts: HashMap<[u8; 16], BTreeSet<PeerId>>,
+    message_conversations: HashMap<[u8; 16], [u8; 16]>,
+    offline_queue: VecDeque<QueuedMessage>,
+}
+
+impl RestoredConversations {
+    fn empty() -> Self {
+        Self {
+            conversations: HashMap::new(),
+            peer_conversations: HashMap::new(),
+            active_channel: HashMap::new(),
+            active: None,
+            pending_receipts: HashMap::new(),
+            message_conversations: HashMap::new(),
+            offline_queue: VecDeque::new(),
+        }
+    }
 }
 
 impl PersistedConversation {
@@ -191,11 +302,67 @@ impl PersistedConversation {
         state: &ConversationState,
         peer: PeerId,
         active_channel: Option<[u8; 16]>,
+        pending_receipts: &HashMap<[u8; 16], BTreeSet<PeerId>>,
+        message_conversations: &HashMap<[u8; 16], [u8; 16]>,
+        offline_queue: &VecDeque<QueuedMessage>,
     ) -> Self {
         let (status_code, status_reason) = status_code(&state.status);
+        let conversation_id = state.conversation.id();
+        let queued_ids: HashSet<[u8; 16]> = offline_queue
+            .iter()
+            .filter(|item| item.conversation_id == conversation_id)
+            .map(|item| item.message_id)
+            .collect();
+        let mut outgoing = Vec::new();
+        let mut receipts = Vec::new();
+        for (message_id, peers) in pending_receipts {
+            if message_conversations.get(message_id) != Some(&conversation_id)
+                || !matches!(
+                    state.conversation.delivery_state(message_id),
+                    Some(DeliveryState::Queued)
+                        | Some(DeliveryState::SentToPeer)
+                        | Some(DeliveryState::Composed)
+                )
+            {
+                continue;
+            }
+            outgoing.push(PersistedOutgoing {
+                message_id: *message_id,
+                state_code: if queued_ids.contains(message_id) {
+                    OUTGOING_QUEUED_CODE
+                } else {
+                    OUTGOING_SENT_CODE
+                },
+            });
+            receipts.push(PersistedReceiptExpectation {
+                message_id: *message_id,
+                peers: peers.iter().map(|peer| peer.to_bytes().to_vec()).collect(),
+            });
+        }
+        outgoing.sort_by_key(|item| item.message_id);
+        receipts.sort_by_key(|item| item.message_id);
+        let pending_operation = match &state.pending_operation {
+            None => PersistedPendingOperation::Flag(false),
+            Some(operation) => PersistedPendingOperation::Detail(PersistedPendingDetail {
+                transaction_id: operation.transaction_id,
+                operation: operation.operation.code(),
+                target: operation.target.map(|peer| peer.to_bytes().to_vec()),
+                commit: operation.commit.clone(),
+                awaited: operation
+                    .awaited
+                    .iter()
+                    .map(|(peer, acked)| (peer.to_bytes().to_vec(), *acked))
+                    .collect(),
+                welcome_target: operation
+                    .welcome_target
+                    .map(|peer| peer.to_bytes().to_vec()),
+                welcome: operation.welcome.clone(),
+                welcome_acked: operation.welcome_acked,
+            }),
+        };
         Self {
             version: PERSISTED_CONVERSATION_VERSION,
-            conversation_id: state.conversation.id(),
+            conversation_id,
             peer: peer.to_bytes().to_vec(),
             admin: state.admin.to_bytes().to_vec(),
             members: state
@@ -218,19 +385,41 @@ impl PersistedConversation {
                         .map(|peer| peer.to_bytes().to_vec())
                         .collect(),
                     revision: channel.revision,
+                    last_frame_id: channel.last_frame_id,
                 })
                 .collect(),
             active_channel,
-            pending_operation: state.pending_operation.is_some(),
+            pending_operation,
+            epoch: Some(state.conversation.epoch()),
+            next_sequence: state.conversation.next_sequence(),
+            outgoing,
+            receipts,
+            queued: offline_queue
+                .iter()
+                .filter(|item| item.conversation_id == conversation_id)
+                .map(|item| PersistedQueuedMessage {
+                    peer: item.peer.to_bytes().to_vec(),
+                    conversation_id: item.conversation_id,
+                    message_id: item.message_id,
+                    envelope_bytes: item.envelope_bytes.clone(),
+                })
+                .collect(),
         }
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, ChatError> {
         let decoded: Self = serde_json::from_slice(bytes)
             .map_err(|_| ChatError::MlsRestore("invalid encrypted conversation metadata"))?;
-        if decoded.version != PERSISTED_CONVERSATION_VERSION
+        if !(decoded.version == PERSISTED_CONVERSATION_V1
+            || decoded.version == PERSISTED_CONVERSATION_VERSION)
+            || decoded.version == PERSISTED_CONVERSATION_V1 && decoded.epoch.is_some()
+            || decoded.version == PERSISTED_CONVERSATION_VERSION && decoded.epoch.is_none()
+            || decoded.next_sequence == 0
             || decoded.channels.len() > MAX_CHANNELS_PER_GROUP
             || decoded.members.len() > MAX_CHANNEL_MEMBERS
+            || decoded.receipts.len() > MAX_PENDING_RECEIPTS
+            || decoded.outgoing.len() > MAX_PENDING_RECEIPTS
+            || decoded.queued.len() > MAX_OFFLINE_QUEUE
         {
             return Err(ChatError::MlsRestore(
                 "unsupported restored conversation metadata",
@@ -245,12 +434,127 @@ impl PersistedConversation {
                 return Err(ChatError::MlsRestore("invalid restored channel metadata"));
             }
         }
+        if decoded
+            .queued
+            .iter()
+            .any(|item| item.envelope_bytes.len() > MAX_QUEUED_ENVELOPE_BYTES)
+        {
+            return Err(ChatError::MlsRestore(
+                "restored queued envelope is too large",
+            ));
+        }
         Ok(decoded)
     }
 }
 
 fn parse_persisted_peer(bytes: &[u8]) -> Result<PeerId, ChatError> {
     PeerId::from_bytes(bytes).map_err(|_| ChatError::MlsRestore("invalid restored peer id"))
+}
+
+/// Rebuild a pending MLS operation only if every field agrees with the restored
+/// group. Removed targets are intentionally absent from `members`; added
+/// targets are present because the member was inserted before the snapshot.
+fn restore_pending_operation(
+    detail: &PersistedPendingDetail,
+    members: &BTreeSet<PeerId>,
+    local: &PeerId,
+) -> Result<PendingOperation, ChatError> {
+    let operation = GroupOperation::from_code(detail.operation).ok_or(ChatError::MlsRestore(
+        "restored group operation code is invalid",
+    ))?;
+    if detail.commit.is_empty() || detail.commit.len() > MAX_PENDING_OPERATION_BYTES {
+        return Err(ChatError::MlsRestore("restored MLS commit is invalid"));
+    }
+    if detail
+        .welcome
+        .as_ref()
+        .is_some_and(|welcome| welcome.is_empty() || welcome.len() > MAX_PENDING_OPERATION_BYTES)
+    {
+        return Err(ChatError::MlsRestore("restored MLS Welcome is invalid"));
+    }
+    if detail.awaited.len() > MAX_CHANNEL_MEMBERS {
+        return Err(ChatError::MlsRestore(
+            "restored acknowledgement set is too large",
+        ));
+    }
+    let target = detail
+        .target
+        .as_ref()
+        .map(|bytes| parse_persisted_peer(bytes))
+        .transpose()?;
+    let welcome_target = detail
+        .welcome_target
+        .as_ref()
+        .map(|bytes| parse_persisted_peer(bytes))
+        .transpose()?;
+    let mut awaited = BTreeMap::new();
+    for (encoded, acked) in &detail.awaited {
+        let peer = parse_persisted_peer(encoded)?;
+        if peer == *local || !members.contains(&peer) || awaited.insert(peer, *acked).is_some() {
+            return Err(ChatError::MlsRestore(
+                "restored acknowledgement peer is inconsistent",
+            ));
+        }
+    }
+
+    match operation {
+        GroupOperation::Add => {
+            let target = target.ok_or(ChatError::MlsRestore(
+                "restored add operation has no target",
+            ))?;
+            if target == *local
+                || !members.contains(&target)
+                || welcome_target != Some(target)
+                || awaited.contains_key(&target)
+                || (!detail.welcome_acked && detail.welcome.is_none())
+            {
+                return Err(ChatError::MlsRestore(
+                    "restored add operation is inconsistent",
+                ));
+            }
+        }
+        GroupOperation::Remove => {
+            let target = target.ok_or(ChatError::MlsRestore(
+                "restored remove operation has no target",
+            ))?;
+            if target == *local
+                || members.contains(&target)
+                || welcome_target.is_some()
+                || detail.welcome.is_some()
+                || !detail.welcome_acked
+            {
+                return Err(ChatError::MlsRestore(
+                    "restored remove operation is inconsistent",
+                ));
+            }
+        }
+        GroupOperation::Update => {
+            if target.is_some()
+                || welcome_target.is_some()
+                || detail.welcome.is_some()
+                || !detail.welcome_acked
+            {
+                return Err(ChatError::MlsRestore(
+                    "restored update operation is inconsistent",
+                ));
+            }
+        }
+    }
+    if detail.welcome_acked && awaited.values().all(|acked| *acked) {
+        return Err(ChatError::MlsRestore(
+            "restored operation was already complete",
+        ));
+    }
+    Ok(PendingOperation {
+        transaction_id: detail.transaction_id,
+        operation,
+        target,
+        commit: detail.commit.clone(),
+        awaited,
+        welcome_target,
+        welcome: detail.welcome.clone(),
+        welcome_acked: detail.welcome_acked,
+    })
 }
 
 fn status_code(status: &ConversationStatus) -> (u8, Option<String>) {
@@ -774,20 +1078,15 @@ impl MessengerController {
         )
     }
 
-    /// Restore only explicitly joined conversations. Every persisted group must
-    /// have authenticated application metadata; missing, inconsistent, or
-    /// pending state fails startup instead of fabricating a joined view.
+    /// Restore joined conversations and their authenticated pending state. Every
+    /// restored item is bound to the loaded MLS group, epoch, membership, and
+    /// encrypted record; anything inconsistent fails startup.
     fn restore_joined_conversations(
         identity: &Identity,
         storage: &Session,
     ) -> Result<RestoredConversations, ChatError> {
         let local = identity.peer_id();
-        let mut restored = RestoredConversations {
-            conversations: HashMap::new(),
-            peer_conversations: HashMap::new(),
-            active_channel: HashMap::new(),
-            active: None,
-        };
+        let mut restored = RestoredConversations::empty();
         let mut first_joined = None;
         for conversation_id in storage.mls_group_ids()? {
             let bytes = storage
@@ -805,15 +1104,18 @@ impl MessengerController {
                     "restored conversation id does not match its group",
                 ));
             }
-            if record.pending_operation {
+            if record.version == PERSISTED_CONVERSATION_V1 && record.pending_operation.is_pending()
+            {
+                // A v1 record has no authenticated operation payload, so a
+                // pending flag can only be cleared without lying.
                 return Err(ChatError::MlsRestore(
                     "a group operation was pending at shutdown",
                 ));
             }
             let status = status_from_code(record.status_code, record.status_reason)?;
             if status != ConversationStatus::Joined {
-                // Setup and failed conversations are deliberately not restored
-                // in this phase. Their metadata remains encrypted in the vault.
+                // Setup and failed conversations remain encrypted but are not
+                // reconstructed as joined groups.
                 continue;
             }
 
@@ -849,8 +1151,19 @@ impl MessengerController {
                     "restored membership does not match MLS group state",
                 ));
             }
+            let epoch = match record.epoch {
+                Some(epoch) if epoch == conversation.epoch() => epoch,
+                Some(_) => {
+                    return Err(ChatError::MlsRestore(
+                        "restored record epoch does not match MLS group state",
+                    ));
+                }
+                None => conversation.epoch(),
+            };
 
             let mut state = ConversationState::new(conversation, admin, members.clone());
+            state.conversation.restore_epoch(epoch)?;
+            state.conversation.restore_sequence(record.next_sequence)?;
             state.channels.clear();
             for channel in record.channels {
                 let creator = parse_persisted_peer(&channel.creator)?;
@@ -885,7 +1198,7 @@ impl MessengerController {
                         creator,
                         members: channel_members,
                         revision: channel.revision,
-                        last_frame_id: None,
+                        last_frame_id: channel.last_frame_id,
                     },
                 );
             }
@@ -899,12 +1212,145 @@ impl MessengerController {
                     return Err(ChatError::MlsRestore("restored active channel is unknown"));
                 }
             };
+
+            let mut receipt_expectations = HashMap::new();
+            for item in &record.receipts {
+                if item.peers.is_empty() || receipt_expectations.contains_key(&item.message_id) {
+                    return Err(ChatError::MlsRestore(
+                        "restored receipt expectation is invalid",
+                    ));
+                }
+                let mut peers = BTreeSet::new();
+                for encoded in &item.peers {
+                    let expected = parse_persisted_peer(encoded)?;
+                    if expected == local || !members.contains(&expected) || !peers.insert(expected)
+                    {
+                        return Err(ChatError::MlsRestore(
+                            "restored receipt peer is inconsistent",
+                        ));
+                    }
+                }
+                receipt_expectations.insert(item.message_id, peers);
+            }
+
+            let mut queued_messages = VecDeque::new();
+            let mut queued_ids = HashSet::new();
+            for item in &record.queued {
+                let queued_peer = parse_persisted_peer(&item.peer)?;
+                if queued_peer == local
+                    || !members.contains(&queued_peer)
+                    || item.conversation_id != conversation_id
+                    || !queued_ids.insert((queued_peer, item.message_id))
+                {
+                    return Err(ChatError::MlsRestore(
+                        "restored queued message is inconsistent",
+                    ));
+                }
+                let envelope = Envelope::from_bytes(&item.envelope_bytes)
+                    .map_err(|_| ChatError::MlsRestore("restored queue envelope is invalid"))?;
+                envelope.verify().map_err(|_| {
+                    ChatError::MlsRestore("restored queue envelope signature is invalid")
+                })?;
+                if envelope.conversation_id != conversation_id
+                    || envelope.message_id != item.message_id
+                    || envelope.sender != local
+                    || envelope.epoch != epoch
+                    || envelope.sender_sequence == 0
+                    || envelope.sender_sequence >= record.next_sequence
+                    || envelope.kind != MessageKind::Channel
+                {
+                    return Err(ChatError::MlsRestore(
+                        "restored queue envelope is not bound to this conversation",
+                    ));
+                }
+                queued_messages.push_back(QueuedMessage {
+                    peer: queued_peer,
+                    conversation_id,
+                    message_id: item.message_id,
+                    envelope_bytes: item.envelope_bytes.clone(),
+                });
+            }
+
+            let queued_message_ids: HashSet<[u8; 16]> =
+                queued_messages.iter().map(|item| item.message_id).collect();
+            let mut restored_outgoing = HashSet::new();
+            for item in &record.outgoing {
+                if !restored_outgoing.insert(item.message_id)
+                    || !receipt_expectations.contains_key(&item.message_id)
+                {
+                    return Err(ChatError::MlsRestore(
+                        "restored outgoing state has no receipt expectation",
+                    ));
+                }
+                let delivery = if queued_message_ids.contains(&item.message_id) {
+                    match item.state_code {
+                        OUTGOING_QUEUED_CODE => DeliveryState::Queued,
+                        _ => {
+                            return Err(ChatError::MlsRestore(
+                                "restored queued message has an invalid state",
+                            ));
+                        }
+                    }
+                } else {
+                    match item.state_code {
+                        OUTGOING_SENT_CODE => DeliveryState::SentToPeer,
+                        _ => {
+                            return Err(ChatError::MlsRestore(
+                                "restored receipt expectation has an invalid state",
+                            ));
+                        }
+                    }
+                };
+                state
+                    .conversation
+                    .restore_outgoing(&item.message_id, delivery)?;
+            }
+            if receipt_expectations
+                .keys()
+                .any(|id| !restored_outgoing.contains(id))
+                || queued_message_ids
+                    .iter()
+                    .any(|id| !receipt_expectations.contains_key(id))
+            {
+                return Err(ChatError::MlsRestore(
+                    "restored pending state is incomplete",
+                ));
+            }
+
+            state.pending_operation = match &record.pending_operation {
+                PersistedPendingOperation::Flag(false) => None,
+                PersistedPendingOperation::Flag(true) => {
+                    return Err(ChatError::MlsRestore(
+                        "a group operation was pending at shutdown",
+                    ));
+                }
+                PersistedPendingOperation::Detail(detail) => {
+                    Some(restore_pending_operation(detail, &members, &local)?)
+                }
+            };
             state.status = ConversationStatus::Joined;
             for member in &members {
                 if *member != local {
                     restored.peer_conversations.insert(*member, conversation_id);
                 }
             }
+            for message_id in receipt_expectations.keys() {
+                match restored.message_conversations.get(message_id) {
+                    Some(existing) if existing != &conversation_id => {
+                        return Err(ChatError::MlsRestore(
+                            "restored message id is bound to two conversations",
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        restored
+                            .message_conversations
+                            .insert(*message_id, conversation_id);
+                    }
+                }
+            }
+            restored.pending_receipts.extend(receipt_expectations);
+            restored.offline_queue.extend(queued_messages);
             restored.active_channel.insert(conversation_id, selected);
             restored.conversations.insert(conversation_id, state);
             if first_joined.is_none() {
@@ -937,12 +1383,7 @@ impl MessengerController {
         }
         let restored = match storage.as_ref() {
             Some(storage) => Self::restore_joined_conversations(identity, storage)?,
-            None => RestoredConversations {
-                conversations: HashMap::new(),
-                peer_conversations: HashMap::new(),
-                active_channel: HashMap::new(),
-                active: None,
-            },
+            None => RestoredConversations::empty(),
         };
         let redial_config = RedialConfig::from(&config);
         let network = Network::start(identity, config)?;
@@ -955,11 +1396,11 @@ impl MessengerController {
             outstanding_setup: HashMap::new(),
             group_requests: HashMap::new(),
             outstanding_messages: HashMap::new(),
-            message_conversations: HashMap::new(),
-            pending_receipts: HashMap::new(),
+            message_conversations: restored.message_conversations,
+            pending_receipts: restored.pending_receipts,
             applied_commits: HashMap::new(),
             setup_replay: SetupReplayCache::default(),
-            offline_queue: VecDeque::new(),
+            offline_queue: restored.offline_queue,
             redial_config,
             dialed_addresses: HashMap::new(),
             redial: HashMap::new(),
@@ -1609,6 +2050,7 @@ impl MessengerController {
                 welcome_acked: true,
             });
         }
+        self.prune_removed_peer_state(conversation_id, &peer);
         self.persist_conversation(conversation_id)?;
         self.dispatch_group_operation(conversation_id)
     }
@@ -1926,13 +2368,16 @@ impl MessengerController {
     fn retry_queued(&mut self, peer: &PeerId) -> Result<(), ChatError> {
         let mut remaining = VecDeque::new();
         let mut last_error = None;
+        let mut changed = HashSet::new();
         while let Some(item) = self.offline_queue.pop_front() {
             if item.peer != *peer {
                 remaining.push_back(item);
                 continue;
             }
             match self.try_send_queued(&item) {
-                Ok(()) => {}
+                Ok(()) => {
+                    changed.insert(item.conversation_id);
+                }
                 Err(error) => {
                     remaining.push_back(item);
                     last_error = Some(error);
@@ -1940,6 +2385,9 @@ impl MessengerController {
             }
         }
         self.offline_queue = remaining;
+        for conversation_id in changed {
+            self.persist_conversation(conversation_id)?;
+        }
         match last_error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -1959,8 +2407,7 @@ impl MessengerController {
                     && state.pending_operation.is_none()
             });
         if !ready {
-            self.last_error = Some(ChatError::ConversationNotReady.to_string());
-            return Ok(());
+            return Err(ChatError::ConversationNotReady);
         }
 
         let request_id = self
@@ -1986,6 +2433,7 @@ impl MessengerController {
             }
             self.set_line_delivery(item.message_id, DeliveryState::Failed);
             self.last_error = Some(error.to_string());
+            self.persist_conversation(item.conversation_id)?;
             return Ok(());
         }
 
@@ -2097,7 +2545,14 @@ impl MessengerController {
             let peer = Self::display_peer(state, &self.identity.peer_id())
                 .ok_or(ChatError::MlsRestore("conversation has no display peer"))?;
             let active_channel = self.active_channel.get(&conversation_id).copied();
-            let record = PersistedConversation::from_state(state, peer, active_channel);
+            let record = PersistedConversation::from_state(
+                state,
+                peer,
+                active_channel,
+                &self.pending_receipts,
+                &self.message_conversations,
+                &self.offline_queue,
+            );
             let bytes = serde_json::to_vec(&record)
                 .map_err(|_| ChatError::MlsRestore("conversation metadata encoding failed"))?;
             (state.conversation.epoch(), bytes)
@@ -2352,6 +2807,29 @@ impl MessengerController {
         }
     }
 
+    /// Drop controller state that is no longer meaningful once a peer leaves
+    /// the MLS group. Without this, a receipt expectation or offline queue item
+    /// for the removed member would be persisted and then rejected as
+    /// inconsistent when the vault is restored.
+    fn prune_removed_peer_state(&mut self, conversation_id: [u8; 16], removed: &PeerId) {
+        let mut empty_messages = Vec::new();
+        for (message_id, peers) in &mut self.pending_receipts {
+            if self.message_conversations.get(message_id) != Some(&conversation_id) {
+                continue;
+            }
+            peers.remove(removed);
+            if peers.is_empty() {
+                empty_messages.push(*message_id);
+            }
+        }
+        for message_id in empty_messages {
+            self.pending_receipts.remove(&message_id);
+            self.message_conversations.remove(&message_id);
+        }
+        self.offline_queue
+            .retain(|item| item.conversation_id != conversation_id || item.peer != *removed);
+    }
+
     fn remove_local_conversation(&mut self, conversation_id: [u8; 16]) {
         self.conversations.remove(&conversation_id);
         self.pending_key_packages
@@ -2445,6 +2923,135 @@ impl MessengerController {
         )
     }
 
+    /// Bind a replay response to the exact group request, including its peer,
+    /// transaction, target, and MLS payload. Re-signing the same message does
+    /// not change this key; changing any payload byte does.
+    fn group_request_outcome_key(peer: &PeerId, message: &SetupMessage) -> Option<[u8; 32]> {
+        let mut hasher = Sha256::new();
+        match message {
+            SetupMessage::GroupCommit {
+                conversation_id,
+                transaction_id,
+                operation,
+                target,
+                commit,
+            } => {
+                hasher.update(b"p2p.app.group-commit-outcome/v1");
+                hasher.update(peer.to_bytes());
+                hasher.update(conversation_id);
+                hasher.update(transaction_id);
+                hasher.update([operation.code()]);
+                hasher.update([u8::from(target.is_some())]);
+                if let Some(target) = target {
+                    hasher.update(target.to_bytes());
+                }
+                hasher.update(commit);
+            }
+            SetupMessage::GroupWelcome {
+                conversation_id,
+                transaction_id,
+                welcome,
+            } => {
+                hasher.update(b"p2p.app.group-welcome-outcome/v1");
+                hasher.update(peer.to_bytes());
+                hasher.update(conversation_id);
+                hasher.update(transaction_id);
+                hasher.update(welcome);
+            }
+            _ => return None,
+        }
+        Some(hasher.finalize().into())
+    }
+
+    /// Look up a previously applied group request. Only an exact payload match
+    /// can produce a stored ack, so this never re-applies an epoch transition.
+    fn durable_group_ack(&self, key: &[u8; 32]) -> Result<Option<SetupMessage>, ChatError> {
+        let Some(storage) = self.storage.as_ref() else {
+            return Ok(None);
+        };
+        let Some(bytes) =
+            storage.load_mls_state(&GLOBAL_PROVIDER_GROUP, PERSISTED_GROUP_ACK_LABEL, key)?
+        else {
+            return Ok(None);
+        };
+        let record: PersistedGroupAck = serde_json::from_slice(&bytes)
+            .map_err(|_| ChatError::MlsRestore("stored group ack is invalid"))?;
+        if record.version != GROUP_ACK_VERSION {
+            return Err(ChatError::MlsRestore(
+                "stored group ack version is unsupported",
+            ));
+        }
+        match record.response {
+            GROUP_ACK_COMMIT_CODE => {
+                let operation = GroupOperation::from_code(record.operation).ok_or(
+                    ChatError::MlsRestore("stored group ack operation is invalid"),
+                )?;
+                Ok(Some(SetupMessage::GroupCommitAck {
+                    conversation_id: record.conversation_id,
+                    transaction_id: record.transaction_id,
+                    operation,
+                    accepted: record.accepted,
+                }))
+            }
+            GROUP_ACK_WELCOME_CODE => Ok(Some(SetupMessage::GroupWelcomeAck {
+                conversation_id: record.conversation_id,
+                transaction_id: record.transaction_id,
+                accepted: record.accepted,
+            })),
+            _ => Err(ChatError::MlsRestore("stored group ack type is invalid")),
+        }
+    }
+
+    /// Save the first ack for a non-repeatable group request so a restart can
+    /// answer an exact retry without replaying the request itself.
+    fn persist_group_ack(
+        &mut self,
+        key: &[u8; 32],
+        outcome: &RequestOutcome,
+    ) -> Result<(), ChatError> {
+        let (Some(storage), Some(response)) = (self.storage.as_mut(), &outcome.response) else {
+            return Ok(());
+        };
+        let record = match response {
+            SetupMessage::GroupCommitAck {
+                conversation_id,
+                transaction_id,
+                operation,
+                accepted,
+            } => PersistedGroupAck {
+                version: GROUP_ACK_VERSION,
+                response: GROUP_ACK_COMMIT_CODE,
+                conversation_id: *conversation_id,
+                transaction_id: *transaction_id,
+                operation: operation.code(),
+                accepted: *accepted,
+            },
+            SetupMessage::GroupWelcomeAck {
+                conversation_id,
+                transaction_id,
+                accepted,
+            } => PersistedGroupAck {
+                version: GROUP_ACK_VERSION,
+                response: GROUP_ACK_WELCOME_CODE,
+                conversation_id: *conversation_id,
+                transaction_id: *transaction_id,
+                operation: GroupOperation::Add.code(),
+                accepted: *accepted,
+            },
+            _ => return Ok(()),
+        };
+        let bytes = serde_json::to_vec(&record)
+            .map_err(|_| ChatError::MlsRestore("group ack encoding failed"))?;
+        storage.store_mls_state(
+            &GLOBAL_PROVIDER_GROUP,
+            PERSISTED_GROUP_ACK_LABEL,
+            key,
+            0,
+            &bytes,
+        )?;
+        Ok(())
+    }
+
     /// Consult the durable control log before mutating any controller state.
     /// Without an attached vault the existing in-memory cache remains the only
     /// replay boundary; with one, a non-repeatable replay is ignored before it
@@ -2475,6 +3082,14 @@ impl MessengerController {
                 bytes,
             } => {
                 let (peer, frame) = Self::decode_setup(peer, &bytes)?;
+                // A non-repeatable group request that was already applied has a
+                // durable ack. Answer the exact retry without re-applying the
+                // epoch transition or asking the control log to record it again.
+                if let Some(key) = Self::group_request_outcome_key(&peer, &frame.message)
+                    && let Some(response) = self.durable_group_ack(&key)?
+                {
+                    return self.respond_setup(response_id, response);
+                }
                 let repeatable = Self::is_repeatable_setup_message(&frame.message);
                 if !self.durable_control_allows(peer, &bytes, repeatable)? {
                     return Ok(());
@@ -2559,6 +3174,7 @@ impl MessengerController {
         frame: SetupEnvelope,
     ) -> Result<RequestOutcome, ChatError> {
         let public_key = frame.sender_public_key;
+        let outcome_key = Self::group_request_outcome_key(&peer, &frame.message);
         match frame.message {
             SetupMessage::KeyPackageRequest {
                 conversation_id,
@@ -2594,7 +3210,11 @@ impl MessengerController {
             } => {
                 let ack =
                     self.join_from_welcome(peer, conversation_id, transaction_id, welcome, true)?;
-                Ok(RequestOutcome::respond(ack))
+                let outcome = RequestOutcome::respond(ack);
+                if let Some(key) = &outcome_key {
+                    self.persist_group_ack(key, &outcome)?;
+                }
+                Ok(outcome)
             }
             SetupMessage::GroupCommit {
                 conversation_id,
@@ -2615,7 +3235,7 @@ impl MessengerController {
                         "group commit transaction does not match pending operation",
                     ));
                 }
-                let (accepted, self_removed, refresh_members) = {
+                let (accepted, self_removed, refresh_members, removed_members) = {
                     let state = self
                         .conversations
                         .get_mut(&conversation_id)
@@ -2634,8 +3254,9 @@ impl MessengerController {
                         .get(&conversation_id)
                         .is_some_and(|applied| applied.contains(&commit));
                     if already_applied {
-                        (true, false, false)
+                        (true, false, false, Vec::new())
                     } else {
+                        let previous_members = state.members.clone();
                         match state.conversation.process_commit(
                             &commit,
                             &peer,
@@ -2651,18 +3272,23 @@ impl MessengerController {
                                 }
                                 applied.insert(commit.clone());
                                 if outcome.self_removed {
-                                    (true, true, false)
+                                    (true, true, false, Vec::new())
                                 } else {
                                     let members = state.conversation.members()?;
+                                    let removed = previous_members
+                                        .iter()
+                                        .copied()
+                                        .filter(|member| !members.contains(member))
+                                        .collect::<Vec<_>>();
                                     state.members = members.into_iter().collect();
                                     state.sync_default_channel();
                                     state.prune_removed_members();
-                                    (true, false, true)
+                                    (true, false, true, removed)
                                 }
                             }
                             Err(error) => {
                                 self.last_error = Some(error.to_string());
-                                (false, false, false)
+                                (false, false, false, Vec::new())
                             }
                         }
                     }
@@ -2672,6 +3298,9 @@ impl MessengerController {
                 } else if refresh_members {
                     let local = self.identity.peer_id();
                     self.refresh_peer_conversations(conversation_id, &local);
+                    for removed in removed_members {
+                        self.prune_removed_peer_state(conversation_id, &removed);
+                    }
                     self.persist_conversation(conversation_id)?;
                 }
                 let ack = SetupMessage::GroupCommitAck {
@@ -2680,14 +3309,15 @@ impl MessengerController {
                     operation,
                     accepted,
                 };
-                if accepted {
-                    Ok(RequestOutcome::respond(ack))
+                let outcome = if accepted {
+                    RequestOutcome::respond(ack)
                 } else {
-                    Ok(RequestOutcome::respond_and_reject(
-                        ack,
-                        ChatError::GroupOperationRejected,
-                    ))
+                    RequestOutcome::respond_and_reject(ack, ChatError::GroupOperationRejected)
+                };
+                if let Some(key) = &outcome_key {
+                    self.persist_group_ack(key, &outcome)?;
                 }
+                Ok(outcome)
             }
             _ => Err(ChatError::InvalidSetup("unexpected setup request type")),
         }
@@ -3044,6 +3674,7 @@ impl MessengerController {
                     .and_then(|state| state.pending_operation.as_mut())
                     .ok_or(ChatError::InvalidSetup("no group operation is pending"))?
                     .welcome_acked = true;
+                self.persist_conversation(conversation_id)?;
                 self.finish_operation_if_ready(conversation_id)?;
                 Ok(())
             }
@@ -3089,6 +3720,7 @@ impl MessengerController {
                     .get_mut(&peer)
                     .ok_or(ChatError::UnexpectedSender)?;
                 *awaited = true;
+                self.persist_conversation(conversation_id)?;
                 self.finish_operation_if_ready(conversation_id)?;
                 Ok(())
             }
@@ -3581,6 +4213,7 @@ impl MessengerController {
         }) else {
             return Ok(());
         };
+        let mut persist_conversation = None;
         if let Some(conversation_id) = self.message_conversations.get(&message_id).copied()
             && let Some(state) = self.conversations.get_mut(&conversation_id)
         {
@@ -3591,12 +4224,16 @@ impl MessengerController {
                     {
                         state.conversation.mark_sent_to_peer(&message_id)?;
                     }
+                    persist_conversation = Some(conversation_id);
                 }
                 DeliveryState::Failed => state.conversation.mark_failed(&message_id)?,
                 _ => return Err(ChatError::InvalidSetup("invalid outgoing transition")),
             }
         }
         self.set_line_delivery(message_id, delivery);
+        if let Some(conversation_id) = persist_conversation {
+            self.persist_conversation(conversation_id)?;
+        }
         Ok(())
     }
 
@@ -3697,6 +4334,7 @@ impl MessengerController {
                 }),
             });
         }
+        self.persist_conversation(conversation_id)?;
         Ok(message_id)
     }
 
@@ -3814,10 +4452,11 @@ impl MessengerController {
         };
         let peer = identity_peer(swarm_peer)?;
         let envelope = Envelope::from_bytes(bytes)?;
+        let conversation_id = envelope.conversation_id;
         let received = {
             let state = self
                 .conversations
-                .get_mut(&envelope.conversation_id)
+                .get_mut(&conversation_id)
                 .ok_or(ChatError::UnknownConversation)?;
             if !state.members.contains(&peer) {
                 return Err(ChatError::NotGroupMember);
@@ -3845,6 +4484,7 @@ impl MessengerController {
                 },
             );
         }
+        self.persist_conversation(conversation_id)?;
         Ok(())
     }
 }
@@ -3910,6 +4550,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p2p_groups::GroupError;
     use p2p_storage::Vault;
 
     #[test]
@@ -4098,6 +4739,245 @@ mod tests {
     }
 
     #[test]
+    fn restored_group_commit_replay_returns_the_original_ack_without_reapplying() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (identity, vault, mut session) = vault_session(directory.path());
+        let admin = Identity::generate().expect("admin");
+        let conversation_id = [58u8; 16];
+        let members = BTreeSet::from([admin.peer_id(), identity.peer_id()]);
+
+        let mut admin_conversation =
+            MlsConversation::create(&admin, conversation_id).expect("admin group");
+        let key_package = MlsConversation::key_package_with_storage(
+            &identity,
+            session.try_clone().expect("clone session for key package"),
+        )
+        .expect("vault-backed recipient key package");
+        let welcome = admin_conversation
+            .add_member(
+                key_package.bytes(),
+                identity.peer_id(),
+                &identity.public_key_bytes(),
+            )
+            .expect("add recipient");
+        let conversation = MlsConversation::join(&identity, conversation_id, key_package, &welcome)
+            .expect("recipient joins group");
+        let before_epoch = conversation.epoch();
+        let commit = admin_conversation
+            .self_update_commit()
+            .expect("admin update commit");
+        let state = ConversationState::new(conversation, admin.peer_id(), members);
+        let display_peer =
+            MessengerController::display_peer(&state, &identity.peer_id()).expect("display peer");
+        let record = PersistedConversation::from_state(
+            &state,
+            display_peer,
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            &VecDeque::new(),
+        );
+        store_record(&mut session, conversation_id, before_epoch, &record);
+        let frame = signed(
+            &admin,
+            SetupMessage::GroupCommit {
+                conversation_id,
+                transaction_id: [59u8; 16],
+                operation: GroupOperation::Update,
+                target: None,
+                commit,
+            },
+        );
+        let bytes = frame.to_bytes().expect("encoded group commit");
+        let outcome_key =
+            MessengerController::group_request_outcome_key(&admin.peer_id(), &frame.message)
+                .expect("group commit outcome key");
+
+        let mut controller = MessengerController::start_with_control_log(
+            &identity,
+            NetworkConfig::default(),
+            session.try_clone().expect("controller session"),
+        )
+        .expect("controller");
+        assert!(
+            controller
+                .durable_control_allows(admin.peer_id(), &bytes, false)
+                .expect("first commit passes durable gate"),
+            "the first authenticated commit must pass the durable gate"
+        );
+        let outcome = controller
+            .process_setup_request(admin.peer_id(), frame.clone())
+            .expect("apply group commit");
+        assert!(
+            matches!(
+                &outcome.response,
+                Some(SetupMessage::GroupCommitAck { accepted: true, .. })
+            ),
+            "the first commit must be acknowledged; last_error={:?}, response={:?}",
+            controller.last_error(),
+            outcome.response.as_ref().map(|_| "<setup message>")
+        );
+        let applied_epoch = controller.active_info().expect("active conversation").epoch;
+        assert_eq!(applied_epoch, before_epoch + 1);
+        drop(controller);
+        drop(session);
+
+        let storage = vault
+            .unlock("phase4-password")
+            .expect("unlock after restart");
+        let mut restored = MessengerController::start_with_control_log(
+            &identity,
+            NetworkConfig::default(),
+            storage,
+        )
+        .expect("restored controller");
+        let replay_ack = restored
+            .durable_group_ack(&outcome_key)
+            .expect("load durable group ack")
+            .expect("stored group ack");
+        assert!(
+            matches!(
+                replay_ack,
+                SetupMessage::GroupCommitAck { accepted: true, .. }
+            ),
+            "the original ack must be recoverable after restart"
+        );
+        assert!(
+            restored
+                .handle_setup_event(SetupEvent::RequestReceived {
+                    response_id: SetupResponseId::new(15),
+                    peer: swarm_peer(&admin.peer_id()).expect("swarm peer"),
+                    bytes,
+                })
+                .is_ok(),
+            "an exact replay must be answered from the durable outcome"
+        );
+        assert_eq!(
+            restored.active_info().expect("still active").epoch,
+            applied_epoch,
+            "a replay must not advance the MLS epoch again"
+        );
+    }
+
+    #[test]
+    fn restored_group_welcome_replay_returns_the_original_ack_without_rejoining() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (identity, vault, session) = vault_session(directory.path());
+        let admin = Identity::generate().expect("admin");
+        let conversation_id = [60u8; 16];
+        let transaction_id = [61u8; 16];
+
+        let mut admin_conversation =
+            MlsConversation::create(&admin, conversation_id).expect("admin group");
+        let key_package = MlsConversation::key_package_with_storage(
+            &identity,
+            session.try_clone().expect("clone session for key package"),
+        )
+        .expect("vault-backed group key package");
+        let welcome = admin_conversation
+            .add_member(
+                key_package.bytes(),
+                identity.peer_id(),
+                &identity.public_key_bytes(),
+            )
+            .expect("create group Welcome");
+
+        let mut controller = MessengerController::start_with_control_log(
+            &identity,
+            NetworkConfig::default(),
+            session.try_clone().expect("controller session"),
+        )
+        .expect("controller");
+        let response_bytes = signed(
+            &admin,
+            SetupMessage::GroupKeyPackageResponse {
+                conversation_id,
+                transaction_id,
+                key_package: key_package.bytes().to_vec(),
+            },
+        )
+        .to_bytes()
+        .expect("encoded group key package response");
+        controller.pending_key_packages.insert(
+            (conversation_id, transaction_id),
+            PendingKeyPackage {
+                peer: admin.peer_id(),
+                kind: PendingKeyPackageKind::GroupJoin,
+                key_package,
+                response_bytes,
+            },
+        );
+        let frame = signed(
+            &admin,
+            SetupMessage::GroupWelcome {
+                conversation_id,
+                transaction_id,
+                welcome,
+            },
+        );
+        let bytes = frame.to_bytes().expect("encoded group welcome");
+        let outcome_key =
+            MessengerController::group_request_outcome_key(&admin.peer_id(), &frame.message)
+                .expect("group welcome outcome key");
+        assert!(
+            controller
+                .durable_control_allows(admin.peer_id(), &bytes, false)
+                .expect("first welcome passes durable gate"),
+            "the first authenticated welcome must pass the durable gate"
+        );
+        let outcome = controller
+            .process_setup_request(admin.peer_id(), frame.clone())
+            .expect("apply group welcome");
+        assert!(
+            matches!(
+                &outcome.response,
+                Some(SetupMessage::GroupWelcomeAck { accepted: true, .. })
+            ),
+            "the first welcome must be acknowledged; last_error={:?}",
+            controller.last_error()
+        );
+        let applied_epoch = controller.active_info().expect("joined conversation").epoch;
+        drop(controller);
+        drop(session);
+
+        let storage = vault
+            .unlock("phase4-password")
+            .expect("unlock after restart");
+        let mut restored = MessengerController::start_with_control_log(
+            &identity,
+            NetworkConfig::default(),
+            storage,
+        )
+        .expect("restored controller");
+        let replay_ack = restored
+            .durable_group_ack(&outcome_key)
+            .expect("load durable group ack")
+            .expect("stored group ack");
+        assert!(
+            matches!(
+                replay_ack,
+                SetupMessage::GroupWelcomeAck { accepted: true, .. }
+            ),
+            "the original welcome ack must be recoverable after restart"
+        );
+        assert!(
+            restored
+                .handle_setup_event(SetupEvent::RequestReceived {
+                    response_id: SetupResponseId::new(16),
+                    peer: swarm_peer(&admin.peer_id()).expect("swarm peer"),
+                    bytes,
+                })
+                .is_ok(),
+            "an exact welcome replay must be answered from the durable outcome"
+        );
+        assert_eq!(
+            restored.active_info().expect("still active").epoch,
+            applied_epoch,
+            "a welcome replay must not rejoin or advance the MLS epoch"
+        );
+    }
+
+    #[test]
     fn durable_control_log_keeps_request_retries_idempotent_after_reopen() {
         let directory = tempfile::tempdir().expect("temp dir");
         let identity = Identity::generate().expect("identity");
@@ -4152,6 +5032,42 @@ mod tests {
         (identity, vault, session)
     }
 
+    #[test]
+    fn start_with_control_log_rejects_a_wrong_vault_identity() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (_identity, vault, session) = vault_session(directory.path());
+        drop(session);
+        let wrong = Identity::generate().expect("wrong identity");
+        let storage = vault.unlock("phase4-password").expect("unlock vault");
+
+        let error =
+            MessengerController::start_with_control_log(&wrong, NetworkConfig::default(), storage)
+                .expect_err("wrong vault identity must fail startup");
+        assert!(matches!(error, ChatError::ControlLogIdentityMismatch));
+    }
+
+    #[test]
+    fn load_with_storage_rejects_a_wrong_local_identity() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (identity, vault, session) = vault_session(directory.path());
+        let peer = Identity::generate().expect("peer");
+        let conversation_id = [57u8; 16];
+        let conversation = group_with_peer(
+            &identity,
+            &peer,
+            conversation_id,
+            session.try_clone().expect("clone session"),
+        );
+        drop(conversation);
+        drop(session);
+        let wrong = Identity::generate().expect("wrong identity");
+        let storage = vault.unlock("phase4-password").expect("unlock vault");
+
+        let error = MlsConversation::load_with_storage(&wrong, conversation_id, storage)
+            .expect_err("wrong local identity must not restore the group");
+        assert!(matches!(error, GroupError::WrongLocalIdentity));
+    }
+
     fn group_with_peer(
         identity: &Identity,
         peer: &Identity,
@@ -4178,7 +5094,17 @@ mod tests {
     ) {
         let peer =
             MessengerController::display_peer(&state, &identity.peer_id()).expect("display peer");
-        let record = PersistedConversation::from_state(&state, peer, active_channel);
+        let pending_receipts: HashMap<[u8; 16], BTreeSet<PeerId>> = HashMap::new();
+        let message_conversations: HashMap<[u8; 16], [u8; 16]> = HashMap::new();
+        let offline_queue: VecDeque<QueuedMessage> = VecDeque::new();
+        let record = PersistedConversation::from_state(
+            &state,
+            peer,
+            active_channel,
+            &pending_receipts,
+            &message_conversations,
+            &offline_queue,
+        );
         let bytes = serde_json::to_vec(&record).expect("encode conversation policy");
         session
             .store_mls_state(
@@ -4189,6 +5115,115 @@ mod tests {
                 &bytes,
             )
             .expect("store conversation policy");
+    }
+
+    fn store_record(
+        session: &mut Session,
+        conversation_id: [u8; 16],
+        epoch: u64,
+        record: &PersistedConversation,
+    ) {
+        let bytes = serde_json::to_vec(record).expect("encode conversation policy");
+        session
+            .store_mls_state(
+                &conversation_id,
+                PERSISTED_CONVERSATION_LABEL,
+                PERSISTED_CONVERSATION_LABEL.as_bytes(),
+                epoch,
+                &bytes,
+            )
+            .expect("store conversation policy");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn persist_full_state(
+        identity: &Identity,
+        session: &mut Session,
+        conversation_id: [u8; 16],
+        state: &ConversationState,
+        active_channel: Option<[u8; 16]>,
+        pending_receipts: &HashMap<[u8; 16], BTreeSet<PeerId>>,
+        message_conversations: &HashMap<[u8; 16], [u8; 16]>,
+        offline_queue: &VecDeque<QueuedMessage>,
+    ) {
+        let peer =
+            MessengerController::display_peer(state, &identity.peer_id()).expect("display peer");
+        let record = PersistedConversation::from_state(
+            state,
+            peer,
+            active_channel,
+            pending_receipts,
+            message_conversations,
+            offline_queue,
+        );
+        store_record(
+            session,
+            conversation_id,
+            state.conversation.epoch(),
+            &record,
+        );
+    }
+
+    fn queued_message(
+        identity: &Identity,
+        state: &mut ConversationState,
+        peer: PeerId,
+        secret: &str,
+    ) -> QueuedMessage {
+        let conversation_id = state.conversation.id();
+        let envelope = state
+            .conversation
+            .compose(identity, MessageKind::Channel, secret.as_bytes())
+            .expect("compose queued frame");
+        state
+            .conversation
+            .mark_queued(&envelope.message_id)
+            .expect("mark queued");
+        QueuedMessage {
+            peer,
+            conversation_id,
+            message_id: envelope.message_id,
+            envelope_bytes: envelope.to_bytes().expect("encode queued envelope"),
+        }
+    }
+
+    fn assert_restore_fails_with_record_mutation(
+        mutate: impl FnOnce(&mut PersistedConversation),
+    ) -> Result<(), ChatError> {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (identity, vault, mut session) = vault_session(directory.path());
+        let peer = Identity::generate().expect("peer");
+        let conversation_id = [61u8; 16];
+        let conversation = group_with_peer(
+            &identity,
+            &peer,
+            conversation_id,
+            session.try_clone().unwrap(),
+        );
+        let state = ConversationState::new(
+            conversation,
+            identity.peer_id(),
+            BTreeSet::from([identity.peer_id(), peer.peer_id()]),
+        );
+        let epoch = state.conversation.epoch();
+        persist_state(&identity, &mut session, conversation_id, state, None);
+        let bytes = session
+            .load_mls_state(
+                &conversation_id,
+                PERSISTED_CONVERSATION_LABEL,
+                PERSISTED_CONVERSATION_LABEL.as_bytes(),
+            )?
+            .expect("persisted record");
+        let mut record = PersistedConversation::decode(&bytes)?;
+        mutate(&mut record);
+        store_record(&mut session, conversation_id, epoch, &record);
+        drop(session);
+
+        let storage = vault
+            .unlock("phase4-password")
+            .expect("unlock after restart");
+        MessengerController::start_with_control_log(&identity, NetworkConfig::default(), storage)
+            .map(|_| ())
     }
 
     #[test]
@@ -4319,7 +5354,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_fails_when_a_group_operation_was_pending() {
+    fn pending_group_operation_restores_after_restart() {
         let directory = tempfile::tempdir().expect("temp dir");
         let (identity, vault, mut session) = vault_session(directory.path());
         let peer = Identity::generate().expect("peer");
@@ -4342,10 +5377,362 @@ mod tests {
             commit: vec![1, 2, 3],
             awaited: BTreeMap::new(),
             welcome_target: Some(peer.peer_id()),
-            welcome: None,
+            welcome: Some(vec![4, 5, 6]),
             welcome_acked: false,
         });
         persist_state(&identity, &mut session, conversation_id, state, None);
+        drop(session);
+
+        let storage = vault
+            .unlock("phase4-password")
+            .expect("unlock after restart");
+        let controller = MessengerController::start_with_control_log(
+            &identity,
+            NetworkConfig::default(),
+            storage,
+        )
+        .expect("restore controller");
+        let info = controller
+            .info(conversation_id)
+            .expect("restored conversation");
+        assert_eq!(info.pending_operation, Some(GroupOperation::Add));
+        let restored = controller
+            .conversations
+            .get(&conversation_id)
+            .expect("restored state");
+        let operation = restored
+            .pending_operation
+            .as_ref()
+            .expect("pending operation");
+        assert_eq!(operation.transaction_id, [46u8; 16]);
+        assert_eq!(operation.target, Some(peer.peer_id()));
+        assert_eq!(operation.welcome_target, Some(peer.peer_id()));
+        assert!(!operation.welcome_acked);
+    }
+
+    #[test]
+    fn pruning_a_removed_peer_drops_only_that_peers_pending_state() {
+        let (_, mut controller) = test_controller();
+        let conversation_id = [63u8; 16];
+        let other_conversation = [64u8; 16];
+        let removed = Identity::generate().expect("removed").peer_id();
+        let kept = Identity::generate().expect("kept").peer_id();
+        let removed_only_message = [65u8; 16];
+        let shared_message = [66u8; 16];
+        let other_message = [67u8; 16];
+
+        controller
+            .message_conversations
+            .insert(removed_only_message, conversation_id);
+        controller
+            .message_conversations
+            .insert(shared_message, conversation_id);
+        controller
+            .message_conversations
+            .insert(other_message, other_conversation);
+        controller
+            .pending_receipts
+            .insert(removed_only_message, BTreeSet::from([removed]));
+        controller
+            .pending_receipts
+            .insert(shared_message, BTreeSet::from([removed, kept]));
+        controller
+            .pending_receipts
+            .insert(other_message, BTreeSet::from([removed]));
+        controller.offline_queue.push_back(QueuedMessage {
+            peer: removed,
+            conversation_id,
+            message_id: removed_only_message,
+            envelope_bytes: vec![1],
+        });
+        controller.offline_queue.push_back(QueuedMessage {
+            peer: kept,
+            conversation_id,
+            message_id: shared_message,
+            envelope_bytes: vec![2],
+        });
+
+        controller.prune_removed_peer_state(conversation_id, &removed);
+
+        assert!(
+            !controller
+                .pending_receipts
+                .contains_key(&removed_only_message)
+        );
+        assert!(
+            !controller
+                .message_conversations
+                .contains_key(&removed_only_message)
+        );
+        assert_eq!(
+            controller.pending_receipts.get(&shared_message),
+            Some(&BTreeSet::from([kept]))
+        );
+        assert_eq!(
+            controller.pending_receipts.get(&other_message),
+            Some(&BTreeSet::from([removed]))
+        );
+        assert_eq!(
+            controller.message_conversations.get(&other_message),
+            Some(&other_conversation)
+        );
+        assert_eq!(controller.offline_queue.len(), 1);
+        assert_eq!(controller.offline_queue[0].peer, kept);
+    }
+
+    #[test]
+    fn receipt_expectations_and_channel_pending_state_restore_after_restart() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (identity, vault, mut session) = vault_session(directory.path());
+        let peer = Identity::generate().expect("peer");
+        let conversation_id = [62u8; 16];
+        let conversation = group_with_peer(
+            &identity,
+            &peer,
+            conversation_id,
+            session.try_clone().unwrap(),
+        );
+        let mut state = ConversationState::new(
+            conversation,
+            identity.peer_id(),
+            BTreeSet::from([identity.peer_id(), peer.peer_id()]),
+        );
+        let envelope = state
+            .conversation
+            .compose(&identity, MessageKind::Channel, b"ciphertext")
+            .expect("compose outgoing frame");
+        state
+            .conversation
+            .mark_sent_to_peer(&envelope.message_id)
+            .expect("mark sent to peer");
+        let message_id = envelope.message_id;
+        state
+            .channels
+            .get_mut(&DEFAULT_CHANNEL_ID)
+            .expect("default channel")
+            .last_frame_id = Some(message_id);
+        let mut pending_receipts = HashMap::new();
+        pending_receipts.insert(message_id, BTreeSet::from([peer.peer_id()]));
+        let mut message_conversations = HashMap::new();
+        message_conversations.insert(message_id, conversation_id);
+        persist_full_state(
+            &identity,
+            &mut session,
+            conversation_id,
+            &state,
+            None,
+            &pending_receipts,
+            &message_conversations,
+            &VecDeque::new(),
+        );
+        drop(session);
+
+        let storage = vault
+            .unlock("phase4-password")
+            .expect("unlock after restart");
+        let controller = MessengerController::start_with_control_log(
+            &identity,
+            NetworkConfig::default(),
+            storage,
+        )
+        .expect("restore controller");
+        assert_eq!(
+            controller.pending_receipts.get(&message_id),
+            Some(&BTreeSet::from([peer.peer_id()]))
+        );
+        let restored = controller
+            .conversations
+            .get(&conversation_id)
+            .expect("restored state");
+        assert_eq!(
+            restored.conversation.delivery_state(&message_id),
+            Some(DeliveryState::SentToPeer)
+        );
+        assert_ne!(
+            restored.conversation.delivery_state(&message_id),
+            Some(DeliveryState::Delivered)
+        );
+        let info = controller.info(conversation_id).expect("conversation info");
+        assert!(
+            !info
+                .channels
+                .iter()
+                .find(|channel| channel.channel_id == DEFAULT_CHANNEL_ID)
+                .expect("default channel")
+                .acknowledged
+        );
+    }
+
+    #[test]
+    fn queued_ciphertext_restores_without_persisting_plaintext() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (identity, vault, mut session) = vault_session(directory.path());
+        let peer = Identity::generate().expect("peer");
+        let conversation_id = [63u8; 16];
+        let conversation = group_with_peer(
+            &identity,
+            &peer,
+            conversation_id,
+            session.try_clone().unwrap(),
+        );
+        let mut state = ConversationState::new(
+            conversation,
+            identity.peer_id(),
+            BTreeSet::from([identity.peer_id(), peer.peer_id()]),
+        );
+        let secret = "PENDING_QUEUE_SENTINEL_88";
+        let queued = queued_message(&identity, &mut state, peer.peer_id(), secret);
+        let message_id = queued.message_id;
+        let mut pending_receipts = HashMap::new();
+        pending_receipts.insert(message_id, BTreeSet::from([peer.peer_id()]));
+        let mut message_conversations = HashMap::new();
+        message_conversations.insert(message_id, conversation_id);
+        let mut offline_queue = VecDeque::new();
+        offline_queue.push_back(queued);
+        persist_full_state(
+            &identity,
+            &mut session,
+            conversation_id,
+            &state,
+            None,
+            &pending_receipts,
+            &message_conversations,
+            &offline_queue,
+        );
+        drop(session);
+
+        for name in ["profile.db", "profile.db-wal", "profile.db-shm"] {
+            let bytes = std::fs::read(directory.path().join(name)).unwrap_or_default();
+            assert!(
+                !bytes
+                    .windows(secret.len())
+                    .any(|window| window == secret.as_bytes()),
+                "{name} contains queued plaintext"
+            );
+        }
+
+        let storage = vault
+            .unlock("phase4-password")
+            .expect("unlock after restart");
+        let controller = MessengerController::start_with_control_log(
+            &identity,
+            NetworkConfig::default(),
+            storage,
+        )
+        .expect("restore controller");
+        assert_eq!(controller.queued_count(&peer.peer_id()), 1);
+        assert_eq!(
+            controller.pending_receipts.get(&message_id),
+            Some(&BTreeSet::from([peer.peer_id()]))
+        );
+        let restored = controller
+            .conversations
+            .get(&conversation_id)
+            .expect("restored state");
+        assert_eq!(
+            restored.conversation.delivery_state(&message_id),
+            Some(DeliveryState::Queued)
+        );
+        assert!(!format!("{controller:?}").contains(secret));
+    }
+
+    #[test]
+    fn restore_fails_when_record_epoch_disagrees_with_mls_state() {
+        let result = assert_restore_fails_with_record_mutation(|record| {
+            let epoch = record.epoch.expect("v2 epoch");
+            record.epoch = Some(epoch.saturating_add(1));
+        });
+        assert!(matches!(result, Err(ChatError::MlsRestore(_))));
+    }
+
+    #[test]
+    fn restore_fails_when_record_group_id_is_tampered() {
+        let result = assert_restore_fails_with_record_mutation(|record| {
+            record.conversation_id = [99u8; 16];
+        });
+        assert!(matches!(result, Err(ChatError::MlsRestore(_))));
+    }
+
+    #[test]
+    fn restore_fails_when_record_peer_is_tampered() {
+        let result = assert_restore_fails_with_record_mutation(|record| {
+            record.peer = Identity::generate()
+                .expect("outsider")
+                .peer_id()
+                .to_bytes()
+                .to_vec();
+        });
+        assert!(matches!(result, Err(ChatError::MlsRestore(_))));
+    }
+
+    #[test]
+    fn restore_fails_when_pending_operation_target_is_inconsistent() {
+        let result = assert_restore_fails_with_record_mutation(|record| {
+            let outsider = Identity::generate().expect("outsider");
+            record.pending_operation = PersistedPendingOperation::Detail(PersistedPendingDetail {
+                transaction_id: [64u8; 16],
+                operation: GroupOperation::Add.code(),
+                target: Some(outsider.peer_id().to_bytes().to_vec()),
+                commit: vec![1, 2, 3],
+                awaited: Vec::new(),
+                welcome_target: Some(outsider.peer_id().to_bytes().to_vec()),
+                welcome: Some(vec![4, 5, 6]),
+                welcome_acked: false,
+            });
+        });
+        assert!(matches!(result, Err(ChatError::MlsRestore(_))));
+    }
+
+    #[test]
+    fn restore_fails_when_v1_record_had_a_pending_operation() {
+        let result = assert_restore_fails_with_record_mutation(|record| {
+            record.version = PERSISTED_CONVERSATION_V1;
+            record.epoch = None;
+            record.pending_operation = PersistedPendingOperation::Flag(true);
+            record.outgoing.clear();
+            record.receipts.clear();
+            record.queued.clear();
+        });
+        assert!(matches!(result, Err(ChatError::MlsRestore(_))));
+    }
+
+    #[test]
+    fn restore_fails_when_queued_envelope_signature_is_tampered() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (identity, vault, mut session) = vault_session(directory.path());
+        let peer = Identity::generate().expect("peer");
+        let conversation_id = [65u8; 16];
+        let conversation = group_with_peer(
+            &identity,
+            &peer,
+            conversation_id,
+            session.try_clone().unwrap(),
+        );
+        let mut state = ConversationState::new(
+            conversation,
+            identity.peer_id(),
+            BTreeSet::from([identity.peer_id(), peer.peer_id()]),
+        );
+        let mut queued = queued_message(&identity, &mut state, peer.peer_id(), "ciphertext");
+        let last = queued.envelope_bytes.len() - 1;
+        queued.envelope_bytes[last] ^= 0x01;
+        let message_id = queued.message_id;
+        let mut pending_receipts = HashMap::new();
+        pending_receipts.insert(message_id, BTreeSet::from([peer.peer_id()]));
+        let mut message_conversations = HashMap::new();
+        message_conversations.insert(message_id, conversation_id);
+        let mut offline_queue = VecDeque::new();
+        offline_queue.push_back(queued);
+        persist_full_state(
+            &identity,
+            &mut session,
+            conversation_id,
+            &state,
+            None,
+            &pending_receipts,
+            &message_conversations,
+            &offline_queue,
+        );
         drop(session);
 
         let storage = vault

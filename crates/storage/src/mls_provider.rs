@@ -19,14 +19,8 @@ use serde::Serialize;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use super::mls_state::StagedMlsWrite;
+use super::mls_state::{GLOBAL_PROVIDER_GROUP, StagedMlsWrite};
 use super::{Session, StorageError};
-
-/// Reserved group id used for provider entries that are not scoped to a group
-/// (signature keys, KeyPackages, epoch key pairs, and PSKs). The messenger
-/// generates 16-byte conversation ids randomly; an application must never use
-/// this value as a real group id, and group-scoped methods reject it.
-const GLOBAL_GROUP: [u8; 16] = *b"P2PMLSGLOBALROOT";
 
 const JOIN_CONFIG_LABEL: &str = "MlsGroupJoinConfig";
 const OWN_LEAF_NODES_LABEL: &str = "OwnLeafNodes";
@@ -126,7 +120,7 @@ impl StagedMlsProvider {
     /// application advances this when OpenMLS successfully commits an epoch;
     /// until then the group starts at epoch 0.
     pub fn set_group_epoch(&self, group_id: &[u8; 16], epoch: u64) -> Result<(), MlsProviderError> {
-        if *group_id == GLOBAL_GROUP {
+        if *group_id == GLOBAL_PROVIDER_GROUP {
             return Err(MlsProviderError::UnsupportedGroupId);
         }
         self.epochs.borrow_mut().insert(*group_id, epoch);
@@ -154,7 +148,7 @@ impl StagedMlsProvider {
         let epochs = self.epochs.borrow();
         let mut writes = Vec::with_capacity(staged.len());
         for ((group_id, label, key), value) in staged.iter() {
-            let epoch = if *group_id == GLOBAL_GROUP {
+            let epoch = if *group_id == GLOBAL_PROVIDER_GROUP {
                 0
             } else {
                 epochs.get(group_id).copied().unwrap_or(0)
@@ -183,7 +177,7 @@ impl StagedMlsProvider {
         // tagged structure so this works for both the pinned `VLBytes` form and
         // the newer compact byte-vector form.
         let raw = extract_bytes(&serde_json::to_value(group_id)?);
-        if raw.len() != 16 || raw.as_slice() == GLOBAL_GROUP {
+        if raw.len() != 16 || raw.as_slice() == GLOBAL_PROVIDER_GROUP {
             return Err(MlsProviderError::UnsupportedGroupId);
         }
         let mut bytes = [0u8; 16];
@@ -550,7 +544,7 @@ impl StorageProvider<CURRENT_VERSION> for StagedMlsProvider {
     ) -> Result<(), Self::Error> {
         let key = Self::key_bytes(public_key)?;
         self.stage_put(
-            GLOBAL_GROUP,
+            GLOBAL_PROVIDER_GROUP,
             SIGNATURE_KEY_PAIR_LABEL,
             key,
             Self::value_bytes(signature_key_pair)?,
@@ -567,7 +561,7 @@ impl StorageProvider<CURRENT_VERSION> for StagedMlsProvider {
     ) -> Result<(), Self::Error> {
         let key = Self::key_bytes(public_key)?;
         self.stage_put(
-            GLOBAL_GROUP,
+            GLOBAL_PROVIDER_GROUP,
             ENCRYPTION_KEY_PAIR_LABEL,
             key,
             Self::value_bytes(key_pair)?,
@@ -607,7 +601,7 @@ impl StorageProvider<CURRENT_VERSION> for StagedMlsProvider {
     ) -> Result<(), Self::Error> {
         let key = Self::key_bytes(hash_ref)?;
         self.stage_put(
-            GLOBAL_GROUP,
+            GLOBAL_PROVIDER_GROUP,
             KEY_PACKAGE_LABEL,
             key,
             Self::value_bytes(key_package)?,
@@ -623,7 +617,12 @@ impl StorageProvider<CURRENT_VERSION> for StagedMlsProvider {
         psk: &PskBundle,
     ) -> Result<(), Self::Error> {
         let key = Self::key_bytes(psk_id)?;
-        self.stage_put(GLOBAL_GROUP, PSK_LABEL, key, Self::value_bytes(psk)?)
+        self.stage_put(
+            GLOBAL_PROVIDER_GROUP,
+            PSK_LABEL,
+            key,
+            Self::value_bytes(psk)?,
+        )
     }
 
     // --- group state readers ---
@@ -811,7 +810,7 @@ impl StorageProvider<CURRENT_VERSION> for StagedMlsProvider {
         public_key: &SignaturePublicKey,
     ) -> Result<Option<SignatureKeyPair>, Self::Error> {
         self.read_entity(
-            GLOBAL_GROUP,
+            GLOBAL_PROVIDER_GROUP,
             SIGNATURE_KEY_PAIR_LABEL,
             &Self::key_bytes(public_key)?,
         )
@@ -825,7 +824,7 @@ impl StorageProvider<CURRENT_VERSION> for StagedMlsProvider {
         public_key: &EncryptionKey,
     ) -> Result<Option<HpkeKeyPair>, Self::Error> {
         self.read_entity(
-            GLOBAL_GROUP,
+            GLOBAL_PROVIDER_GROUP,
             ENCRYPTION_KEY_PAIR_LABEL,
             &Self::key_bytes(public_key)?,
         )
@@ -859,7 +858,11 @@ impl StorageProvider<CURRENT_VERSION> for StagedMlsProvider {
         &self,
         hash_ref: &KeyPackageRef,
     ) -> Result<Option<KeyPackage>, Self::Error> {
-        self.read_entity(GLOBAL_GROUP, KEY_PACKAGE_LABEL, &Self::key_bytes(hash_ref)?)
+        self.read_entity(
+            GLOBAL_PROVIDER_GROUP,
+            KEY_PACKAGE_LABEL,
+            &Self::key_bytes(hash_ref)?,
+        )
     }
 
     async fn psk<
@@ -869,7 +872,7 @@ impl StorageProvider<CURRENT_VERSION> for StagedMlsProvider {
         &self,
         psk_id: &PskId,
     ) -> Result<Option<PskBundle>, Self::Error> {
-        self.read_entity(GLOBAL_GROUP, PSK_LABEL, &Self::key_bytes(psk_id)?)
+        self.read_entity(GLOBAL_PROVIDER_GROUP, PSK_LABEL, &Self::key_bytes(psk_id)?)
     }
 
     // --- deleters ---
@@ -1021,7 +1024,7 @@ impl StorageProvider<CURRENT_VERSION> for StagedMlsProvider {
         public_key: &SignaturePublicKey,
     ) -> Result<(), Self::Error> {
         self.stage_delete(
-            GLOBAL_GROUP,
+            GLOBAL_PROVIDER_GROUP,
             SIGNATURE_KEY_PAIR_LABEL,
             Self::key_bytes(public_key)?,
         )
@@ -1032,7 +1035,7 @@ impl StorageProvider<CURRENT_VERSION> for StagedMlsProvider {
         public_key: &EncryptionKey,
     ) -> Result<(), Self::Error> {
         self.stage_delete(
-            GLOBAL_GROUP,
+            GLOBAL_PROVIDER_GROUP,
             ENCRYPTION_KEY_PAIR_LABEL,
             Self::key_bytes(public_key)?,
         )
@@ -1058,13 +1061,17 @@ impl StorageProvider<CURRENT_VERSION> for StagedMlsProvider {
         &self,
         hash_ref: &KeyPackageRef,
     ) -> Result<(), Self::Error> {
-        self.stage_delete(GLOBAL_GROUP, KEY_PACKAGE_LABEL, Self::key_bytes(hash_ref)?)
+        self.stage_delete(
+            GLOBAL_PROVIDER_GROUP,
+            KEY_PACKAGE_LABEL,
+            Self::key_bytes(hash_ref)?,
+        )
     }
 
     async fn delete_psk<PskKey: traits::PskId<CURRENT_VERSION>>(
         &self,
         psk_id: &PskKey,
     ) -> Result<(), Self::Error> {
-        self.stage_delete(GLOBAL_GROUP, PSK_LABEL, Self::key_bytes(psk_id)?)
+        self.stage_delete(GLOBAL_PROVIDER_GROUP, PSK_LABEL, Self::key_bytes(psk_id)?)
     }
 }

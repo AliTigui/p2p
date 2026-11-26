@@ -260,6 +260,31 @@ impl Conversation {
         Ok(())
     }
 
+    /// Rebuild one outbound message from an authenticated local restore record.
+    /// Only non-delivered states are accepted: a receipt must still be observed
+    /// before the application may show `Delivered`.
+    pub fn restore_outgoing(
+        &mut self,
+        message_id: &[u8; 16],
+        state: DeliveryState,
+    ) -> Result<(), MessageError> {
+        if !matches!(state, DeliveryState::Queued | DeliveryState::SentToPeer) {
+            return Err(MessageError::InvalidStateTransition);
+        }
+        self.outgoing.insert(*message_id, state);
+        Ok(())
+    }
+
+    /// Restore the next local sequence from an authenticated snapshot so a new
+    /// message cannot reuse a sequence number that predates the restart.
+    pub fn restore_sequence(&mut self, sequence: u64) -> Result<(), MessageError> {
+        if sequence == 0 {
+            return Err(MessageError::SequenceExhausted);
+        }
+        self.next_sequence = self.next_sequence.max(sequence);
+        Ok(())
+    }
+
     pub fn delivery_state(&self, message_id: &[u8; 16]) -> Option<DeliveryState> {
         self.outgoing.get(message_id).copied()
     }

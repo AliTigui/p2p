@@ -32,7 +32,10 @@ pub use control_log::{
     ControlLogState, ControlRecordOutcome, MAX_CONTROL_LOG_ENTRIES, MAX_CONTROL_PEER_BYTES,
 };
 pub use mls_provider::{MlsProviderError, StagedMlsProvider};
-pub use mls_state::{MAX_MLS_GROUPS, MAX_MLS_STATE_BYTES, MAX_MLS_STATE_ENTRIES, MlsStateEntry};
+pub use mls_state::{
+    GLOBAL_PROVIDER_GROUP, MAX_MLS_GROUPS, MAX_MLS_STATE_BYTES, MAX_MLS_STATE_ENTRIES,
+    MlsStateEntry,
+};
 
 const DATABASE_NAME: &str = "profile.db";
 const MASTER_AAD: &[u8] = b"p2p-messenger/master-key-wrap/v1";

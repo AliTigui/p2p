@@ -788,6 +788,52 @@ fn tampered_mls_state_is_rejected_on_unlock() {
 }
 
 #[test]
+fn mls_state_from_another_profile_cannot_be_restored() {
+    let directory_a = tempfile::tempdir().expect("temp dir a");
+    let directory_b = tempfile::tempdir().expect("temp dir b");
+    let identity_a = Identity::generate().expect("identity a");
+    let identity_b = Identity::generate().expect("identity b");
+    let vault_a = Vault::open(directory_a.path()).expect("vault a");
+    let vault_b = Vault::open(directory_b.path()).expect("vault b");
+    let mut session_a = vault_a
+        .create(USERNAME, PASSWORD, &identity_a)
+        .expect("create a");
+    let mut session_b = vault_b
+        .create(USERNAME, PASSWORD, &identity_b)
+        .expect("create b");
+    let group_id = [13u8; 16];
+    session_a
+        .store_mls_state(&group_id, "tree", b"node", 1, MLS_STATE_SENTINEL.as_bytes())
+        .expect("store in profile a");
+    session_b
+        .store_mls_state(&group_id, "tree", b"node", 1, b"other-profile-state")
+        .expect("store in profile b");
+    drop(session_a);
+    drop(session_b);
+
+    let source = rusqlite::Connection::open(vault_a.database_path()).expect("open source database");
+    let ciphertext: Vec<u8> = source
+        .query_row("SELECT ciphertext FROM mls_state LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .expect("read source ciphertext");
+    drop(source);
+    let target = rusqlite::Connection::open(vault_b.database_path()).expect("open target database");
+    target
+        .execute(
+            "UPDATE mls_state SET ciphertext = ?1",
+            rusqlite::params![ciphertext],
+        )
+        .expect("copy ciphertext from another profile");
+    drop(target);
+
+    assert!(
+        vault_b.unlock(PASSWORD).is_err(),
+        "another profile's MLS state must fail closed"
+    );
+}
+
+#[test]
 fn password_change_keeps_encrypted_mls_state_readable() {
     let directory = tempfile::tempdir().expect("temp dir");
     let identity = Identity::generate().expect("identity");
@@ -1005,4 +1051,311 @@ fn restoring_whole_vault_including_anchor_is_not_detected() {
             .map(|value| value.as_slice()),
         Some(b"MLS_ANCHOR_WHOLE_VAULT_25".as_slice())
     );
+}
+
+/// Every label implemented by the vault-backed OpenMLS `StorageProvider`.
+const MLS_PROVIDER_LABELS: &[&str] = &[
+    "MlsGroupJoinConfig",
+    "OwnLeafNodes",
+    "GroupState",
+    "QueuedProposal",
+    "ProposalQueueRefs",
+    "OwnLeafNodeIndex",
+    "EpochSecrets",
+    "ResumptionPsk",
+    "MessageSecrets",
+    "Tree",
+    "GroupContext",
+    "InterimTranscriptHash",
+    "ConfirmationTag",
+    "SignatureKeyPair",
+    "EncryptionKeyPair",
+    "EpochKeyPairs",
+    "KeyPackage",
+    "Psk",
+];
+
+type MlsStateRow = (Vec<u8>, Vec<u8>, i64, Vec<u8>, Vec<u8>);
+type MlsGroupRow = (Vec<u8>, Vec<u8>, i64, Vec<u8>);
+
+fn mls_state_rows(conn: &rusqlite::Connection) -> Vec<MlsStateRow> {
+    let mut statement = conn
+        .prepare(
+            "SELECT group_bi, entity_bi, epoch, ciphertext, chain_hash
+             FROM mls_state ORDER BY group_bi, entity_bi",
+        )
+        .expect("prepare MLS state snapshot");
+    statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .expect("query MLS state snapshot")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read MLS state snapshot")
+}
+
+fn restore_mls_state_rows(conn: &rusqlite::Connection, rows: &[MlsStateRow]) {
+    for (group_bi, entity_bi, epoch, ciphertext, chain_hash) in rows {
+        conn.execute(
+            "UPDATE mls_state SET group_bi = ?1, epoch = ?2, ciphertext = ?3, chain_hash = ?4
+             WHERE entity_bi = ?5",
+            rusqlite::params![group_bi, epoch, ciphertext, chain_hash, entity_bi],
+        )
+        .expect("restore MLS state row");
+    }
+}
+
+fn mls_group_rows(conn: &rusqlite::Connection) -> Vec<MlsGroupRow> {
+    let mut statement = conn
+        .prepare("SELECT group_bi, ciphertext, epoch, chain FROM mls_groups ORDER BY group_bi")
+        .expect("prepare MLS group snapshot");
+    statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .expect("query MLS group snapshot")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read MLS group snapshot")
+}
+
+fn restore_mls_group_rows(conn: &rusqlite::Connection, rows: &[MlsGroupRow]) {
+    for (group_bi, ciphertext, epoch, chain) in rows {
+        conn.execute(
+            "UPDATE mls_groups SET ciphertext = ?1, epoch = ?2, chain = ?3 WHERE group_bi = ?4",
+            rusqlite::params![ciphertext, epoch, chain, group_bi],
+        )
+        .expect("restore MLS group row");
+    }
+}
+
+#[test]
+fn every_mls_provider_entity_class_ciphertext_is_authenticated() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let identity = Identity::generate().expect("identity");
+    let vault = Vault::open(directory.path()).expect("vault");
+    let group = [71u8; 16];
+    let mut session = vault
+        .create(USERNAME, PASSWORD, &identity)
+        .expect("create vault");
+    for (index, label) in MLS_PROVIDER_LABELS.iter().enumerate() {
+        session
+            .store_mls_state(
+                &group,
+                label,
+                label.as_bytes(),
+                1,
+                format!("{label}-sentinel-{index}").as_bytes(),
+            )
+            .expect("store provider class");
+    }
+
+    let conn = rusqlite::Connection::open(vault.database_path()).expect("open database");
+    let rows = mls_state_rows(&conn);
+    assert_eq!(
+        rows.len(),
+        MLS_PROVIDER_LABELS.len(),
+        "each provider class must produce one authenticated row"
+    );
+    for (index, (_, _, _, ciphertext, _)) in rows.iter().enumerate() {
+        let mut tampered = ciphertext.clone();
+        tampered[0] ^= 1;
+        conn.execute(
+            "UPDATE mls_state SET ciphertext = ?1 WHERE entity_bi = ?2",
+            rusqlite::params![tampered, &rows[index].1],
+        )
+        .expect("tamper provider class ciphertext");
+        assert!(
+            session.verify_mls_state().is_err(),
+            "provider class {} must fail closed when its ciphertext is tampered",
+            MLS_PROVIDER_LABELS[index]
+        );
+        conn.execute(
+            "UPDATE mls_state SET ciphertext = ?1 WHERE entity_bi = ?2",
+            rusqlite::params![ciphertext, &rows[index].1],
+        )
+        .expect("restore provider class ciphertext");
+        session.verify_mls_state().expect("restored provider class");
+    }
+}
+
+#[test]
+fn mls_state_aad_blind_indexes_and_chain_links_are_authenticated() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let identity = Identity::generate().expect("identity");
+    let vault = Vault::open(directory.path()).expect("vault");
+    let group_a = [72u8; 16];
+    let group_b = [73u8; 16];
+    let mut session = vault
+        .create(USERNAME, PASSWORD, &identity)
+        .expect("create vault");
+    for group in [group_a, group_b] {
+        session
+            .store_mls_state(&group, "tree", b"node", 4, b"AAD_SENTINEL")
+            .expect("store state");
+    }
+    let conn = conn_for(&vault);
+    let state = mls_state_rows(&conn);
+    let groups = mls_group_rows(&conn);
+
+    // Authenticated epoch column: changing it changes the AEAD AAD.
+    let mut epoch_state = state.clone();
+    epoch_state[0].2 += 1;
+    restore_mls_state_rows(&conn, &epoch_state);
+    assert!(
+        session.verify_mls_state().is_err(),
+        "epoch AAD must be bound"
+    );
+    restore_mls_state_rows(&conn, &state);
+    session.verify_mls_state().expect("epoch restored");
+
+    // Entity blind index: swapping two indexes breaks both record AAD and the
+    // authenticated label/key binding inside each record.
+    let temporary_index = [0xffu8; 32].to_vec();
+    conn.execute(
+        "UPDATE mls_state SET entity_bi = ?1 WHERE entity_bi = ?2",
+        rusqlite::params![temporary_index, &state[0].1],
+    )
+    .expect("move first entity index aside");
+    conn.execute(
+        "UPDATE mls_state SET entity_bi = ?1 WHERE entity_bi = ?2",
+        rusqlite::params![&state[0].1, &state[1].1],
+    )
+    .expect("move second entity index");
+    conn.execute(
+        "UPDATE mls_state SET entity_bi = ?1 WHERE entity_bi = ?2",
+        rusqlite::params![&state[1].1, temporary_index],
+    )
+    .expect("restore first entity index to the other slot");
+    assert!(
+        session.verify_mls_state().is_err(),
+        "entity blind indexes must be bound"
+    );
+    restore_mls_state_rows(&conn, &state);
+    session.verify_mls_state().expect("indexes restored");
+
+    // Ciphertext cannot move between authenticated entity slots.
+    let mut swapped = state.clone();
+    swapped[0].3 = state[1].3.clone();
+    restore_mls_state_rows(&conn, &swapped);
+    assert!(
+        session.verify_mls_state().is_err(),
+        "entity AAD must bind ciphertext to its index"
+    );
+    restore_mls_state_rows(&conn, &state);
+    session.verify_mls_state().expect("ciphertext restored");
+
+    // Per-row chain link.
+    let mut broken_row_chain = state.clone();
+    broken_row_chain[0].4[0] ^= 1;
+    restore_mls_state_rows(&conn, &broken_row_chain);
+    assert!(
+        session.verify_mls_state().is_err(),
+        "row chain link must be authenticated"
+    );
+    restore_mls_state_rows(&conn, &state);
+    session.verify_mls_state().expect("row chain restored");
+
+    // Per-group chain high-water mark.
+    let mut broken_group_chain = groups.clone();
+    broken_group_chain[0].3[0] ^= 1;
+    restore_mls_group_rows(&conn, &broken_group_chain);
+    assert!(
+        session.verify_mls_state().is_err(),
+        "group chain link must be authenticated"
+    );
+    restore_mls_group_rows(&conn, &groups);
+    session.verify_mls_state().expect("group chain restored");
+
+    // Group ciphertext cannot move between blind indexes.
+    let mut swapped_groups = groups.clone();
+    swapped_groups[0].1 = groups[1].1.clone();
+    restore_mls_group_rows(&conn, &swapped_groups);
+    assert!(
+        session.verify_mls_state().is_err(),
+        "group AAD must bind ciphertext to its blind index"
+    );
+    restore_mls_group_rows(&conn, &groups);
+    session
+        .verify_mls_state()
+        .expect("group ciphertext restored");
+}
+
+fn conn_for(vault: &Vault) -> rusqlite::Connection {
+    rusqlite::Connection::open(vault.database_path()).expect("open database")
+}
+
+#[test]
+fn every_mls_provider_entity_class_rejects_bounds_violations() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let identity = Identity::generate().expect("identity");
+    let vault = Vault::open(directory.path()).expect("vault");
+    let mut session = vault
+        .create(USERNAME, PASSWORD, &identity)
+        .expect("create vault");
+    let group = [74u8; 16];
+    let oversized_key = vec![9u8; 257];
+    let oversized_value = vec![9u8; p2p_storage::MAX_MLS_STATE_BYTES + 1];
+
+    for label in MLS_PROVIDER_LABELS {
+        assert!(
+            session
+                .store_mls_state(&group, label, &oversized_key, 1, b"value")
+                .is_err(),
+            "{label} must reject an oversized entity key"
+        );
+        assert!(
+            session
+                .store_mls_state(&group, label, label.as_bytes(), 1, &oversized_value)
+                .is_err(),
+            "{label} must reject an oversized value"
+        );
+    }
+    assert!(session.mls_group_ids().expect("no rows").is_empty());
+}
+
+#[test]
+fn every_byte_of_mls_state_ciphertext_and_chain_is_bound() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let identity = Identity::generate().expect("identity");
+    let vault = Vault::open(directory.path()).expect("vault");
+    let group = [75u8; 16];
+    let mut session = vault
+        .create(USERNAME, PASSWORD, &identity)
+        .expect("create vault");
+    session
+        .store_mls_state(&group, "tree", b"node", 6, b"BYTEWISE_SENTINEL")
+        .expect("store state");
+    let conn = conn_for(&vault);
+    let state = mls_state_rows(&conn);
+    assert_eq!(state.len(), 1);
+
+    let original = state[0].clone();
+    for offset in 0..original.3.len() {
+        let mut mutated = state.clone();
+        mutated[0].3[offset] ^= 1;
+        restore_mls_state_rows(&conn, &mutated);
+        assert!(
+            session.verify_mls_state().is_err(),
+            "ciphertext byte {offset} must be authenticated"
+        );
+        restore_mls_state_rows(&conn, &state);
+        session.verify_mls_state().expect("ciphertext restored");
+    }
+    for offset in 0..original.4.len() {
+        let mut mutated = state.clone();
+        mutated[0].4[offset] ^= 1;
+        restore_mls_state_rows(&conn, &mutated);
+        assert!(
+            session.verify_mls_state().is_err(),
+            "chain byte {offset} must be authenticated"
+        );
+        restore_mls_state_rows(&conn, &state);
+        session.verify_mls_state().expect("chain restored");
+    }
 }

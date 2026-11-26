@@ -13,7 +13,8 @@ use std::sync::mpsc;
 use std::thread;
 
 use egui::{
-    CentralPanel, Color32, Context, Id, Key, Layout, Panel, RichText, TextEdit, Ui, Visuals,
+    Button, CentralPanel, Color32, Context, FontFamily, FontId, Frame, Layout, Margin, Panel,
+    RichText, Stroke, TextEdit, TextStyle, Ui, Visuals, vec2,
 };
 use p2p_chat::{
     MessengerController, PeerId, QuarantineDeletionPolicy, ReleaseApproval, TransferDirection,
@@ -28,12 +29,215 @@ use rfd::FileDialog;
 use zeroize::Zeroize;
 
 use crate::model::{
-    MILESTONES, NetworkInfo, NetworkOptions, SECTIONS, Section, Theme, UnlockedInfo,
-    VaultOperation, VaultState, filter_nav, next_theme, runtime_banner, security_rows,
+    NetworkInfo, NetworkOptions, Theme, UnlockedInfo, VaultOperation, VaultState, next_theme,
+    runtime_banner, security_rows,
 };
 
-const SEARCH_ID: &str = "p2p_messenger_search";
-const ERROR_COLOR: Color32 = Color32::from_rgb(220, 120, 120);
+/// A small Material-inspired token set. These are presentation colors only;
+/// runtime state still comes from the vault and network workers.
+#[derive(Debug, Clone, Copy)]
+struct Palette {
+    primary: Color32,
+    on_primary: Color32,
+    primary_container: Color32,
+    on_primary_container: Color32,
+    surface: Color32,
+    surface_container: Color32,
+    outline: Color32,
+    text: Color32,
+    muted: Color32,
+    warning: Color32,
+    error: Color32,
+    field: Color32,
+}
+
+const DARK_PALETTE: Palette = Palette {
+    primary: Color32::from_rgb(208, 188, 255),
+    on_primary: Color32::from_rgb(56, 30, 114),
+    primary_container: Color32::from_rgb(79, 55, 139),
+    on_primary_container: Color32::from_rgb(234, 221, 255),
+    surface: Color32::from_rgb(20, 19, 24),
+    surface_container: Color32::from_rgb(39, 37, 47),
+    outline: Color32::from_rgb(105, 99, 118),
+    text: Color32::from_rgb(230, 225, 235),
+    muted: Color32::from_rgb(174, 168, 185),
+    warning: Color32::from_rgb(255, 193, 118),
+    error: Color32::from_rgb(242, 184, 181),
+    field: Color32::from_rgb(49, 47, 60),
+};
+
+const LIGHT_PALETTE: Palette = Palette {
+    primary: Color32::from_rgb(103, 80, 164),
+    on_primary: Color32::from_rgb(255, 255, 255),
+    primary_container: Color32::from_rgb(234, 221, 255),
+    on_primary_container: Color32::from_rgb(33, 0, 93),
+    surface: Color32::from_rgb(255, 251, 254),
+    surface_container: Color32::from_rgb(246, 240, 250),
+    outline: Color32::from_rgb(202, 196, 208),
+    text: Color32::from_rgb(29, 27, 32),
+    muted: Color32::from_rgb(98, 91, 113),
+    warning: Color32::from_rgb(129, 76, 0),
+    error: Color32::from_rgb(179, 38, 30),
+    field: Color32::from_rgb(255, 255, 255),
+};
+
+fn palette(theme: Theme) -> Palette {
+    match theme {
+        Theme::Dark => DARK_PALETTE,
+        Theme::Light => LIGHT_PALETTE,
+    }
+}
+
+fn material_visuals(theme: Theme, p: Palette) -> Visuals {
+    let mut visuals = match theme {
+        Theme::Dark => Visuals::dark(),
+        Theme::Light => Visuals::light(),
+    };
+    visuals.dark_mode = matches!(theme, Theme::Dark);
+    visuals.override_text_color = Some(p.text);
+    visuals.weak_text_color = Some(p.muted);
+    visuals.hyperlink_color = p.primary;
+    visuals.faint_bg_color = p.surface_container;
+    visuals.extreme_bg_color = p.field;
+    visuals.text_edit_bg_color = Some(p.field);
+    visuals.window_fill = p.surface;
+    visuals.panel_fill = p.surface;
+    visuals.window_stroke = Stroke::NONE;
+    visuals.window_corner_radius = 16u8.into();
+    visuals.menu_corner_radius = 12u8.into();
+    visuals.warn_fg_color = p.warning;
+    visuals.error_fg_color = p.error;
+    visuals.button_frame = true;
+    visuals.collapsing_header_frame = true;
+    visuals.selection.bg_fill = p.primary_container;
+    visuals.selection.stroke = Stroke::new(1.0, p.primary);
+
+    visuals.widgets.noninteractive.bg_fill = p.surface_container;
+    visuals.widgets.noninteractive.weak_bg_fill = p.surface_container;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.outline);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
+    visuals.widgets.noninteractive.corner_radius = 12u8.into();
+
+    for widget in [
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        widget.bg_fill = p.surface_container;
+        widget.weak_bg_fill = p.surface_container;
+        widget.bg_stroke = Stroke::new(1.0, p.outline);
+        widget.fg_stroke = Stroke::new(1.0, p.text);
+        widget.corner_radius = 20u8.into();
+    }
+    visuals.widgets.hovered.weak_bg_fill = p.primary_container;
+    visuals.widgets.active.weak_bg_fill = p.primary_container;
+    visuals.widgets.open.weak_bg_fill = p.primary_container;
+    visuals
+}
+
+fn apply_material_style(ctx: &Context, theme: Theme, p: Palette) {
+    ctx.all_styles_mut(|style| {
+        style.text_styles.insert(
+            TextStyle::Heading,
+            FontId::new(26.0, FontFamily::Proportional),
+        );
+        style
+            .text_styles
+            .insert(TextStyle::Body, FontId::new(15.0, FontFamily::Proportional));
+        style.text_styles.insert(
+            TextStyle::Button,
+            FontId::new(14.0, FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            TextStyle::Small,
+            FontId::new(12.0, FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            TextStyle::Monospace,
+            FontId::new(13.0, FontFamily::Monospace),
+        );
+        style.spacing.item_spacing = vec2(10.0, 8.0);
+        style.spacing.button_padding = vec2(14.0, 8.0);
+        style.spacing.interact_size = vec2(56.0, 40.0);
+        style.spacing.text_edit_width = 320.0;
+    });
+    ctx.set_visuals(material_visuals(theme, p));
+}
+
+fn card<R>(ui: &mut Ui, p: Palette, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    Frame::new()
+        .inner_margin(Margin::symmetric(18, 16))
+        .fill(p.surface_container)
+        .stroke(Stroke::new(1.0, p.outline))
+        .corner_radius(16u8)
+        .show(ui, add_contents)
+        .inner
+}
+
+fn card_title(ui: &mut Ui, p: Palette, title: &str) {
+    ui.label(
+        RichText::new(title.to_uppercase())
+            .small()
+            .strong()
+            .color(p.primary),
+    );
+    ui.add_space(4.0);
+}
+
+fn note(ui: &mut Ui, p: Palette, text: impl Into<RichText>) {
+    ui.label(text.into().small().color(p.muted));
+}
+
+fn error_label(ui: &mut Ui, p: Palette, text: impl Into<RichText>) {
+    ui.colored_label(p.error, text);
+}
+
+fn filled_button(ui: &mut Ui, p: Palette, label: impl Into<RichText>) -> bool {
+    ui.add(
+        Button::new(label.into().color(p.on_primary).strong())
+            .fill(p.primary)
+            .corner_radius(20u8)
+            .min_size(vec2(120.0, 40.0)),
+    )
+    .clicked()
+}
+
+fn tonal_button(ui: &mut Ui, p: Palette, label: impl Into<RichText>) -> bool {
+    ui.add(
+        Button::new(label.into().color(p.on_primary_container).strong())
+            .fill(p.primary_container)
+            .corner_radius(20u8)
+            .min_size(vec2(88.0, 36.0)),
+    )
+    .clicked()
+}
+
+fn tonal_button_enabled(
+    ui: &mut Ui,
+    p: Palette,
+    label: impl Into<RichText>,
+    enabled: bool,
+) -> bool {
+    let label = label.into();
+    if enabled {
+        ui.add(
+            Button::new(label.color(p.on_primary_container).strong())
+                .fill(p.primary_container)
+                .corner_radius(20u8)
+                .min_size(vec2(88.0, 36.0)),
+        )
+        .clicked()
+    } else {
+        ui.add_enabled(
+            false,
+            Button::new(label)
+                .corner_radius(20u8)
+                .min_size(vec2(88.0, 36.0)),
+        )
+        .clicked()
+    }
+}
 
 /// Write the only plaintext disk output with static errors: no chosen path,
 /// file contents, or key material is surfaced in the UI. A pre-existing
@@ -91,7 +295,6 @@ pub struct MessengerApp {
     confirm_password: String,
     form_error: Option<String>,
     theme: Theme,
-    search: String,
 }
 
 impl MessengerApp {
@@ -125,7 +328,6 @@ impl MessengerApp {
             confirm_password: String::new(),
             form_error: None,
             theme: Theme::Dark,
-            search: String::new(),
         })
     }
 
@@ -516,13 +718,9 @@ impl MessengerApp {
     }
 
     pub fn render(&mut self, ui: &mut Ui) {
-        let ctx = ui.ctx().clone();
-        ctx.set_visuals(match self.theme {
-            Theme::Dark => Visuals::dark(),
-            Theme::Light => Visuals::light(),
-        });
+        let p = palette(self.theme);
+        apply_material_style(ui.ctx(), self.theme, p);
 
-        self.handle_shortcuts(&ctx);
         self.poll_worker();
         self.poll_chat();
 
@@ -533,94 +731,64 @@ impl MessengerApp {
         let active_conversation = self.chat.as_ref().and_then(|chat| chat.active_info());
         let security = security_rows(&state, network_info.as_ref(), active_conversation.as_ref());
 
-        {
-            Panel::top("top_bar").show(ui, |ui| {
+        Panel::top("top_bar")
+            .frame(
+                Frame::new()
+                    .inner_margin(Margin::symmetric(20, 10))
+                    .fill(p.surface),
+            )
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("P2P Messenger");
-                    ui.label(
-                        RichText::new(banner)
-                            .small()
-                            .color(Color32::from_rgb(220, 160, 80)),
-                    );
+                    ui.label(RichText::new("P2P Messenger").size(20.0).strong());
+                    ui.label(RichText::new(banner).small().color(p.warning));
                     ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                        if unlocked && ui.button("Lock").clicked() {
+                        if unlocked && tonal_button(ui, p, "Lock") {
                             self.lock();
                         }
                         let label = match self.theme {
                             Theme::Dark => "Light mode",
                             Theme::Light => "Dark mode",
                         };
-                        if ui.button(label).clicked() {
+                        if tonal_button(ui, p, label) {
                             self.theme = next_theme(self.theme);
                         }
                     });
                 });
             });
 
-            Panel::left("sidebar")
-                .resizable(false)
-                .default_size(250.0)
-                .show(ui, |ui| {
-                    ui.add(
-                        TextEdit::singleline(&mut self.search)
-                            .id(Id::new(SEARCH_ID))
-                            .hint_text("Search (Ctrl/⌘+K)"),
-                    );
-                    ui.add_space(8.0);
-
-                    let visible = filter_nav(&self.search);
-                    for section in SECTIONS {
-                        let items: Vec<_> = visible
-                            .iter()
-                            .filter(|item| item.section == section)
-                            .collect();
-                        if items.is_empty() {
-                            continue;
-                        }
-                        ui.add_space(10.0);
-                        ui.label(RichText::new(Section::label(section)).small().weak());
-                        for item in items {
-                            ui.add_enabled(false, egui::Button::new(item.label));
-                        }
-                    }
-
-                    if visible.is_empty() {
-                        ui.add_space(8.0);
-                        ui.label(format!("No section matches “{}”.", self.search));
-                    }
-                    ui.add_space(14.0);
-                    ui.label(
-                        RichText::new(
-                            "Navigation is a placeholder. Local vault controls are on the right.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                });
-
-            Panel::right("details")
-                .resizable(false)
-                .default_size(290.0)
-                .show(ui, |ui| {
-                    ui.label(RichText::new("SECURITY & CONNECTION").small().weak());
-                    ui.add_space(8.0);
+        Panel::right("details")
+            .resizable(false)
+            .default_size(290.0)
+            .frame(
+                Frame::new()
+                    .inner_margin(Margin::symmetric(12, 12))
+                    .fill(p.surface),
+            )
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| card(ui, p, |ui| {
+                    card_title(ui, p, "Observed status");
                     for row in &security {
-                        ui.label(RichText::new(row.label).small().weak());
+                        ui.label(RichText::new(row.label).small().color(p.muted));
                         ui.label(RichText::new(&row.value).small());
-                        ui.separator();
+                        ui.add_space(5.0);
                     }
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new(
-                            "Statuses reflect observed runtime state. Unimplemented features are shown as such.",
-                        )
-                        .small()
-                        .weak(),
+                    ui.add_space(2.0);
+                    note(
+                        ui,
+                        p,
+                        "Statuses reflect observed runtime state. Unimplemented features are shown as such.",
                     );
-                });
+                }));
+            });
 
-            CentralPanel::default().show(ui, |ui| {
-                ui.add_space(24.0);
+        CentralPanel::default()
+            .frame(
+                Frame::new()
+                    .inner_margin(Margin::symmetric(20, 16))
+                    .fill(p.surface),
+            )
+            .show(ui, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
                 match &state {
                     VaultState::Missing
                     | VaultState::Failed {
@@ -628,10 +796,16 @@ impl MessengerApp {
                         ..
                     } => self.render_create(ui),
                     VaultState::Busy(VaultOperation::Creating) => {
-                        ui.heading("Creating your vault");
-                        ui.add_space(8.0);
-                        ui.spinner();
-                        ui.label("Running Argon2id on a worker thread; the interface stays responsive.");
+                        card(ui, p, |ui| {
+                            ui.heading("Creating your vault");
+                            ui.add_space(8.0);
+                            ui.spinner();
+                            note(
+                                ui,
+                                p,
+                                "Running Argon2id on a worker thread; the interface stays responsive.",
+                            );
+                        });
                     }
                     VaultState::Locked
                     | VaultState::Failed {
@@ -639,242 +813,83 @@ impl MessengerApp {
                         ..
                     } => self.render_unlock(ui, &state),
                     VaultState::Busy(VaultOperation::Unlocking) => {
-                        ui.heading("Unlocking your vault");
-                        ui.add_space(8.0);
-                        ui.spinner();
-                        ui.label("Verifying your password on a worker thread; the interface stays responsive.");
+                        card(ui, p, |ui| {
+                            ui.heading("Unlocking your vault");
+                            ui.add_space(8.0);
+                            ui.spinner();
+                            note(
+                                ui,
+                                p,
+                                "Verifying your password on a worker thread; the interface stays responsive.",
+                            );
+                        });
                     }
                     VaultState::Unlocked(info) => self.render_unlocked(ui, info),
                 }
-
-                ui.add_space(18.0);
-                ui.separator();
-                ui.add_space(10.0);
-                ui.label(RichText::new("IMPLEMENTATION ROADMAP").small().weak());
-                ui.add_space(6.0);
-                for milestone in MILESTONES {
-                    ui.horizontal(|ui| {
-                        ui.label(if milestone.done { "✓" } else { "·" });
-                        if milestone.done {
-                            ui.label(milestone.label);
-                        } else {
-                            ui.label(RichText::new(milestone.label).weak());
-                        }
-                    });
-                }
             });
-        }
+        });
     }
 
     fn render_create(&mut self, ui: &mut Ui) {
-        ui.heading("Create your local vault");
-        ui.add_space(8.0);
-        ui.label(
-            "A random master key will be generated on this device and wrapped with Argon2id. \
-             Your password is never stored. There is no account, server, or recovery service.",
-        );
-        ui.add_space(12.0);
-        ui.label("Profile name");
-        ui.add(TextEdit::singleline(&mut self.username).hint_text("Display name"));
-        ui.label("Password");
-        ui.add(TextEdit::singleline(&mut self.password).password(true));
-        ui.label("Confirm password");
-        ui.add(TextEdit::singleline(&mut self.confirm_password).password(true));
-        if let VaultState::Failed { message, .. } = &self.state {
-            ui.colored_label(ERROR_COLOR, format!("Last attempt failed: {message}"));
-        } else {
-            self.render_form_error(ui);
-        }
-        ui.add_space(10.0);
-        if ui.button("Create vault").clicked() {
-            self.submit_create();
-        }
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new(
+        let p = palette(self.theme);
+        card(ui, p, |ui| {
+            ui.heading("Create your local vault");
+            ui.add_space(8.0);
+            ui.label(
+                "A random master key will be generated on this device and wrapped with Argon2id. \
+                 Your password is never stored. There is no account, server, or recovery service.",
+            );
+            ui.add_space(12.0);
+            ui.label("Profile name");
+            ui.add(TextEdit::singleline(&mut self.username).hint_text("Display name"));
+            ui.label("Password");
+            ui.add(TextEdit::singleline(&mut self.password).password(true));
+            ui.label("Confirm password");
+            ui.add(TextEdit::singleline(&mut self.confirm_password).password(true));
+            if let VaultState::Failed { message, .. } = &self.state {
+                error_label(ui, p, format!("Last attempt failed: {message}"));
+            } else {
+                self.render_form_error(ui);
+            }
+            ui.add_space(10.0);
+            if filled_button(ui, p, "Create vault") {
+                self.submit_create();
+            }
+            ui.add_space(6.0);
+            note(
+                ui,
+                p,
                 "Losing this password means permanent loss of the vault; no recovery is offered.",
-            )
-            .small()
-            .weak(),
-        );
+            );
+        });
     }
 
     fn render_unlock(&mut self, ui: &mut Ui, state: &VaultState) {
-        ui.heading("Unlock your vault");
-        ui.add_space(8.0);
-        ui.label(format!(
-            "Vault location: {}",
-            self.vault.directory().display()
-        ));
-        ui.add_space(12.0);
-        ui.label("Password");
-        ui.add(TextEdit::singleline(&mut self.password).password(true));
-        if let VaultState::Failed { message, .. } = state {
-            ui.colored_label(ERROR_COLOR, format!("Last attempt failed: {message}"));
-        } else {
-            self.render_form_error(ui);
-        }
-        ui.add_space(10.0);
-        if ui.button("Unlock").clicked() {
-            self.submit_unlock();
-        }
+        let p = palette(self.theme);
+        card(ui, p, |ui| {
+            ui.heading("Unlock your vault");
+            ui.add_space(8.0);
+            ui.label(format!(
+                "Vault location: {}",
+                self.vault.directory().display()
+            ));
+            ui.add_space(12.0);
+            ui.label("Password");
+            ui.add(TextEdit::singleline(&mut self.password).password(true));
+            if let VaultState::Failed { message, .. } = state {
+                error_label(ui, p, format!("Last attempt failed: {message}"));
+            } else {
+                self.render_form_error(ui);
+            }
+            ui.add_space(10.0);
+            if filled_button(ui, p, "Unlock") {
+                self.submit_unlock();
+            }
+        });
     }
 
     fn render_unlocked(&mut self, ui: &mut Ui, info: &UnlockedInfo) {
-        ui.heading("Vault unlocked");
-        ui.add_space(8.0);
-        ui.label(format!("Profile: {}", info.profile_id));
-        ui.label(format!("Peer ID: {}", info.peer_id));
-        ui.label(format!("Fingerprint: {}", info.fingerprint));
-        ui.label(format!("Key protection: {}", info.kdf_summary));
-
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(8.0);
-        ui.label(RichText::new("DIRECT CONNECTION").small().weak());
-        let network = self.network_info();
-        match &network {
-            Some(net) => {
-                ui.label(format!("Status: {}", net.connection));
-                if net.listen_addresses.is_empty() {
-                    ui.label("Listening: waiting for a local address");
-                } else {
-                    for address in &net.listen_addresses {
-                        ui.label(format!("Listening on: {address}"));
-                    }
-                }
-            }
-            None => {
-                ui.label("Network worker is not running.");
-            }
-        }
-        ui.add_space(8.0);
-        ui.label("Peer address (must include /p2p/<peer-id>)");
-        ui.add(
-            TextEdit::singleline(&mut self.peer_address)
-                .hint_text("/ip4/127.0.0.1/tcp/4001/p2p/12D3…"),
-        );
-        let (connect, disconnect) = ui
-            .horizontal(|ui| {
-                (
-                    ui.button("Connect").clicked(),
-                    ui.button("Disconnect all").clicked(),
-                )
-            })
-            .inner;
-        if connect {
-            self.connect_peer();
-        }
-        if disconnect
-            && let Some(chat) = self.chat.as_mut()
-            && let Err(error) = chat.disconnect_all()
-        {
-            self.chat_error = Some(error.to_string());
-        }
-        if let Some(chat) = self.chat.as_ref() {
-            let saved = chat.redial_peers();
-            if saved.is_empty() {
-                ui.label(
-                    RichText::new("Automatic redial: no saved address")
-                        .small()
-                        .weak(),
-                );
-            } else {
-                for peer in saved {
-                    let short: String = peer.to_string().chars().take(12).collect();
-                    ui.label(
-                        RichText::new(format!(
-                            "Redial {short}: {}",
-                            chat.redial_state(&peer).description()
-                        ))
-                        .small()
-                        .weak(),
-                    );
-                }
-            }
-        }
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new(
-                "By default no bootstrap peers, DHT servers, or relays are configured. Direct dial requires an address you supply.",
-            )
-            .small()
-            .weak(),
-        );
-
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new("OPTIONAL NETWORK CAPABILITIES")
-                .small()
-                .weak(),
-        );
-        ui.checkbox(
-            &mut self.network_options.enable_identify,
-            "Identify (bounded protocol metadata)",
-        );
-        ui.checkbox(
-            &mut self.network_options.enable_ping,
-            "Ping (low frequency)",
-        );
-        ui.checkbox(
-            &mut self.network_options.enable_mdns,
-            "mDNS local discovery (advisory only)",
-        );
-        ui.checkbox(
-            &mut self.network_options.enable_kad,
-            "Kademlia discovery (user-supplied bootstrap peers only)",
-        );
-        ui.checkbox(
-            &mut self.network_options.enable_autonat,
-            "AutoNAT best-effort status probe",
-        );
-        ui.checkbox(
-            &mut self.network_options.enable_dcutr,
-            "DCUtR hole punching when a relayed path exists",
-        );
-        ui.horizontal(|ui| {
-            ui.label("Relay mode");
-            egui::ComboBox::from_id_salt("p2p_messenger_relay_mode")
-                .selected_text(self.network_options.relay_mode.description())
-                .show_ui(ui, |ui| {
-                    for (mode, label) in [
-                        (RelayMode::Off, "Off"),
-                        (RelayMode::Client, "Client"),
-                        (RelayMode::Server, "Server"),
-                    ] {
-                        ui.selectable_value(&mut self.network_options.relay_mode, mode, label);
-                    }
-                });
-        });
-        ui.label(
-            "Kademlia bootstrap addresses (one per line or comma-separated; /p2p/<peer-id> required)",
-        );
-        ui.add(TextEdit::multiline(
-            &mut self.network_options.kad_bootstrap_peers,
-        ));
-        ui.label("Relay server addresses (client mode only; direct addresses required)");
-        ui.add(TextEdit::multiline(&mut self.network_options.relay_servers));
-        ui.label(
-            RichText::new(
-                "All optional capabilities are off and address lists are empty by default. \
-                 Discovery candidates are advisory only: they are never auto-dialed, trusted, \
-                 or treated as fingerprint-verified contacts. Relay operators can observe IPs, \
-                 timing, and sizes and can deny service; file transfer over a relay is disabled. \
-                 AutoNAT and DCUtR are best effort, not universal NAT traversal. There is no \
-                 Tor/I2P/mixnet, anonymity, or metadata privacy claim. Settings apply when the \
-                 network worker starts: lock and unlock the vault after changing them.",
-            )
-            .small()
-            .weak(),
-        );
-
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(8.0);
-        ui.label(RichText::new("MLS GROUPS").small().weak());
-
+        let p = palette(self.theme);
         let conversations = self
             .chat
             .as_ref()
@@ -910,100 +925,244 @@ impl MessengerApp {
             None => Vec::new(),
         };
 
-        if conversations.is_empty() {
-            ui.label("No MLS conversation has been started in this session.");
-        } else {
-            for item in &conversations {
-                let pending = item
-                    .pending_operation
-                    .map(|operation| format!(" · pending {}", operation.description()))
-                    .unwrap_or_default();
-                ui.label(format!(
-                    "{} · epoch {} · admin {} · {} members · {} channels · {}{}",
-                    short(&item.peer.to_string(), 14),
-                    item.epoch,
-                    short(&item.admin.to_string(), 14),
-                    item.members.len(),
-                    item.channels.len(),
-                    item.status.description(),
-                    pending
-                ));
-            }
-        }
+        card(ui, p, |ui| {
+            ui.heading("Vault unlocked");
+            ui.add_space(8.0);
+            ui.label(format!("Profile: {}", info.profile_id));
+            ui.label(format!("Peer ID: {}", info.peer_id));
+            ui.label(format!("Fingerprint: {}", info.fingerprint));
+            note(ui, p, format!("Key protection: {}", info.kdf_summary));
+        });
 
-        ui.add_space(8.0);
-        ui.label("Connected peer ID for a new 1:1 MLS group");
-        ui.add(
-            TextEdit::singleline(&mut self.contact_peer_id)
-                .hint_text("12D3Koo… (from the peer's identity panel)"),
-        );
-        if ui.button("Start encrypted chat").clicked() {
-            self.start_conversation();
-        }
-
-        ui.add_space(8.0);
-        match &active_conversation {
-            Some(active) => {
-                ui.label(format!(
-                    "Active MLS group: {} · epoch {} · {}",
-                    short(&active.peer.to_string(), 14),
-                    active.epoch,
-                    active.status.description()
-                ));
-                ui.label(format!("Admin: {}", short(&active.admin.to_string(), 14)));
-                let pending = match active.pending_operation {
-                    Some(operation) => format!(
-                        "Pending: {} (waiting for acknowledgements)",
-                        operation.description()
-                    ),
-                    None => "Pending: none".to_owned(),
-                };
-                ui.label(RichText::new(pending).small());
-                ui.label("Members in local view:");
-                for member in &active.members {
-                    let role = if Some(*member) == local_peer {
-                        " (you)"
-                    } else if *member == active.admin {
-                        " (admin)"
+        card(ui, p, |ui| {
+            card_title(ui, p, "Direct connection");
+            let network = self.network_info();
+            match &network {
+                Some(net) => {
+                    ui.label(format!("Status: {}", net.connection));
+                    if net.listen_addresses.is_empty() {
+                        ui.label("Listening: waiting for a local address");
                     } else {
-                        ""
-                    };
-                    ui.label(format!("  {}{role}", short(&member.to_string(), 14)));
-                }
-
-                ui.add_space(6.0);
-                ui.label(RichText::new("CHANNELS IN THIS MLS GROUP").small().weak());
-                for channel in &active.channels {
-                    let selected = active.active_channel == Some(channel.channel_id);
-                    let marker = if selected { "● " } else { "   " };
-                    let policy = if channel.acknowledged {
-                        "policy acknowledged"
-                    } else {
-                        "policy awaiting receipts"
-                    };
-                    let label = format!(
-                        "{marker}{} · rev {} · {} allowed · {policy}",
-                        short(&channel.name, 20),
-                        channel.revision,
-                        channel.members.len()
-                    );
-                    if ui.button(label).clicked() {
-                        self.select_channel(channel.channel_id);
+                        for address in &net.listen_addresses {
+                            ui.label(format!("Listening on: {address}"));
+                        }
                     }
                 }
-                ui.add(
-                    TextEdit::singleline(&mut self.channel_name)
-                        .hint_text("New channel name (admin only)"),
-                );
-                let idle = active.pending_operation.is_none();
-                let can_create = idle && local_peer == Some(active.admin);
-                if ui
-                    .add_enabled(can_create, egui::Button::new("Create channel"))
-                    .clicked()
-                {
-                    self.create_channel();
+                None => {
+                    ui.label("Network worker is not running.");
                 }
-                ui.label(
+            }
+            ui.add_space(8.0);
+            ui.label("Peer address (must include /p2p/<peer-id>)");
+            ui.add(
+                TextEdit::singleline(&mut self.peer_address)
+                    .hint_text("/ip4/127.0.0.1/tcp/4001/p2p/12D3…"),
+            );
+            let (connect, disconnect) = ui
+                .horizontal(|ui| {
+                    (
+                        filled_button(ui, p, "Connect"),
+                        tonal_button(ui, p, "Disconnect all"),
+                    )
+                })
+                .inner;
+            if connect {
+                self.connect_peer();
+            }
+            if disconnect
+                && let Some(chat) = self.chat.as_mut()
+                && let Err(error) = chat.disconnect_all()
+            {
+                self.chat_error = Some(error.to_string());
+            }
+            if let Some(chat) = self.chat.as_ref() {
+                let saved = chat.redial_peers();
+                if saved.is_empty() {
+                    note(ui, p, "Automatic redial: no saved address");
+                } else {
+                    for peer in saved {
+                        let short: String = peer.to_string().chars().take(12).collect();
+                        note(
+                            ui,
+                            p,
+                            format!("Redial {short}: {}", chat.redial_state(&peer).description()),
+                        );
+                    }
+                }
+            }
+            ui.add_space(6.0);
+            note(
+                ui,
+                p,
+                "By default no bootstrap peers, DHT servers, or relays are configured. Direct dial requires an address you supply.",
+            );
+        });
+
+        card(ui, p, |ui| {
+            note(
+                ui,
+                p,
+                "All optional capabilities are off and address lists are empty by default. \
+                 Discovery candidates are advisory only: they are never auto-dialed, trusted, \
+                 or treated as fingerprint-verified contacts. Relay operators can observe IPs, \
+                 timing, and sizes and can deny service; file transfer over a relay is disabled. \
+                 AutoNAT and DCUtR are best effort, not universal NAT traversal. There is no \
+                 Tor/I2P/mixnet, anonymity, or metadata privacy claim. Settings apply when the \
+                 network worker starts: lock and unlock the vault after changing them.",
+            );
+            egui::CollapsingHeader::new("Optional network settings")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.checkbox(
+                        &mut self.network_options.enable_identify,
+                        "Identify (bounded protocol metadata)",
+                    );
+                    ui.checkbox(
+                        &mut self.network_options.enable_ping,
+                        "Ping (low frequency)",
+                    );
+                    ui.checkbox(
+                        &mut self.network_options.enable_mdns,
+                        "mDNS local discovery (advisory only)",
+                    );
+                    ui.checkbox(
+                        &mut self.network_options.enable_kad,
+                        "Kademlia discovery (user-supplied bootstrap peers only)",
+                    );
+                    ui.checkbox(
+                        &mut self.network_options.enable_autonat,
+                        "AutoNAT best-effort status probe",
+                    );
+                    ui.checkbox(
+                        &mut self.network_options.enable_dcutr,
+                        "DCUtR hole punching when a relayed path exists",
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Relay mode");
+                        egui::ComboBox::from_id_salt("p2p_messenger_relay_mode")
+                            .selected_text(self.network_options.relay_mode.description())
+                            .show_ui(ui, |ui| {
+                                for (mode, label) in [
+                                    (RelayMode::Off, "Off"),
+                                    (RelayMode::Client, "Client"),
+                                    (RelayMode::Server, "Server"),
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.network_options.relay_mode,
+                                        mode,
+                                        label,
+                                    );
+                                }
+                            });
+                    });
+                    ui.label(
+                        "Kademlia bootstrap addresses (one per line or comma-separated; /p2p/<peer-id> required)",
+                    );
+                    ui.add(TextEdit::multiline(
+                        &mut self.network_options.kad_bootstrap_peers,
+                    ));
+                    ui.label(
+                        "Relay server addresses (client mode only; direct addresses required)",
+                    );
+                    ui.add(TextEdit::multiline(&mut self.network_options.relay_servers));
+                });
+        });
+
+        ui.add_space(8.0);
+        card(ui, p, |ui| {
+            card_title(ui, p, "MLS groups");
+
+            if conversations.is_empty() {
+                ui.label("No MLS conversation has been started in this session.");
+            } else {
+                for item in &conversations {
+                    let pending = item
+                        .pending_operation
+                        .map(|operation| format!(" · pending {}", operation.description()))
+                        .unwrap_or_default();
+                    ui.label(format!(
+                        "{} · epoch {} · admin {} · {} members · {} channels · {}{}",
+                        short(&item.peer.to_string(), 14),
+                        item.epoch,
+                        short(&item.admin.to_string(), 14),
+                        item.members.len(),
+                        item.channels.len(),
+                        item.status.description(),
+                        pending
+                    ));
+                }
+            }
+
+            ui.add_space(8.0);
+            ui.label("Connected peer ID for a new 1:1 MLS group");
+            ui.add(
+                TextEdit::singleline(&mut self.contact_peer_id)
+                    .hint_text("12D3Koo… (from the peer's identity panel)"),
+            );
+            if filled_button(ui, p, "Start encrypted chat") {
+                self.start_conversation();
+            }
+
+            ui.add_space(8.0);
+            match &active_conversation {
+                Some(active) => {
+                    ui.label(format!(
+                        "Active MLS group: {} · epoch {} · {}",
+                        short(&active.peer.to_string(), 14),
+                        active.epoch,
+                        active.status.description()
+                    ));
+                    ui.label(format!("Admin: {}", short(&active.admin.to_string(), 14)));
+                    let pending = match active.pending_operation {
+                        Some(operation) => format!(
+                            "Pending: {} (waiting for acknowledgements)",
+                            operation.description()
+                        ),
+                        None => "Pending: none".to_owned(),
+                    };
+                    ui.label(RichText::new(pending).small());
+                    ui.label("Members in local view:");
+                    for member in &active.members {
+                        let role = if Some(*member) == local_peer {
+                            " (you)"
+                        } else if *member == active.admin {
+                            " (admin)"
+                        } else {
+                            ""
+                        };
+                        ui.label(format!("  {}{role}", short(&member.to_string(), 14)));
+                    }
+
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("CHANNELS IN THIS MLS GROUP").small().weak());
+                    for channel in &active.channels {
+                        let selected = active.active_channel == Some(channel.channel_id);
+                        let marker = if selected { "● " } else { "   " };
+                        let policy = if channel.acknowledged {
+                            "policy acknowledged"
+                        } else {
+                            "policy awaiting receipts"
+                        };
+                        let label = format!(
+                            "{marker}{} · rev {} · {} allowed · {policy}",
+                            short(&channel.name, 20),
+                            channel.revision,
+                            channel.members.len()
+                        );
+                        if tonal_button(ui, p, label) {
+                            self.select_channel(channel.channel_id);
+                        }
+                    }
+                    ui.add(
+                        TextEdit::singleline(&mut self.channel_name)
+                            .hint_text("New channel name (admin only)"),
+                    );
+                    let idle = active.pending_operation.is_none();
+                    let can_create = idle && local_peer == Some(active.admin);
+                    if tonal_button_enabled(ui, p, "Create channel", can_create) {
+                        self.create_channel();
+                    }
+                    ui.label(
                     RichText::new(
                         "Channel metadata and text are MLS-encrypted application frames in one group. Channel membership is local client policy, not cryptographic access control.",
                     )
@@ -1011,34 +1170,28 @@ impl MessengerApp {
                     .weak(),
                 );
 
-                if ui
-                    .add_enabled(idle, egui::Button::new("Refresh my MLS key"))
-                    .clicked()
-                {
-                    self.update_member_key();
-                }
-                ui.label("Connected peer ID to add to this group");
-                ui.add(
-                    TextEdit::singleline(&mut self.member_peer_id)
-                        .hint_text("12D3Koo… (must already be directly connected)"),
-                );
-                if ui
-                    .add_enabled(idle, egui::Button::new("Add member"))
-                    .clicked()
-                {
-                    self.add_member();
-                }
-                if let Some(local) = local_peer {
-                    for member in &active.members {
-                        if *member != local && *member != active.admin {
-                            let label = format!("Remove {}", short(&member.to_string(), 14));
-                            if ui.add_enabled(idle, egui::Button::new(label)).clicked() {
-                                self.remove_member(*member);
+                    if tonal_button_enabled(ui, p, "Refresh my MLS key", idle) {
+                        self.update_member_key();
+                    }
+                    ui.label("Connected peer ID to add to this group");
+                    ui.add(
+                        TextEdit::singleline(&mut self.member_peer_id)
+                            .hint_text("12D3Koo… (must already be directly connected)"),
+                    );
+                    if tonal_button_enabled(ui, p, "Add member", idle) {
+                        self.add_member();
+                    }
+                    if let Some(local) = local_peer {
+                        for member in &active.members {
+                            if *member != local && *member != active.admin {
+                                let label = format!("Remove {}", short(&member.to_string(), 14));
+                                if tonal_button_enabled(ui, p, label, idle) {
+                                    self.remove_member(*member);
+                                }
                             }
                         }
                     }
-                }
-                ui.label(
+                    ui.label(
                     RichText::new(
                         "Group changes are signed MLS commits. They stay pending until every required member acknowledges; messages and further changes are blocked while pending. Only the group admin can add, remove, or refresh keys.",
                     )
@@ -1046,46 +1199,46 @@ impl MessengerApp {
                     .weak(),
                 );
 
-                egui::ScrollArea::vertical()
-                    .max_height(180.0)
-                    .show(ui, |ui| {
-                        if messages.is_empty() {
-                            ui.label("No decrypted messages in this session.");
-                        }
-                        for message in &messages {
-                            let sender = if message.origin == p2p_chat::MessageOrigin::Local {
-                                "You".to_owned()
-                            } else {
-                                short(&message.peer.to_string(), 14)
-                            };
-                            let delivery = match message.delivery {
-                                Some(state) => state.description(),
-                                None => "Received",
-                            };
-                            ui.label(format!("{sender}: {} [{delivery}]", message.text));
-                        }
-                    });
-                ui.add(
-                    TextEdit::singleline(&mut self.message_text)
-                        .hint_text("Type a message for the selected channel"),
-                );
-                if ui.button("Send (MLS encrypted)").clicked() {
-                    self.send_message();
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            if messages.is_empty() {
+                                ui.label("No decrypted messages in this session.");
+                            }
+                            for message in &messages {
+                                let sender = if message.origin == p2p_chat::MessageOrigin::Local {
+                                    "You".to_owned()
+                                } else {
+                                    short(&message.peer.to_string(), 14)
+                                };
+                                let delivery = match message.delivery {
+                                    Some(state) => state.description(),
+                                    None => "Received",
+                                };
+                                ui.label(format!("{sender}: {} [{delivery}]", message.text));
+                            }
+                        });
+                    ui.add(
+                        TextEdit::singleline(&mut self.message_text)
+                            .hint_text("Type a message for the selected channel"),
+                    );
+                    if filled_button(ui, p, "Send (MLS encrypted)") {
+                        self.send_message();
+                    }
+                }
+                None => {
+                    ui.label("Start or join an MLS conversation before sending messages.");
                 }
             }
-            None => {
-                ui.label("Start or join an MLS conversation before sending messages.");
-            }
-        }
+        });
 
-        ui.add_space(12.0);
-        ui.separator();
         ui.add_space(8.0);
-        ui.label(RichText::new("ENCRYPTED FILE TRANSFER").small().weak());
-        if transfers.is_empty() {
-            ui.label("No file transfers in this session.");
-        } else {
-            egui::ScrollArea::vertical()
+        card(ui, p, |ui| {
+            card_title(ui, p, "Encrypted file transfer");
+            if transfers.is_empty() {
+                ui.label("No file transfers in this session.");
+            } else {
+                egui::ScrollArea::vertical()
                 .max_height(140.0)
                 .show(ui, |ui| {
                     for transfer in &transfers {
@@ -1124,7 +1277,7 @@ impl MessengerApp {
                             .small()
                             .weak(),
                         );
-                        if transfer.status.active() && ui.button("Abort transfer").clicked() {
+                        if transfer.status.active() && tonal_button(ui, p, "Abort transfer") {
                             self.abort_file(transfer.peer);
                         }
                         if transfer.direction == TransferDirection::Incoming && !transfer.released {
@@ -1135,24 +1288,24 @@ impl MessengerApp {
                                         | ReleaseApproval::Pending
                                         | ReleaseApproval::Approved
                                 )
-                                && ui.button("Validate format / scan if configured").clicked()
+                                && tonal_button(ui, p, "Validate format / scan if configured")
                             {
                                 self.scan_file(transfer.peer);
                             }
                             match transfer.approval {
                                 ReleaseApproval::Pending => {
-                                    if ui.button("Approve and store encrypted").clicked() {
+                                    if filled_button(ui, p, "Approve and store encrypted") {
                                         self.approve_and_release_file(transfer.peer);
                                     }
-                                    if ui.button("Cancel release").clicked() {
+                                    if tonal_button(ui, p, "Cancel release") {
                                         self.cancel_file(transfer.peer);
                                     }
                                 }
                                 ReleaseApproval::Approved => {
-                                    if ui.button("Store encrypted in vault").clicked() {
+                                    if filled_button(ui, p, "Store encrypted in vault") {
                                         self.release_file(transfer.peer);
                                     }
-                                    if ui.button("Cancel release").clicked() {
+                                    if tonal_button(ui, p, "Cancel release") {
                                         self.cancel_file(transfer.peer);
                                     }
                                 }
@@ -1164,90 +1317,87 @@ impl MessengerApp {
                             && transfer.status.completed()
                             && deletion_policy == QuarantineDeletionPolicy::Explicit
                             && (transfer.released || transfer.approval == ReleaseApproval::Cancelled)
-                            && ui.button("Delete quarantine ciphertext").clicked()
+                            && tonal_button(ui, p, "Delete quarantine ciphertext")
                         {
                             self.delete_file_quarantine(transfer.peer);
                         }
                     }
                 });
-        }
-        ui.add_space(8.0);
-        ui.label("Local file path for the active peer (maximum 64 MiB)");
-        ui.add(TextEdit::singleline(&mut self.file_path).hint_text("/path/to/file.txt"));
-        if ui.button("Send encrypted file").clicked() {
-            self.send_file();
-        }
-        ui.label(
-            RichText::new(
+            }
+            ui.add_space(8.0);
+            ui.label("Local file path for the active peer (maximum 64 MiB)");
+            ui.add(TextEdit::singleline(&mut self.file_path).hint_text("/path/to/file.txt"));
+            if filled_button(ui, p, "Send encrypted file") {
+                self.send_file();
+            }
+            note(
+                ui,
+                p,
                 "Incoming ciphertext is quarantined. Structural validation supports TXT, PNG, and GIF only; it is not malware detection. Integrity verification is not a scan, and scanning is unavailable without an independent scanner. Release requires a clean scanner result, a validated format, an allowed extension, and explicit per-file approval; released bytes are copied into the encrypted vault, never written as plaintext here. Quarantine ciphertext for a verified transfer is retained by default and is deleted only by an explicit request where policy permits; aborting an incomplete transfer removes its partial ciphertext. Active transfers have an inactivity timeout and can be aborted; release cancellation applies only after verification. Filesystem deletion is not secure erasure. This app configures no scanner or allowed extensions, so no release action appears by default.",
-            )
-            .small()
-            .weak(),
-        );
+            );
+        });
 
-        ui.add_space(12.0);
-        ui.separator();
         ui.add_space(8.0);
-        ui.label(RichText::new("ENCRYPTED ATTACHMENTS").small().weak());
-        if attachments.is_empty() {
-            ui.label("No attachments are stored in the encrypted vault.");
-        } else {
-            egui::ScrollArea::vertical()
-                .max_height(140.0)
-                .show(ui, |ui| {
-                    for item in &attachments {
-                        ui.label(format!(
-                            "{} · {} bytes · {}",
-                            item.name,
-                            item.size,
-                            item.format.as_deref().unwrap_or("not validated")
-                        ));
-                        ui.horizontal(|ui| {
-                            #[cfg(feature = "native")]
-                            if ui.button("Save via OS dialog").clicked() {
-                                self.save_attachment(item.id, &item.name);
-                            }
-                            if ui.button("Delete stored attachment").clicked() {
-                                self.delete_attachment(item.id);
-                            }
-                        });
-                    }
-                });
-        }
-        ui.label(
-            RichText::new(
+        card(ui, p, |ui| {
+            card_title(ui, p, "Encrypted attachments");
+            if attachments.is_empty() {
+                ui.label("No attachments are stored in the encrypted vault.");
+            } else {
+                egui::ScrollArea::vertical()
+                    .max_height(140.0)
+                    .show(ui, |ui| {
+                        for item in &attachments {
+                            ui.label(format!(
+                                "{} · {} bytes · {}",
+                                item.name,
+                                item.size,
+                                item.format.as_deref().unwrap_or("not validated")
+                            ));
+                            ui.horizontal(|ui| {
+                                #[cfg(feature = "native")]
+                                if tonal_button(ui, p, "Save via OS dialog") {
+                                    self.save_attachment(item.id, &item.name);
+                                }
+                                if tonal_button(ui, p, "Delete stored attachment") {
+                                    self.delete_attachment(item.id);
+                                }
+                            });
+                        }
+                    });
+            }
+            note(
+                ui,
+                p,
                 "Attachments are ciphertext at rest in the vault. The native OS save dialog is the only plaintext disk write and requires a path you choose; a cancelled dialog writes nothing.",
-            )
-            .small()
-            .weak(),
-        );
-        #[cfg(not(feature = "native"))]
-        ui.label(
-            RichText::new("OS save dialog is available only in the native build.")
-                .small()
-                .weak(),
-        );
+            );
+            #[cfg(not(feature = "native"))]
+            note(
+                ui,
+                p,
+                "OS save dialog is available only in the native build.",
+            );
+        });
 
-        if let Some(error) = &self.chat_error {
-            ui.colored_label(ERROR_COLOR, error);
-        }
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new(
+        ui.add_space(8.0);
+        card(ui, p, |ui| {
+            if let Some(error) = &self.chat_error {
+                error_label(ui, p, error);
+            }
+            note(
+                ui,
+                p,
                 "Joined MLS group state is restored from encrypted vault storage when present; decrypted messages remain memory-only. Pending group operations, receipts, and offline queues are not restored. Receipts advance status only after verified MLS decryption; file chunks are encrypted and integrity-checked, but no malware scanner is configured.",
-            )
-            .small()
-            .weak(),
-        );
-        ui.add_space(10.0);
-        if ui.button("Lock vault").clicked() {
-            self.lock();
-        }
+            );
+            ui.add_space(10.0);
+            if tonal_button(ui, p, "Lock vault") {
+                self.lock();
+            }
+        });
     }
 
     fn render_form_error(&self, ui: &mut Ui) {
         if let Some(error) = &self.form_error {
-            ui.colored_label(ERROR_COLOR, error);
+            error_label(ui, palette(self.theme), error);
         }
     }
 
@@ -1417,22 +1567,6 @@ impl MessengerApp {
         self.confirm_password.clear();
         self.username.clear();
     }
-
-    fn handle_shortcuts(&mut self, ctx: &Context) {
-        let (focus_search, clear_search) = ctx.input(|input| {
-            (
-                input.modifiers.command_only() && input.key_pressed(Key::K),
-                input.key_pressed(Key::Escape),
-            )
-        });
-
-        if focus_search {
-            ctx.memory_mut(|memory| memory.request_focus(Id::new(SEARCH_ID)));
-        }
-        if clear_search {
-            self.search.clear();
-        }
-    }
 }
 
 fn short(value: &str, max_chars: usize) -> String {
@@ -1488,7 +1622,6 @@ mod tests {
             confirm_password: String::new(),
             form_error: None,
             theme: Theme::Dark,
-            search: String::new(),
         };
         sender
             .send(VaultOutcome {

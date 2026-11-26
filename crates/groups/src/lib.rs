@@ -18,7 +18,9 @@ use openmls_traits::OpenMlsProvider;
 use openmls_traits::signatures::{Signer, SignerError};
 use openmls_traits::types::SignatureScheme;
 use p2p_identity::{Identity, raw_ed25519_public_bytes_from_protobuf};
-use p2p_messaging::{Conversation, Envelope, MessageKind, Receipt, ReceiptStatus, ReceivedMessage};
+use p2p_messaging::{
+    Conversation, DeliveryState, Envelope, MessageKind, Receipt, ReceiptStatus, ReceivedMessage,
+};
 use p2p_storage::{MlsProviderError, Session, StagedMlsProvider};
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -334,6 +336,20 @@ impl MlsSession {
         })
     }
 
+    fn ensure_local_identity(group: &MlsGroup, identity: &Identity) -> Result<(), GroupError> {
+        let local_member = group
+            .members()
+            .find(|member| {
+                PeerId::from_bytes(member.credential.serialized_content()).ok()
+                    == Some(identity.peer_id())
+            })
+            .ok_or(GroupError::WrongLocalIdentity)?;
+        if local_member.signature_key.as_slice() != identity.ed25519_public_bytes()? {
+            return Err(GroupError::WrongLocalIdentity);
+        }
+        Ok(())
+    }
+
     /// Reconstruct a group from encrypted provider state. `None` from OpenMLS
     /// is a restore failure, never an empty conversation.
     fn load(
@@ -352,16 +368,7 @@ impl MlsSession {
         if group.group_id().as_slice() != conversation_id {
             return Err(GroupError::WrongConversation);
         }
-        let local_member = group
-            .members()
-            .find(|member| {
-                PeerId::from_bytes(member.credential.serialized_content()).ok()
-                    == Some(identity.peer_id())
-            })
-            .ok_or(GroupError::WrongLocalIdentity)?;
-        if local_member.signature_key.as_slice() != identity.ed25519_public_bytes()? {
-            return Err(GroupError::WrongLocalIdentity);
-        }
+        Self::ensure_local_identity(&group, identity)?;
         Ok(Self {
             provider,
             group,
@@ -670,6 +677,10 @@ impl MlsSession {
         if group.group_id().as_slice() != conversation_id {
             provider.discard();
             return Err(GroupError::WrongConversation);
+        }
+        if let Err(error) = Self::ensure_local_identity(&group, identity) {
+            provider.discard();
+            return Err(error);
         }
         if let Err(error) = provider.persist_group(&conversation_id, group.epoch().as_u64()) {
             provider.discard();
@@ -1181,8 +1192,39 @@ impl MlsConversation {
         &self.conversation
     }
 
-    pub fn delivery_state(&self, message_id: &[u8; 16]) -> Option<p2p_messaging::DeliveryState> {
+    pub fn delivery_state(&self, message_id: &[u8; 16]) -> Option<DeliveryState> {
         self.conversation.delivery_state(message_id)
+    }
+
+    /// Next local message sequence, restored from the encrypted snapshot.
+    pub fn next_sequence(&self) -> u64 {
+        self.conversation.next_sequence()
+    }
+
+    /// Set the local epoch from an authenticated restore record. The inner
+    /// conversation starts at epoch zero after `MlsGroup::load`; without this a
+    /// valid receipt at the loaded MLS epoch would be rejected.
+    pub fn restore_epoch(&mut self, epoch: u64) -> Result<(), GroupError> {
+        self.conversation.advance_epoch(epoch)?;
+        Ok(())
+    }
+
+    /// Restore the local sequence counter from an authenticated restore record.
+    pub fn restore_sequence(&mut self, sequence: u64) -> Result<(), GroupError> {
+        self.conversation.restore_sequence(sequence)?;
+        Ok(())
+    }
+
+    /// Rebuild one outbound state from an authenticated restore record. Only
+    /// `Queued` and `SentToPeer` are accepted; a verified receipt is still
+    /// required before delivery can advance.
+    pub fn restore_outgoing(
+        &mut self,
+        message_id: &[u8; 16],
+        state: DeliveryState,
+    ) -> Result<(), GroupError> {
+        self.conversation.restore_outgoing(message_id, state)?;
+        Ok(())
     }
 
     /// Local offline queue accepted the message; no network send has occurred.

@@ -33,6 +33,10 @@ pub const MAX_MLS_STATE_BYTES: usize = 1024 * 1024;
 pub const MAX_MLS_STATE_ENTRIES: u64 = 4096;
 /// Finite number of distinct groups tracked by the local MLS state store.
 pub const MAX_MLS_GROUPS: u64 = 64;
+/// Reserved provider bucket for OpenMLS entries that are not tied to a group,
+/// such as pending KeyPackages and PSKs. It is authenticated like any other
+/// group row but is not an application conversation.
+pub const GLOBAL_PROVIDER_GROUP: [u8; 16] = *b"P2PMLSGLOBALROOT";
 
 /// One provider write staged by the `StorageProvider` adapter. `value = None`
 /// is a tombstone: the matching encrypted row is removed by the flush.
@@ -410,7 +414,10 @@ pub(crate) fn collect_mls_watermarks(
                 "MLS group state does not match its chain".to_owned(),
             ));
         }
-        if u64::try_from(watermarks.len()).unwrap_or(u64::MAX) >= MAX_MLS_GROUPS {
+        // The reserved global provider bucket is verified and anchored, but it
+        // is not an application conversation and must not consume the group
+        // budget.
+        if u64::try_from(watermarks.len()).unwrap_or(u64::MAX) > MAX_MLS_GROUPS {
             return Err(StorageError::MlsStateFull);
         }
         watermarks.push(MlsWatermark {
@@ -756,6 +763,9 @@ impl Session {
                 &group_aad(&self.profile_id, &group_bi),
             )?;
             let group_id = fixed::<16>(&plaintext, "MLS group id")?;
+            if group_id == GLOBAL_PROVIDER_GROUP {
+                continue;
+            }
             if self.group_index(&group_id) != group_bi {
                 return Err(StorageError::MlsStateIntegrity(
                     "MLS group blind index mismatch".to_owned(),
@@ -826,5 +836,266 @@ impl Session {
     pub fn verify_mls_state(&self) -> Result<(), StorageError> {
         self.verify_anchor_full()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use p2p_identity::Identity;
+
+    use super::super::{StorageError, Vault};
+    use super::*;
+
+    fn vault_session(directory: &std::path::Path) -> Session {
+        let vault = Vault::open(directory).expect("open vault");
+        let identity = Identity::generate().expect("identity");
+        vault
+            .create("mls-state-unit", "mls-state-password", &identity)
+            .expect("create vault")
+    }
+
+    fn staged_write(group_id: [u8; 16], key: Vec<u8>, epoch: u64, value: &[u8]) -> StagedMlsWrite {
+        StagedMlsWrite {
+            group_id,
+            label: "OwnLeafNodeIndex".to_owned(),
+            key,
+            epoch,
+            value: Some(Zeroizing::new(value.to_vec())),
+        }
+    }
+
+    /// Apply a valid MLS write and install the matching anchor from inside the
+    /// still-open transaction, then deliberately roll back without committing.
+    /// This is the exact interruption point an anchor-first write exposes.
+    fn interrupt_anchor_first_write(session: &mut Session, group_id: [u8; 16]) {
+        let storage_key = session.mls_key();
+        let subkeys = session.subkeys.clone();
+        let profile_id = session.profile_id;
+        let vault_dir = session.vault_dir.clone();
+        let group_bi = group_index(&subkeys, &group_id);
+        let key = b"interrupted".to_vec();
+        let entity_bi = entity_index(&subkeys, &group_id, "OwnLeafNodeIndex", &key);
+        let record = StateRecord {
+            epoch: 1,
+            label: "OwnLeafNodeIndex".to_owned(),
+            entity_key: key.clone(),
+            value: Zeroizing::new(b"interrupted-value".to_vec()),
+        };
+        let ciphertext = encrypt_bytes(
+            &storage_key,
+            &record_plaintext(&record).expect("record plaintext"),
+            &state_aad(&profile_id, &group_bi, &entity_bi, 1),
+        )
+        .expect("encrypt interrupted write");
+
+        let transaction = session.conn.transaction().expect("begin interrupted write");
+        let group_bi =
+            ensure_group_row(&transaction, &storage_key, &subkeys, &profile_id, &group_id)
+                .expect("ensure group row");
+        transaction
+            .execute(
+                "INSERT INTO mls_state (group_bi, entity_bi, epoch, ciphertext, chain_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    group_bi.to_vec(),
+                    entity_bi.to_vec(),
+                    1_i64,
+                    ciphertext,
+                    ZERO_CHAIN.to_vec(),
+                ],
+            )
+            .expect("insert interrupted row");
+        let (epoch, chain) = recompute_group_chain(
+            &transaction,
+            &storage_key,
+            &subkeys,
+            &profile_id,
+            &group_id,
+            &group_bi,
+            true,
+        )
+        .expect("recompute interrupted chain");
+        transaction
+            .execute(
+                "UPDATE mls_groups SET epoch = ?1, chain = ?2 WHERE group_bi = ?3",
+                params![epoch as i64, chain.to_vec(), group_bi.to_vec()],
+            )
+            .expect("update interrupted group");
+        super::super::control_log::write_current_anchor_to(
+            &vault_dir,
+            &subkeys,
+            &profile_id,
+            &transaction,
+        )
+        .expect("install interrupted anchor");
+        drop(transaction);
+    }
+
+    /// Apply a valid MLS deletion and install the matching anchor from inside
+    /// the still-open transaction, then deliberately roll back without
+    /// committing.
+    fn interrupt_anchor_first_delete(session: &mut Session, group_id: [u8; 16]) {
+        let group_bi = session.group_index(&group_id).to_vec();
+        let transaction = session
+            .conn
+            .transaction()
+            .expect("begin interrupted delete");
+        transaction
+            .execute(
+                "DELETE FROM mls_state WHERE group_bi = ?1",
+                params![group_bi.clone()],
+            )
+            .expect("delete interrupted rows");
+        transaction
+            .execute(
+                "DELETE FROM mls_groups WHERE group_bi = ?1",
+                params![group_bi],
+            )
+            .expect("delete interrupted group");
+        super::super::control_log::write_current_anchor_to(
+            &session.vault_dir,
+            &session.subkeys,
+            &session.profile_id,
+            &transaction,
+        )
+        .expect("install interrupted delete anchor");
+        drop(transaction);
+    }
+
+    #[test]
+    fn staged_writes_enforce_the_global_entry_cap() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut session = vault_session(directory.path());
+        let group = [1u8; 16];
+        let writes = (0..MAX_MLS_STATE_ENTRIES as u32)
+            .map(|index| staged_write(group, index.to_le_bytes().to_vec(), 1, b"entry"))
+            .collect::<Vec<_>>();
+        session.apply_staged_writes(&writes).expect("fill to cap");
+
+        let overflow = staged_write(
+            group,
+            (MAX_MLS_STATE_ENTRIES as u32).to_le_bytes().to_vec(),
+            1,
+            b"overflow",
+        );
+        assert!(matches!(
+            session.apply_staged_writes(&[overflow]),
+            Err(StorageError::MlsStateFull)
+        ));
+    }
+
+    #[test]
+    fn staged_writes_enforce_the_group_cap() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut session = vault_session(directory.path());
+        let writes = (1..=MAX_MLS_GROUPS as u8)
+            .map(|byte| staged_write([byte; 16], b"key".to_vec(), 1, b"entry"))
+            .collect::<Vec<_>>();
+        session
+            .apply_staged_writes(&writes)
+            .expect("fill group cap");
+        assert_eq!(
+            session.mls_group_ids().expect("group ids").len(),
+            MAX_MLS_GROUPS as usize
+        );
+
+        let overflow = staged_write(
+            [(MAX_MLS_GROUPS + 1) as u8; 16],
+            b"key".to_vec(),
+            1,
+            b"overflow",
+        );
+        assert!(matches!(
+            session.apply_staged_writes(&[overflow]),
+            Err(StorageError::MlsStateFull)
+        ));
+        assert_eq!(
+            session
+                .mls_group_ids()
+                .expect("group ids after rollback")
+                .len(),
+            MAX_MLS_GROUPS as usize
+        );
+    }
+
+    #[test]
+    fn interrupted_anchor_first_write_fails_closed_until_the_anchor_is_restored() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let vault = Vault::open(directory.path()).expect("vault");
+        let identity = Identity::generate().expect("identity");
+        let _initial = vault
+            .create("mls-state-unit", "mls-state-password", &identity)
+            .expect("create vault");
+        let anchor_path = directory.path().join("control.anchor");
+        let baseline = fs::read(&anchor_path).expect("baseline anchor");
+        drop(_initial);
+
+        let mut session = vault.unlock("mls-state-password").expect("unlock");
+        interrupt_anchor_first_write(&mut session, [31u8; 16]);
+        assert_ne!(
+            fs::read(&anchor_path).expect("advanced anchor"),
+            baseline,
+            "the anchor must be installed before the database commit"
+        );
+        drop(session);
+        assert!(matches!(
+            vault.unlock("mls-state-password"),
+            Err(StorageError::RollbackDetected)
+        ));
+
+        fs::write(&anchor_path, &baseline).expect("restore interrupted anchor");
+        let recovered = vault
+            .unlock("mls-state-password")
+            .expect("recover from baseline");
+        assert!(
+            recovered
+                .mls_group_ids()
+                .expect("no committed group")
+                .is_empty(),
+            "the interrupted write must not survive its rolled-back transaction"
+        );
+    }
+
+    #[test]
+    fn interrupted_anchor_first_delete_fails_closed_until_the_anchor_is_restored() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let vault = Vault::open(directory.path()).expect("vault");
+        let identity = Identity::generate().expect("identity");
+        let group = [32u8; 16];
+        {
+            let mut session = vault
+                .create("mls-state-unit", "mls-state-password", &identity)
+                .expect("create vault");
+            session
+                .store_mls_state(&group, "tree", b"node", 1, b"delete-me")
+                .expect("store state");
+        }
+        let anchor_path = directory.path().join("control.anchor");
+        let baseline = fs::read(&anchor_path).expect("baseline anchor");
+
+        let mut session = vault.unlock("mls-state-password").expect("unlock");
+        interrupt_anchor_first_delete(&mut session, group);
+        assert_ne!(
+            fs::read(&anchor_path).expect("advanced anchor"),
+            baseline,
+            "the delete anchor must be installed before the database commit"
+        );
+        drop(session);
+        assert!(matches!(
+            vault.unlock("mls-state-password"),
+            Err(StorageError::RollbackDetected)
+        ));
+
+        fs::write(&anchor_path, &baseline).expect("restore interrupted anchor");
+        let recovered = vault
+            .unlock("mls-state-password")
+            .expect("recover from baseline");
+        assert_eq!(
+            recovered.mls_group_ids().expect("committed group"),
+            vec![group],
+            "the interrupted deletion must not survive its rolled-back transaction"
+        );
     }
 }

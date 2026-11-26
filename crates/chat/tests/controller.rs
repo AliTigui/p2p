@@ -1,15 +1,19 @@
 //! Acceptance tests for the application-level MLS setup and message path.
 //! Two controllers use only explicit loopback addresses; no discovery infra.
 
+use std::collections::BTreeSet;
 use std::fs;
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use libp2p_identity::PeerId;
 use p2p_chat::{
-    ChatError, ConversationStatus, DEFAULT_CHANNEL_ID, FileConfig, FileFormat, FileScanner,
-    GroupOperation, MessageOrigin, MessengerController, QuarantineDeletionPolicy, RedialState,
-    ReleaseApproval, ReleasePolicy, SETUP_VERSION, ScanRequest, ScanResult, ScanStatus,
-    SecurityConfig, SetupEnvelope, SetupMessage, TransferDirection, TransferStatus, parse_address,
+    ChatError, ConversationInfo, ConversationStatus, DEFAULT_CHANNEL_ID, FileConfig, FileFormat,
+    FileScanner, GroupOperation, MessageOrigin, MessengerController, QuarantineDeletionPolicy,
+    RedialState, ReleaseApproval, ReleasePolicy, SETUP_VERSION, ScanRequest, ScanResult,
+    ScanStatus, SecurityConfig, SetupEnvelope, SetupMessage, TransferDirection, TransferStatus,
+    parse_address,
 };
 use p2p_identity::Identity;
 use p2p_messaging::DeliveryState;
@@ -426,6 +430,99 @@ fn queued_text_is_not_persisted_in_plaintext() {
             "{name} contains queued plaintext"
         );
     }
+}
+
+#[test]
+fn vault_backed_offline_queue_and_receipts_restore_after_restart() {
+    let directory = tempfile::tempdir().expect("temp vault directory");
+    let alice_identity = Identity::generate().expect("alice identity");
+    let bob_identity = Identity::generate().expect("bob identity");
+    let vault = Vault::open(directory.path()).expect("open vault");
+    let session = vault
+        .create("restore-user", "restore-password", &alice_identity)
+        .expect("create vault session");
+    let mut alice = MessengerController::start_with_control_log(
+        &alice_identity,
+        local_config(),
+        session.try_clone().expect("clone session"),
+    )
+    .expect("vault-backed alice");
+    let mut bob = MessengerController::start(&bob_identity, local_config()).expect("bob");
+    let target = connect_controllers(&mut alice, &mut bob, &bob_identity);
+
+    let bob_peer = bob_identity.peer_id();
+    alice.start_conversation(bob_peer).expect("start MLS setup");
+    wait_for_joined(&mut alice, &mut bob);
+    wait_for(
+        "alice joined state persisted",
+        || {
+            alice.poll();
+            alice.active_info().is_some_and(|info| {
+                info.status == ConversationStatus::Joined && info.pending_operation.is_none()
+            })
+        },
+        Duration::from_secs(10),
+    );
+
+    alice.disconnect_all().expect("disconnect alice");
+    wait_for(
+        "alice disconnected before queueing",
+        || {
+            alice.poll();
+            matches!(
+                alice.connection_state(),
+                ConnectionState::Disconnected { .. }
+            )
+        },
+        Duration::from_secs(10),
+    );
+
+    let secret = "PENDING_RESTORE_SENTINEL_91";
+    alice
+        .send_text(bob_peer, secret)
+        .expect("queue offline text in vault");
+    assert_eq!(alice.queued_count(&bob_peer), 1);
+    drop(alice);
+    drop(session);
+
+    let storage = vault
+        .unlock("restore-password")
+        .expect("unlock after restart");
+    let mut alice =
+        MessengerController::start_with_control_log(&alice_identity, local_config(), storage)
+            .expect("restore vault-backed alice");
+    assert_eq!(alice.queued_count(&bob_peer), 1);
+    assert!(
+        alice.active_messages().is_empty(),
+        "decrypted text must not be restored"
+    );
+    let info = alice.active_info().expect("restored conversation");
+    assert_eq!(info.status, ConversationStatus::Joined);
+    assert_eq!(info.pending_operation, None);
+
+    alice
+        .connect(parse_address(&target).expect("valid reconnect target"))
+        .expect("reconnect queued");
+    wait_for(
+        "restored queue reaches bob after reconnect",
+        || {
+            alice.poll();
+            bob.poll();
+            bob.active_messages()
+                .iter()
+                .any(|message| message.text == secret)
+        },
+        Duration::from_secs(15),
+    );
+    wait_for(
+        "restored queue is drained",
+        || {
+            alice.poll();
+            bob.poll();
+            alice.queued_count(&bob_peer) == 0
+        },
+        Duration::from_secs(15),
+    );
 }
 
 #[test]
@@ -1651,4 +1748,341 @@ fn setup_frames_carry_and_sign_transaction_ids_and_reject_v1() {
     bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
     let legacy = SetupEnvelope::from_bytes(&bytes).expect_err("version 1 is rejected");
     assert!(legacy.to_string().contains("version 1"));
+}
+
+fn vault_controller(
+    label: &str,
+    identity: &Identity,
+    directory: &Path,
+    password: &str,
+    create: bool,
+) -> MessengerController {
+    let vault = Vault::open(directory).expect("open vault");
+    let storage = if create {
+        vault
+            .create("hardening-user", password, identity)
+            .expect("create vault")
+    } else {
+        vault.unlock(password).expect("unlock vault")
+    };
+    MessengerController::start_with_control_log(identity, local_config(), storage)
+        .unwrap_or_else(|error| panic!("{label}: {error:?}"))
+}
+
+fn connect_vault_peer(
+    alice: &mut MessengerController,
+    peer: &mut MessengerController,
+    peer_identity: &Identity,
+) -> String {
+    wait_for(
+        "peer has a listen address",
+        || {
+            peer.poll();
+            !peer.listen_addresses().is_empty()
+        },
+        Duration::from_secs(10),
+    );
+    let address = peer
+        .listen_addresses()
+        .into_iter()
+        .next()
+        .expect("peer listen address");
+    let target = format!("{address}/p2p/{}", peer_identity.peer_id());
+    alice
+        .connect(parse_address(&target).expect("valid target"))
+        .expect("dial queued");
+
+    let local_peer = alice.identity().peer_id();
+    let remote_peer = peer_identity.peer_id();
+    wait_for(
+        "vault-backed controllers connected",
+        || {
+            alice.poll();
+            peer.poll();
+            let alice_ready = matches!(
+                alice.connection_state(),
+                ConnectionState::Connected { peers } if peers.contains(&remote_peer)
+            );
+            let peer_ready = matches!(
+                peer.connection_state(),
+                ConnectionState::Connected { peers } if peers.contains(&local_peer)
+            );
+            alice_ready && peer_ready
+        },
+        Duration::from_secs(10),
+    );
+    target
+}
+
+fn conversation_info(
+    controller: &MessengerController,
+    conversation_id: [u8; 16],
+) -> ConversationInfo {
+    controller
+        .conversation_infos()
+        .into_iter()
+        .find(|info| info.conversation_id == conversation_id)
+        .expect("restored conversation")
+}
+
+const PERSISTED_CONVERSATION_LABEL: &str = "p2p.app.conversation/v1";
+
+fn assert_vault_has_metadata(directory: &Path, password: &str, conversation_id: [u8; 16]) {
+    let vault = Vault::open(directory).expect("open vault for metadata check");
+    let session = vault
+        .unlock(password)
+        .expect("unlock vault for metadata check");
+    assert_eq!(
+        session.mls_group_ids().expect("list persisted groups"),
+        vec![conversation_id],
+        "vault must contain exactly the persisted MLS group"
+    );
+    assert!(
+        session
+            .load_mls_state(
+                &conversation_id,
+                PERSISTED_CONVERSATION_LABEL,
+                PERSISTED_CONVERSATION_LABEL.as_bytes()
+            )
+            .expect("load persisted metadata")
+            .is_some(),
+        "vault must contain encrypted conversation metadata"
+    );
+}
+
+fn assert_group_snapshot(
+    info: &ConversationInfo,
+    conversation_id: [u8; 16],
+    epoch: u64,
+    members: &[PeerId],
+    channel_id: [u8; 16],
+    channel_name: &str,
+) {
+    assert_eq!(info.conversation_id, conversation_id);
+    assert_eq!(info.status, ConversationStatus::Joined);
+    assert_eq!(info.pending_operation, None);
+    assert_eq!(info.epoch, epoch, "MLS epoch must survive restart");
+    assert_eq!(
+        info.members.iter().copied().collect::<BTreeSet<_>>(),
+        members.iter().copied().collect::<BTreeSet<_>>(),
+        "group membership must survive restart"
+    );
+    let channel = info
+        .channels
+        .iter()
+        .find(|channel| channel.channel_id == channel_id)
+        .expect("channel must survive restart");
+    assert_eq!(channel.name, channel_name);
+    assert!(
+        channel
+            .members
+            .iter()
+            .all(|member| members.contains(member)),
+        "restored channel policy must stay inside the restored member set"
+    );
+}
+
+#[test]
+fn vault_backed_group_operations_survive_controlled_restarts() {
+    let alice_dir = tempfile::tempdir().expect("alice vault dir");
+    let bob_dir = tempfile::tempdir().expect("bob vault dir");
+    let charlie_dir = tempfile::tempdir().expect("charlie vault dir");
+    let alice_identity = Identity::generate().expect("alice");
+    let bob_identity = Identity::generate().expect("bob");
+    let charlie_identity = Identity::generate().expect("charlie");
+    let password = "group-hardening-password";
+
+    let mut alice = vault_controller(
+        "alice initial",
+        &alice_identity,
+        alice_dir.path(),
+        password,
+        true,
+    );
+    let mut bob = vault_controller("bob initial", &bob_identity, bob_dir.path(), password, true);
+    let mut charlie = vault_controller(
+        "charlie initial",
+        &charlie_identity,
+        charlie_dir.path(),
+        password,
+        true,
+    );
+    connect_vault_peer(&mut alice, &mut bob, &bob_identity);
+    connect_vault_peer(&mut alice, &mut charlie, &charlie_identity);
+
+    let alice_peer = alice_identity.peer_id();
+    let bob_peer = bob_identity.peer_id();
+    let charlie_peer = charlie_identity.peer_id();
+
+    // Create: both sides persist the joined MLS group.
+    let conversation_id = alice.start_conversation(bob_peer).expect("create group");
+    wait_for_joined(&mut alice, &mut bob);
+
+    // Add: the joiner consumes and deletes its KeyPackage in the same vault
+    // transaction that persists the joined group.
+    alice
+        .add_member(conversation_id, charlie_peer)
+        .expect("admin adds charlie");
+    wait_for(
+        "initial add completed",
+        || {
+            alice.poll();
+            bob.poll();
+            charlie.poll();
+            [&alice, &bob, &charlie].iter().all(|controller| {
+                controller.active_info().is_some_and(|info| {
+                    info.status == ConversationStatus::Joined
+                        && info.pending_operation.is_none()
+                        && info.members.len() == 3
+                })
+            })
+        },
+        Duration::from_secs(15),
+    );
+    let after_add = alice.active_info().expect("alice after add").epoch;
+
+    let channel_id = alice
+        .create_channel(
+            conversation_id,
+            "hardening",
+            vec![alice_peer, bob_peer, charlie_peer],
+        )
+        .expect("create channel");
+    wait_for(
+        "channel policy acknowledged by every member",
+        || {
+            alice.poll();
+            bob.poll();
+            charlie.poll();
+            [&alice, &bob, &charlie].iter().all(|controller| {
+                controller.active_info().is_some_and(|info| {
+                    info.channels.iter().any(|channel| {
+                        channel.channel_id == channel_id
+                            && channel.name == "hardening"
+                            && channel.members.len() == 3
+                    })
+                })
+            })
+        },
+        Duration::from_secs(15),
+    );
+
+    // Restart every participant from encrypted provider state only.
+    drop(alice);
+    drop(bob);
+    drop(charlie);
+    for directory in [alice_dir.path(), bob_dir.path(), charlie_dir.path()] {
+        assert_vault_has_metadata(directory, password, conversation_id);
+    }
+    let mut alice = vault_controller(
+        "alice restart",
+        &alice_identity,
+        alice_dir.path(),
+        password,
+        false,
+    );
+    let mut bob = vault_controller(
+        "bob restart",
+        &bob_identity,
+        bob_dir.path(),
+        password,
+        false,
+    );
+    let mut charlie = vault_controller(
+        "charlie restart",
+        &charlie_identity,
+        charlie_dir.path(),
+        password,
+        false,
+    );
+    connect_vault_peer(&mut alice, &mut bob, &bob_identity);
+    connect_vault_peer(&mut alice, &mut charlie, &charlie_identity);
+
+    for controller in [&alice, &bob, &charlie] {
+        let info = conversation_info(controller, conversation_id);
+        assert_group_snapshot(
+            &info,
+            conversation_id,
+            after_add,
+            &[alice_peer, bob_peer, charlie_peer],
+            channel_id,
+            "hardening",
+        );
+    }
+
+    // Remove and Update: the admin's advanced epoch and pruned channel policy
+    // must both be restored after another controlled restart.
+    alice
+        .remove_member(conversation_id, charlie_peer)
+        .expect("admin removes charlie");
+    wait_for(
+        "remove acknowledged after restart",
+        || {
+            alice.poll();
+            bob.poll();
+            charlie.poll();
+            let alice_info = alice.active_info();
+            alice_info.as_ref().is_some_and(|info| {
+                info.pending_operation.is_none()
+                    && info.epoch > after_add
+                    && !info.members.contains(&charlie_peer)
+            }) && bob.active_info().is_some_and(|info| {
+                info.pending_operation.is_none()
+                    && info.epoch == alice_info.as_ref().map_or(0, |info| info.epoch)
+                    && !info.members.contains(&charlie_peer)
+            })
+        },
+        Duration::from_secs(15),
+    );
+    let after_remove = alice.active_info().expect("alice after remove").epoch;
+
+    alice
+        .update_member_key(conversation_id)
+        .expect("admin updates key");
+    wait_for(
+        "update acknowledged after restart",
+        || {
+            alice.poll();
+            bob.poll();
+            let alice_info = alice.active_info();
+            alice_info.as_ref().is_some_and(|info| {
+                info.pending_operation.is_none() && info.epoch == after_remove + 1
+            }) && bob.active_info().is_some_and(|info| {
+                info.pending_operation.is_none()
+                    && info.epoch == alice_info.as_ref().map_or(0, |info| info.epoch)
+            })
+        },
+        Duration::from_secs(15),
+    );
+    let final_epoch = alice.active_info().expect("alice final").epoch;
+
+    drop(alice);
+    drop(bob);
+    drop(charlie);
+    let mut alice = vault_controller(
+        "alice final restart",
+        &alice_identity,
+        alice_dir.path(),
+        password,
+        false,
+    );
+    let mut bob = vault_controller(
+        "bob final restart",
+        &bob_identity,
+        bob_dir.path(),
+        password,
+        false,
+    );
+    connect_vault_peer(&mut alice, &mut bob, &bob_identity);
+    for controller in [&alice, &bob] {
+        let info = conversation_info(controller, conversation_id);
+        assert_group_snapshot(
+            &info,
+            conversation_id,
+            final_epoch,
+            &[alice_peer, bob_peer],
+            channel_id,
+            "hardening",
+        );
+    }
 }
