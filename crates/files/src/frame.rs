@@ -10,7 +10,10 @@ use std::fmt;
 
 use libp2p_identity::PeerId;
 use p2p_crypto::{NONCE_LEN, TAG_LEN};
-use p2p_identity::{Identity, verify_signature_with_public_bytes};
+use p2p_identity::{
+    Identity, IdentityRole, MAX_IDENTITY_PROOF_BYTES, unix_time_seconds,
+    verify_application_signature,
+};
 use zeroize::Zeroizing;
 
 use crate::FileError;
@@ -23,7 +26,7 @@ pub const FILE_PROTOCOL: &str = "/p2p-messenger/file/1";
 /// Fixed frame magic. Unknown magic is rejected, never negotiated.
 pub const FILE_MAGIC: [u8; 4] = *b"FILE";
 /// File frame version implemented by this build.
-pub const FILE_VERSION: u16 = 1;
+pub const FILE_VERSION: u16 = 2;
 
 /// Maximum bytes accepted in one file request or response frame. This matches
 /// the transport codec cap and prevents unbounded length-prefix allocation.
@@ -335,6 +338,7 @@ impl fmt::Debug for FileMessage {
 pub struct FileEnvelope {
     pub sender: PeerId,
     pub sender_public_key: Vec<u8>,
+    pub identity_proof: Vec<u8>,
     pub message: FileMessage,
     signature: [u8; SIGNATURE_LEN],
 }
@@ -345,12 +349,13 @@ impl FileEnvelope {
         message.check_sizes()?;
         let mut envelope = Self {
             sender: identity.peer_id(),
-            sender_public_key: identity.public_key_bytes(),
+            sender_public_key: identity.role_public_bytes(IdentityRole::File)?.to_vec(),
+            identity_proof: identity.proof().to_bytes(),
             message,
             signature: [0; SIGNATURE_LEN],
         };
         envelope.check_sizes()?;
-        let signature = identity.sign(&envelope.signing_bytes()?)?;
+        let signature = identity.sign_with_role(IdentityRole::File, &envelope.signing_bytes()?)?;
         envelope.signature = signature
             .as_slice()
             .try_into()
@@ -375,6 +380,7 @@ impl FileEnvelope {
         let transfer_id = reader.fixed::<16>()?;
         let sender_public_key = reader.var(MAX_PUBLIC_KEY_BYTES)?;
         let sender_bytes = reader.var(MAX_PEER_ID_BYTES)?;
+        let identity_proof = reader.var(MAX_IDENTITY_PROOF_BYTES)?;
         let payload = reader.var(MAX_FILE_PAYLOAD_BYTES)?;
         let signature = reader.fixed::<SIGNATURE_LEN>()?;
         reader.finish()?;
@@ -384,6 +390,7 @@ impl FileEnvelope {
         let envelope = Self {
             sender,
             sender_public_key: sender_public_key.to_vec(),
+            identity_proof: identity_proof.to_vec(),
             message,
             signature,
         };
@@ -414,22 +421,18 @@ impl FileEnvelope {
             return Err(FileError::UnexpectedSender);
         }
         self.check_sizes()?;
-        let valid = verify_signature_with_public_bytes(
+        let certified_key = verify_application_signature(
+            &self.identity_proof,
+            IdentityRole::File,
+            &self.sender,
             &self.signing_bytes()?,
             &self.signature,
-            &self.sender_public_key,
-            &self.sender,
-        )
-        .map_err(|error| match error {
-            p2p_identity::IdentityError::NotEd25519 => FileError::NotEd25519,
-            p2p_identity::IdentityError::PeerIdMismatch => FileError::BadPeerId,
-            _ => FileError::BadSignature,
-        })?;
-        if valid {
-            Ok(())
-        } else {
-            Err(FileError::BadSignature)
+            unix_time_seconds(),
+        )?;
+        if self.sender_public_key != certified_key {
+            return Err(FileError::InvalidField);
         }
+        Ok(())
     }
 
     fn signing_bytes(&self) -> Result<Vec<u8>, FileError> {
@@ -441,6 +444,7 @@ impl FileEnvelope {
         bytes.extend_from_slice(self.message.transfer_id());
         put_bytes(&mut bytes, &self.sender_public_key)?;
         put_bytes(&mut bytes, &self.sender.to_bytes())?;
+        put_bytes(&mut bytes, &self.identity_proof)?;
         put_bytes(&mut bytes, &payload)?;
         Ok(bytes)
     }
@@ -449,8 +453,10 @@ impl FileEnvelope {
         if FILE_MAGIC != *b"FILE" {
             return Err(FileError::BadMagic);
         }
-        if self.sender_public_key.is_empty() || self.sender_public_key.len() > MAX_PUBLIC_KEY_BYTES
-        {
+        if self.sender_public_key.len() != 32 {
+            return Err(FileError::InvalidField);
+        }
+        if self.identity_proof.is_empty() || self.identity_proof.len() > MAX_IDENTITY_PROOF_BYTES {
             return Err(FileError::InvalidField);
         }
         let peer_bytes = self.sender.to_bytes();
@@ -470,6 +476,7 @@ impl fmt::Debug for FileEnvelope {
         f.debug_struct("FileEnvelope")
             .field("sender", &self.sender.to_string())
             .field("sender_public_key_len", &self.sender_public_key.len())
+            .field("identity_proof_len", &self.identity_proof.len())
             .field("kind", &self.message.kind())
             .field("transfer_id", &hex(self.message.transfer_id()))
             .field("signature", &"<redacted>")
@@ -604,6 +611,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p2p_identity::{CERTIFICATE_BYTES, IDENTITY_PROOF_HEADER_BYTES};
 
     fn offer(sender: &Identity) -> FileEnvelope {
         FileEnvelope::new(
@@ -649,6 +657,71 @@ mod tests {
             original.verify(&other.peer_id()),
             Err(FileError::UnexpectedSender)
         ));
+    }
+
+    fn tampered_proof(identity: &Identity) -> Vec<u8> {
+        let mut bytes = identity.proof().to_bytes();
+        let index = IDENTITY_PROOF_HEADER_BYTES + CERTIFICATE_BYTES * 4 + 34;
+        bytes[index] ^= 0x01;
+        bytes
+    }
+
+    #[test]
+    fn wrong_role_and_transport_signatures_are_rejected() {
+        let sender = Identity::generate().expect("identity");
+        let mut frame = offer(&sender);
+        let signed_bytes = frame.signing_bytes().expect("signed bytes");
+
+        let application_signature = sender
+            .sign_with_role(IdentityRole::Application, &signed_bytes)
+            .expect("application role signature");
+        frame.signature = application_signature
+            .as_slice()
+            .try_into()
+            .expect("signature");
+        assert!(matches!(
+            frame.verify(&sender.peer_id()),
+            Err(FileError::BadSignature)
+        ));
+
+        let transport_signature = sender.sign(&signed_bytes).expect("transport signature");
+        frame.signature = transport_signature
+            .as_slice()
+            .try_into()
+            .expect("signature");
+        assert!(matches!(
+            frame.verify(&sender.peer_id()),
+            Err(FileError::BadSignature)
+        ));
+    }
+
+    #[test]
+    fn substituted_and_tampered_proofs_are_rejected() {
+        let sender = Identity::generate().expect("identity");
+        let other = Identity::generate().expect("other identity");
+        let frame = offer(&sender);
+
+        let mut substituted = frame.clone();
+        substituted.identity_proof = other.proof().to_bytes();
+        assert!(matches!(
+            substituted.verify(&sender.peer_id()),
+            Err(FileError::BadPeerId)
+        ));
+
+        let mut tampered = frame.clone();
+        tampered.identity_proof = tampered_proof(&sender);
+        assert!(tampered.verify(&sender.peer_id()).is_err());
+
+        assert_eq!(
+            frame.sender_public_key,
+            sender
+                .role_public_bytes(IdentityRole::File)
+                .expect("local file key")
+        );
+        assert_ne!(
+            frame.sender_public_key,
+            sender.ed25519_public_bytes().expect("transport key")
+        );
     }
 
     #[test]

@@ -89,8 +89,8 @@ This model states attacker capabilities separately from properties the code curr
 | Envelope replay | Message-ID cache + sequence high-water mark + epoch checks | Yes | Replay state is in-memory; legacy load path is limited |
 | Setup replay/overwrite | Signed v2 frames, strict `(conversation, transaction, peer)` state guards, bounded 512-entry digest cache, and schema v4 chained blind-indexed log anchored by `<vault>/control.anchor` | Yes for tested cases | Memory cache is bounded; durable log caps at 4096 and fails closed; full vault including anchor rollback is not locally detectable |
 | Unauthorized group change | Admin check + signed commit operation/target binding | Yes | No delegated roles |
-| Restricted-channel plaintext disclosure | Sender/recemit operation/target binding | Yes | No delegated roles |
-| Restricted-channel plaintext disclosure | Sender/receiver policy only | Yes for honest clients | Excluded MLS members can decrypt obtained ciphertext |
+| Unauthorized channel policy | Admin check + signed parent `CHN1` policy + revision checks | Yes | Policy metadata remains visible to all parent members |
+| Restricted-channel plaintext disclosure | P1d derived `MlsChannelGroup` for non-default text/receipts, signed parent/channel binding, readiness receipts, P1e authenticated restore, and P1f distinct GUI status | Yes for non-default controller text, including restart of ready groups | Default channel and policy stay on the parent group; setup material does not survive restart and no complete ACL is claimed |
 | Relay content-key disclosure | Noise terminates at endpoints | Source verified | No live three-node capture test |
 | File tampering | Fresh AEAD key, AAD, manifest hash, full hash | Yes | Scanner availability is a separate policy gate |
 | Stalled file transfer | Inactivity deadline, separate abort, local key zeroization, pending-request cleanup, incomplete quarantine cleanup | Yes for loopback timeout/abort tests | Worker request already queued in libp2p cannot be withdrawn; late responses are ignored |

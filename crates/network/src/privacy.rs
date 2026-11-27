@@ -8,6 +8,29 @@
 
 use libp2p::{Multiaddr, PeerId};
 
+/// Requested transport privacy mode. This is configuration only: it never
+/// claims that a requested hidden route was obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransportPrivacyMode {
+    /// Direct TCP + Noise. This is the implemented default and is not
+    /// anonymous; peers can observe addresses and timing.
+    #[default]
+    Direct,
+    /// A hidden route is required. No such transport is implemented here, so
+    /// startup fails closed instead of falling back to direct dialing.
+    TorRequired,
+}
+
+impl TransportPrivacyMode {
+    /// Honest description. It does not claim anonymity or an active route.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Direct => "Direct TCP + Noise (not anonymous)",
+            Self::TorRequired => "Tor required (unavailable; startup refused)",
+        }
+    }
+}
+
 /// Operational mode for optional peer-operated circuit relays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RelayMode {
@@ -149,6 +172,8 @@ pub enum IdentifyEvent {
 /// only after the corresponding libp2p behaviour emits a real event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkPrivacyStatus {
+    /// Requested mode, not an observed anonymity property.
+    pub transport_mode: TransportPrivacyMode,
     pub identify_enabled: bool,
     pub ping_enabled: bool,
     pub mdns_enabled: bool,
@@ -179,6 +204,7 @@ pub struct NetworkPrivacyStatus {
 impl Default for NetworkPrivacyStatus {
     fn default() -> Self {
         Self {
+            transport_mode: TransportPrivacyMode::Direct,
             identify_enabled: false,
             ping_enabled: false,
             mdns_enabled: false,
@@ -224,6 +250,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transport_mode_default_is_direct_without_an_anonymity_claim() {
+        assert_eq!(
+            TransportPrivacyMode::default(),
+            TransportPrivacyMode::Direct
+        );
+        assert!(
+            TransportPrivacyMode::Direct
+                .description()
+                .contains("not anonymous")
+        );
+        assert!(
+            TransportPrivacyMode::TorRequired
+                .description()
+                .contains("startup refused")
+        );
+    }
+
+    #[test]
     fn relay_mode_default_is_off() {
         assert_eq!(RelayMode::default(), RelayMode::Off);
         assert!(!RelayMode::Off.is_enabled());
@@ -252,6 +296,7 @@ mod tests {
     #[test]
     fn nat_description_never_claims_connectivity() {
         let mut status = NetworkPrivacyStatus {
+            transport_mode: TransportPrivacyMode::Direct,
             identify_enabled: false,
             ping_enabled: false,
             mdns_enabled: false,

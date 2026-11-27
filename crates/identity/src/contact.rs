@@ -284,10 +284,7 @@ mod tests {
 
         assert!(svg.starts_with("<?xml"));
         assert!(svg.contains("<svg"));
-        let private = identity
-            .keypair()
-            .to_protobuf_encoding()
-            .expect("private key encoding");
+        let private = identity.export_keypair_bytes();
         let hex: String = private
             .iter()
             .map(|byte| format!("{byte:02x}"))

@@ -1,9 +1,9 @@
 //! UI state and pure helpers. This module has no GUI-toolkit dependency so it
 //! can be unit-tested on any host, including machines without display libraries.
 
-use p2p_chat::{ConversationInfo, parse_address};
+use p2p_chat::{ChannelGroupStatus, ConversationInfo, parse_address};
 use p2p_core::AppInfo;
-use p2p_network::{NetworkConfig, NetworkPrivacyStatus, RelayMode};
+use p2p_network::{NetworkConfig, NetworkPrivacyStatus, RelayMode, TransportPrivacyMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Theme {
@@ -125,6 +125,9 @@ impl NetworkOptions {
         }
 
         Ok(NetworkConfig {
+            // The GUI never offers Tor-required mode. Direct is explicit so a
+            // future config default cannot silently introduce a fallback path.
+            transport_mode: TransportPrivacyMode::Direct,
             enable_identify: self.enable_identify,
             enable_ping: self.enable_ping,
             enable_mdns: self.enable_mdns,
@@ -147,6 +150,56 @@ pub struct NetworkInfo {
     pub listen_addresses: Vec<String>,
     pub connected_peers: usize,
     pub privacy: NetworkPrivacyStatus,
+}
+
+/// Short, visible copy for the file affordance. The native build opens an OS
+/// picker; feature-only builds say so instead of offering a dead control.
+pub fn file_picker_hint() -> &'static str {
+    if cfg!(feature = "native") {
+        "Choose a file from your device"
+    } else {
+        "File picker requires the native build"
+    }
+}
+
+/// One-line default file explanation. Longer safety boundaries stay in the
+/// collapsed details panel so the normal send flow is not a setup checklist.
+pub fn file_send_summary() -> &'static str {
+    "Files are encrypted and stay quarantined until you explicitly approve them."
+}
+
+/// Detailed network wording is opt-in so the default screen stays calm. All
+/// values remain off/empty unless the user changes them explicitly.
+pub fn network_settings_details() -> &'static str {
+    "Optional capabilities are off and address lists are empty by default. Discovery candidates are advisory only: never auto-dialed, trusted, or fingerprint-verified. Relay operators can observe IPs, timing, and sizes and can deny service; file transfer over a relay is disabled. AutoNAT and DCUtR are best effort, not universal NAT traversal. There is no Tor/I2P/mixnet, anonymity, or metadata privacy claim. Settings apply when the network worker starts: lock and unlock the vault after changing them."
+}
+
+fn channel_group_label(status: ChannelGroupStatus) -> String {
+    match status {
+        ChannelGroupStatus::DefaultOnParent => "default text on parent MLS group".to_owned(),
+        ChannelGroupStatus::DerivedReady => "derived text group ready".to_owned(),
+        ChannelGroupStatus::DerivedSettingUp { awaited } => {
+            format!("derived text group setting up ({awaited} acknowledgement(s) outstanding)")
+        }
+        ChannelGroupStatus::Missing => "derived text group not started".to_owned(),
+    }
+}
+
+fn channel_group_access(status: ChannelGroupStatus) -> String {
+    match status {
+        ChannelGroupStatus::DefaultOnParent => {
+            "default text uses parent MLS group · all parent members hold its keys · not a complete ACL".to_owned()
+        }
+        ChannelGroupStatus::DerivedReady => {
+            "non-default text and receipts use a ready derived MLS group · parent policy stays on parent group · not a complete ACL".to_owned()
+        }
+        ChannelGroupStatus::DerivedSettingUp { awaited } => format!(
+            "derived MLS group setting up · {awaited} acknowledgement(s) outstanding · non-default text blocked · parent policy stays on parent group"
+        ),
+        ChannelGroupStatus::Missing => {
+            "derived MLS group not started · non-default text blocked · parent policy stays on parent group".to_owned()
+        }
+    }
 }
 
 /// Statuses are observations, not aspirations. Vault state, connection state,
@@ -281,31 +334,33 @@ pub fn security_rows(
             });
             let active_channel = match selected {
                 Some(channel) => format!(
-                    "#{} · revision {}",
+                    "#{} · revision {} · {}",
                     truncate(&channel.name, 16),
-                    channel.revision
+                    channel.revision,
+                    channel_group_label(channel.group_status)
                 ),
                 None => "No channel selected".to_owned(),
             };
             let channel_policy = match selected {
-                Some(channel) if channel.acknowledged => format!(
-                    "{} allowed members · policy acknowledged",
-                    channel.members.len()
-                ),
                 Some(channel) => format!(
-                    "{} allowed members · policy awaiting receipts",
-                    channel.members.len()
+                    "parent MLS group (CHN1) · {} allowed members · policy {}",
+                    channel.members.len(),
+                    if channel.policy_acknowledged {
+                        "acknowledged"
+                    } else {
+                        "awaiting receipts"
+                    }
                 ),
                 None => "none (no channel selected)".to_owned(),
             };
-            (
-                active_channel,
-                channel_policy,
-                format!(
-                    "{} channels in local view · application policy only",
+            let channel_access = match selected {
+                Some(channel) => channel_group_access(channel.group_status),
+                None => format!(
+                    "{} channels in local view · default text uses parent MLS group · parent policy metadata is not a complete ACL",
                     info.channels.len()
                 ),
-            )
+            };
+            (active_channel, channel_policy, channel_access)
         }
         None => (
             "No channel selected".to_owned(),
@@ -378,6 +433,10 @@ pub fn security_rows(
         StatusRow {
             label: "Quarantine deletion",
             value: "Retain by default; explicit request only where enabled".to_owned(),
+        },
+        StatusRow {
+            label: "Transport mode",
+            value: privacy.transport_mode.description().to_owned(),
         },
         StatusRow {
             label: "Bootstrap services",
@@ -482,7 +541,7 @@ mod tests {
         let network = network_info(1);
         let rows = security_rows(&VaultState::Unlocked(info.clone()), Some(&network), None);
 
-        assert_eq!(rows.len(), 24);
+        assert_eq!(rows.len(), 25);
         assert!(
             rows.iter()
                 .any(|row| row.label == "Fingerprint" && row.value == info.fingerprint)
@@ -561,12 +620,13 @@ mod tests {
                 creator: peer,
                 members: vec![peer],
                 revision: 2,
-                acknowledged: false,
+                policy_acknowledged: false,
+                group_status: ChannelGroupStatus::DefaultOnParent,
             }],
             active_channel: Some([9u8; 16]),
         };
         let rows = security_rows(&VaultState::Unlocked(unlocked_info()), None, Some(&group));
-        assert_eq!(rows.len(), 24);
+        assert_eq!(rows.len(), 25);
         let control = rows
             .iter()
             .find(|row| row.label == "Group control")
@@ -585,6 +645,143 @@ mod tests {
             .expect("active channel row");
         assert!(channel.value.contains("general"));
         assert!(channel.value.contains("revision 2"));
+        assert!(channel.value.contains("default text on parent MLS group"));
+        let policy = rows
+            .iter()
+            .find(|row| row.label == "Channel policy")
+            .expect("channel policy row");
+        assert!(policy.value.contains("parent MLS group (CHN1)"));
+        assert!(policy.value.contains("policy awaiting receipts"));
+        let access = rows
+            .iter()
+            .find(|row| row.label == "Channel access")
+            .expect("channel access row");
+        assert!(access.value.contains("all parent members hold its keys"));
+        assert!(access.value.contains("not a complete ACL"));
+    }
+
+    #[test]
+    fn default_channel_status_reports_parent_group_without_acl_claim() {
+        let peer = Identity::generate().expect("peer identity").peer_id();
+        let group = ConversationInfo {
+            conversation_id: [10u8; 16],
+            peer,
+            admin: peer,
+            members: vec![peer],
+            epoch: 1,
+            status: ConversationStatus::Joined,
+            pending_operation: None,
+            channels: vec![ChannelInfo {
+                channel_id: [11u8; 16],
+                name: "general".to_owned(),
+                creator: peer,
+                members: vec![peer],
+                revision: 1,
+                policy_acknowledged: true,
+                group_status: ChannelGroupStatus::DefaultOnParent,
+            }],
+            active_channel: Some([11u8; 16]),
+        };
+        let rows = security_rows(&VaultState::Unlocked(unlocked_info()), None, Some(&group));
+        let active = rows
+            .iter()
+            .find(|row| row.label == "Active channel")
+            .expect("active channel row");
+        assert!(active.value.contains("default text on parent MLS group"));
+        let policy = rows
+            .iter()
+            .find(|row| row.label == "Channel policy")
+            .expect("channel policy row");
+        assert!(policy.value.contains("parent MLS group (CHN1)"));
+        assert!(policy.value.contains("policy acknowledged"));
+        let access = rows
+            .iter()
+            .find(|row| row.label == "Channel access")
+            .expect("channel access row");
+        assert!(access.value.contains("all parent members hold its keys"));
+        assert!(access.value.contains("not a complete ACL"));
+    }
+
+    #[test]
+    fn derived_channel_reports_ready_group_and_parent_policy_boundary() {
+        let peer = Identity::generate().expect("peer identity").peer_id();
+        let group = ConversationInfo {
+            conversation_id: [12u8; 16],
+            peer,
+            admin: peer,
+            members: vec![peer],
+            epoch: 2,
+            status: ConversationStatus::Joined,
+            pending_operation: None,
+            channels: vec![ChannelInfo {
+                channel_id: [13u8; 16],
+                name: "ops".to_owned(),
+                creator: peer,
+                members: vec![peer],
+                revision: 1,
+                policy_acknowledged: true,
+                group_status: ChannelGroupStatus::DerivedReady,
+            }],
+            active_channel: Some([13u8; 16]),
+        };
+        let rows = security_rows(&VaultState::Unlocked(unlocked_info()), None, Some(&group));
+        let active = rows
+            .iter()
+            .find(|row| row.label == "Active channel")
+            .expect("active channel row");
+        assert!(active.value.contains("derived text group ready"));
+        let policy = rows
+            .iter()
+            .find(|row| row.label == "Channel policy")
+            .expect("channel policy row");
+        assert!(policy.value.contains("parent MLS group (CHN1)"));
+        assert!(policy.value.contains("1 allowed members"));
+        let access = rows
+            .iter()
+            .find(|row| row.label == "Channel access")
+            .expect("channel access row");
+        assert!(
+            access
+                .value
+                .contains("non-default text and receipts use a ready derived MLS group")
+        );
+        assert!(access.value.contains("parent policy stays on parent group"));
+        assert!(access.value.contains("not a complete ACL"));
+    }
+
+    #[test]
+    fn derived_channel_setup_status_does_not_claim_readiness() {
+        let peer = Identity::generate().expect("peer identity").peer_id();
+        let group = ConversationInfo {
+            conversation_id: [14u8; 16],
+            peer,
+            admin: peer,
+            members: vec![peer],
+            epoch: 3,
+            status: ConversationStatus::Joined,
+            pending_operation: None,
+            channels: vec![ChannelInfo {
+                channel_id: [15u8; 16],
+                name: "ops".to_owned(),
+                creator: peer,
+                members: vec![peer],
+                revision: 1,
+                policy_acknowledged: false,
+                group_status: ChannelGroupStatus::DerivedSettingUp { awaited: 2 },
+            }],
+            active_channel: Some([15u8; 16]),
+        };
+        let rows = security_rows(&VaultState::Unlocked(unlocked_info()), None, Some(&group));
+        let active = rows
+            .iter()
+            .find(|row| row.label == "Active channel")
+            .expect("active channel row");
+        assert!(
+            active
+                .value
+                .contains("setting up (2 acknowledgement(s) outstanding)")
+        );
+        assert!(!active.value.contains("ready"));
         let policy = rows
             .iter()
             .find(|row| row.label == "Channel policy")
@@ -594,8 +791,9 @@ mod tests {
             .iter()
             .find(|row| row.label == "Channel access")
             .expect("channel access row");
-        assert!(access.value.contains("1 channels in local view"));
-        assert!(access.value.contains("application policy only"));
+        assert!(access.value.contains("2 acknowledgement(s) outstanding"));
+        assert!(access.value.contains("non-default text blocked"));
+        assert!(!access.value.contains("text and receipts use a ready"));
     }
 
     #[test]
@@ -697,6 +895,7 @@ mod tests {
         assert!(config.kad_bootstrap_peers.is_empty());
         assert!(config.relay_servers.is_empty());
         assert_eq!(config.relay_mode, RelayMode::Off);
+        assert_eq!(config.transport_mode, TransportPrivacyMode::Direct);
     }
 
     #[test]
@@ -782,7 +981,7 @@ mod tests {
             ..NetworkPrivacyStatus::default()
         };
         let rows = security_rows(&VaultState::Unlocked(unlocked_info()), Some(&network), None);
-        assert_eq!(rows.len(), 24);
+        assert_eq!(rows.len(), 25);
         let value = |label: &'static str| {
             rows.iter()
                 .find(|row| row.label == label)
@@ -790,6 +989,8 @@ mod tests {
                 .value
                 .clone()
         };
+        assert!(value("Transport mode").contains("Direct TCP + Noise"));
+        assert!(value("Transport mode").contains("not anonymous"));
         assert!(value("Bootstrap services").contains("1 user-supplied"));
         assert!(value("Optional capabilities").contains("identify on"));
         assert!(value("Optional capabilities").contains("ping off"));
@@ -806,5 +1007,22 @@ mod tests {
         );
         assert!(value("NAT observation").contains("no AutoNAT observation"));
         assert!(value("Anonymity").contains("No Tor/I2P/mixnet"));
+    }
+
+    #[test]
+    fn file_picker_copy_does_not_ask_for_a_manual_path() {
+        let hint = file_picker_hint();
+        assert!(!hint.contains("path"));
+        assert!(hint.contains("Choose a file") || hint.contains("native build"));
+        assert!(file_send_summary().contains("quarantined"));
+    }
+
+    #[test]
+    fn network_details_keep_the_bounded_non_claims() {
+        let details = network_settings_details();
+        assert!(details.contains("off and address lists are empty by default"));
+        assert!(details.contains("advisory only"));
+        assert!(details.contains("relay"));
+        assert!(details.contains("no Tor/I2P/mixnet"));
     }
 }

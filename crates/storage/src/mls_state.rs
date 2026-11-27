@@ -14,7 +14,10 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use super::control_log::write_current_anchor_to;
-use super::{Session, StorageError, fixed, index_input, tagged_aad};
+use super::{
+    MLS_KEY_VERSION_DEDICATED, MLS_KEY_VERSION_LEGACY, Session, StorageError, fixed, index_input,
+    tagged_aad,
+};
 
 const STATE_AAD: &[u8] = b"p2p-messenger/mls-state/v1";
 const GROUP_AAD: &[u8] = b"p2p-messenger/mls-group/v1";
@@ -444,8 +447,14 @@ pub(crate) fn collect_mls_watermarks(
 }
 
 impl Session {
-    fn mls_key(&self) -> Zeroizing<[u8; 32]> {
-        self.subkeys.derive(Purpose::Db)
+    /// Key protecting this vault's MLS rows. New vaults use a dedicated
+    /// purpose; legacy vaults keep the general DB key they were written with.
+    pub(crate) fn mls_key(&self) -> Zeroizing<[u8; 32]> {
+        match self.mls_key_version {
+            MLS_KEY_VERSION_DEDICATED => self.subkeys.derive(Purpose::MlsState),
+            MLS_KEY_VERSION_LEGACY => self.subkeys.derive(Purpose::Db),
+            _ => unreachable!("read_profile rejects unknown MLS key versions"),
+        }
     }
 
     /// Store one opaque OpenMLS provider value. The caller supplies only
@@ -530,7 +539,13 @@ impl Session {
         // Install the new watermark before committing the database change. A
         // crash after this point leaves the anchor ahead and fails closed, so
         // an older database cannot silently replace the newer MLS state.
-        write_current_anchor_to(&vault_dir, &subkeys, &profile_id, &transaction)?;
+        write_current_anchor_to(
+            &vault_dir,
+            &subkeys,
+            &profile_id,
+            &transaction,
+            &storage_key,
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -644,7 +659,13 @@ impl Session {
                 ],
             )?;
         }
-        write_current_anchor_to(&vault_dir, &subkeys, &profile_id, &transaction)?;
+        write_current_anchor_to(
+            &vault_dir,
+            &subkeys,
+            &profile_id,
+            &transaction,
+            &storage_key,
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -780,6 +801,7 @@ impl Session {
     /// not a claim of secure erasure.
     pub fn delete_mls_state_group(&mut self, group_id: &[u8; 16]) -> Result<(), StorageError> {
         let group_bi = self.group_index(group_id).to_vec();
+        let storage_key = self.mls_key();
         let vault_dir = self.vault_dir.clone();
         let subkeys = self.subkeys.clone();
         let profile_id = self.profile_id;
@@ -794,7 +816,13 @@ impl Session {
         )?;
         // Anchor first: a database restored to a state where this group still
         // exists must not be accepted after an explicit deletion.
-        write_current_anchor_to(&vault_dir, &subkeys, &profile_id, &transaction)?;
+        write_current_anchor_to(
+            &vault_dir,
+            &subkeys,
+            &profile_id,
+            &transaction,
+            &storage_key,
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -928,6 +956,7 @@ mod tests {
             &subkeys,
             &profile_id,
             &transaction,
+            &storage_key,
         )
         .expect("install interrupted anchor");
         drop(transaction);
@@ -937,6 +966,7 @@ mod tests {
     /// the still-open transaction, then deliberately roll back without
     /// committing.
     fn interrupt_anchor_first_delete(session: &mut Session, group_id: [u8; 16]) {
+        let storage_key = session.mls_key();
         let group_bi = session.group_index(&group_id).to_vec();
         let transaction = session
             .conn
@@ -959,6 +989,7 @@ mod tests {
             &session.subkeys,
             &session.profile_id,
             &transaction,
+            &storage_key,
         )
         .expect("install interrupted delete anchor");
         drop(transaction);
@@ -1097,5 +1128,116 @@ mod tests {
             vec![group],
             "the interrupted deletion must not survive its rolled-back transaction"
         );
+    }
+
+    #[test]
+    fn new_vault_encrypts_mls_state_with_the_dedicated_purpose() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut session = vault_session(directory.path());
+        let group = [41u8; 16];
+        let label = "OwnLeafNodeIndex";
+        let key = b"dedicated".to_vec();
+        session
+            .store_mls_state(&group, label, &key, 1, b"secret-mls-state")
+            .expect("store MLS state");
+
+        let group_bi = session.group_index(&group);
+        let entity_bi = session.entity_index(&group, label, &key);
+        let ciphertext: Vec<u8> = session
+            .conn
+            .query_row(
+                "SELECT ciphertext FROM mls_state WHERE group_bi = ?1 AND entity_bi = ?2",
+                params![group_bi.to_vec(), entity_bi.to_vec()],
+                |row| row.get(0),
+            )
+            .expect("stored ciphertext");
+        let aad = state_aad(&session.profile_id, &group_bi, &entity_bi, 1);
+        let dedicated = session.subkeys.derive(Purpose::MlsState);
+        let legacy = session.subkeys.derive(Purpose::Db);
+
+        assert!(
+            decrypt_bytes(&dedicated, &ciphertext, &aad).is_ok(),
+            "the dedicated MLS key must decrypt the row"
+        );
+        assert!(
+            decrypt_bytes(&legacy, &ciphertext, &aad).is_err(),
+            "the general DB key must not decrypt an MLS row"
+        );
+    }
+
+    #[test]
+    fn legacy_mls_key_version_keeps_legacy_vaults_readable() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let vault = Vault::open(directory.path()).expect("vault");
+        let identity = Identity::generate().expect("identity");
+        {
+            let session = vault
+                .create("mls-state-unit", "mls-state-password", &identity)
+                .expect("create vault");
+            assert_eq!(session.mls_key_version, MLS_KEY_VERSION_DEDICATED);
+            let salts = super::super::flatten_salts(session.subkeys.salts());
+            let legacy_len = (Purpose::ALL.len() - 1) * super::super::SALT_LEN;
+            session
+                .conn
+                .execute(
+                    "UPDATE profile SET subkey_salts = ?1, mls_key_version = ?2 WHERE id = 1",
+                    params![salts[..legacy_len].to_vec(), MLS_KEY_VERSION_LEGACY],
+                )
+                .expect("convert the profile to the legacy layout");
+        }
+
+        let mut session = vault
+            .unlock("mls-state-password")
+            .expect("unlock legacy-layout vault");
+        assert_eq!(session.mls_key_version, MLS_KEY_VERSION_LEGACY);
+        let group = [42u8; 16];
+        session
+            .store_mls_state(&group, "tree", b"node", 1, b"legacy-value")
+            .expect("store under the legacy key");
+
+        let group_bi = session.group_index(&group);
+        let entity_bi = session.entity_index(&group, "tree", b"node");
+        let ciphertext: Vec<u8> = session
+            .conn
+            .query_row(
+                "SELECT ciphertext FROM mls_state WHERE group_bi = ?1 AND entity_bi = ?2",
+                params![group_bi.to_vec(), entity_bi.to_vec()],
+                |row| row.get(0),
+            )
+            .expect("stored ciphertext");
+        let aad = state_aad(&session.profile_id, &group_bi, &entity_bi, 1);
+        assert!(
+            decrypt_bytes(&session.subkeys.derive(Purpose::Db), &ciphertext, &aad).is_ok(),
+            "legacy rows must stay readable with the DB key"
+        );
+        assert!(
+            decrypt_bytes(
+                &session.subkeys.derive(Purpose::MlsState),
+                &ciphertext,
+                &aad
+            )
+            .is_err(),
+            "legacy rows must not silently switch keys"
+        );
+    }
+
+    #[test]
+    fn corrupt_mls_key_version_fails_closed() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let vault = Vault::open(directory.path()).expect("vault");
+        let identity = Identity::generate().expect("identity");
+        {
+            let session = vault
+                .create("mls-state-unit", "mls-state-password", &identity)
+                .expect("create vault");
+            session
+                .conn
+                .execute("UPDATE profile SET mls_key_version = 9 WHERE id = 1", [])
+                .expect("corrupt MLS key version");
+        }
+        assert!(matches!(
+            vault.unlock("mls-state-password"),
+            Err(StorageError::InvalidProfile(_))
+        ));
     }
 }

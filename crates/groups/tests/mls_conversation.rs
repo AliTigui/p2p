@@ -3,8 +3,15 @@
 #![forbid(unsafe_code)]
 
 use p2p_groups::{GroupError, GroupOperation, MlsConversation};
-use p2p_identity::Identity;
+use p2p_identity::{Identity, IdentityRole};
 use p2p_messaging::{DeliveryState, Envelope, EnvelopeParams, MessageKind, Receipt, ReceiptStatus};
+
+fn mls_key(identity: &Identity) -> Vec<u8> {
+    identity
+        .role_public_bytes(IdentityRole::Mls)
+        .expect("certified MLS role key")
+        .to_vec()
+}
 
 fn pair() -> (Identity, Identity, MlsConversation, MlsConversation) {
     let alice_identity = Identity::generate().expect("alice identity");
@@ -16,7 +23,7 @@ fn pair() -> (Identity, Identity, MlsConversation, MlsConversation) {
         .add_member(
             key_package.bytes(),
             bob_identity.peer_id(),
-            &bob_identity.public_key_bytes(),
+            &mls_key(&bob_identity),
         )
         .expect("add bob");
     let bob =
@@ -38,7 +45,7 @@ fn join_rejects_an_identity_that_does_not_own_the_key_package() {
         .add_member(
             key_package.bytes(),
             bob_identity.peer_id(),
-            &bob_identity.public_key_bytes(),
+            &mls_key(&bob_identity),
         )
         .expect("add bob");
 
@@ -185,7 +192,7 @@ fn adding_a_member_rejects_a_mismatched_public_key() {
         .add_member(
             key_package.bytes(),
             bob_identity.peer_id(),
-            &mallory_identity.public_key_bytes(),
+            &mls_key(&mallory_identity),
         )
         .expect_err("mismatched public key must be rejected");
     assert!(matches!(error, GroupError::SenderMismatch));
@@ -211,7 +218,7 @@ fn trio() -> Trio {
         .add_member_parts(
             bob_package.bytes(),
             bob_identity.peer_id(),
-            &bob_identity.public_key_bytes(),
+            &mls_key(&bob_identity),
         )
         .expect("alice adds bob");
     let mut bob = MlsConversation::join(&bob_identity, alice.id(), bob_package, &bob_welcome)
@@ -223,14 +230,14 @@ fn trio() -> Trio {
         .add_member_parts(
             charlie_package.bytes(),
             charlie_identity.peer_id(),
-            &charlie_identity.public_key_bytes(),
+            &mls_key(&charlie_identity),
         )
         .expect("alice adds charlie");
     let outcome = bob
         .process_commit(
             &add_commit,
             &alice_identity.peer_id(),
-            &alice_identity.public_key_bytes(),
+            &mls_key(&alice_identity),
             GroupOperation::Add,
             Some(charlie_identity.peer_id()),
         )
@@ -274,7 +281,7 @@ fn three_member_group_applies_authorized_remove_and_excludes_removed_member() {
         .process_commit(
             &commit,
             &alice_identity.peer_id(),
-            &alice_identity.public_key_bytes(),
+            &mls_key(&alice_identity),
             GroupOperation::Remove,
             Some(charlie_identity.peer_id()),
         )
@@ -322,7 +329,7 @@ fn three_member_group_applies_authorized_self_update() {
         .process_commit(
             &commit,
             &alice_identity.peer_id(),
-            &alice_identity.public_key_bytes(),
+            &mls_key(&alice_identity),
             GroupOperation::Update,
             None,
         )
@@ -331,7 +338,7 @@ fn three_member_group_applies_authorized_self_update() {
         .process_commit(
             &commit,
             &alice_identity.peer_id(),
-            &alice_identity.public_key_bytes(),
+            &mls_key(&alice_identity),
             GroupOperation::Update,
             None,
         )
@@ -361,18 +368,14 @@ fn commit_with_a_different_declared_operation_is_rejected() {
     let dave = Identity::generate().expect("dave identity");
     let dave_package = MlsConversation::key_package(&dave).expect("dave key package");
     let (_, add_commit) = alice
-        .add_member_parts(
-            dave_package.bytes(),
-            dave.peer_id(),
-            &dave.public_key_bytes(),
-        )
+        .add_member_parts(dave_package.bytes(), dave.peer_id(), &mls_key(&dave))
         .expect("alice adds dave");
 
     let error = bob
         .process_commit(
             &add_commit,
             &alice_identity.peer_id(),
-            &alice_identity.public_key_bytes(),
+            &mls_key(&alice_identity),
             GroupOperation::Remove,
             Some(dave.peer_id()),
         )

@@ -1,6 +1,6 @@
 //! End-to-end public-API test: generate, share, verify, back up, restore.
 
-use p2p_identity::{ContactPayload, EncryptedIdentity, Identity};
+use p2p_identity::{ContactPayload, EncryptedIdentity, Identity, IdentityRole};
 
 #[test]
 fn two_installations_can_exchange_and_verify_a_contact_without_infrastructure() {
@@ -46,4 +46,30 @@ fn encrypted_export_restores_the_exact_same_peer_identity() {
     assert_eq!(restored.peer_id(), original.peer_id());
     assert_eq!(restored.public_key_bytes(), original.public_key_bytes());
     assert_eq!(restored.fingerprint(), original.fingerprint());
+}
+
+#[test]
+fn independent_devices_keep_separate_keys_but_portable_export_preserves_a_bundle() {
+    let first = Identity::generate().expect("first device");
+    let second = Identity::generate().expect("second device");
+    assert_ne!(
+        first
+            .role_public_bytes(IdentityRole::Device)
+            .expect("first device key"),
+        second
+            .role_public_bytes(IdentityRole::Device)
+            .expect("second device key")
+    );
+
+    let backup = EncryptedIdentity::encrypt(&first, "device backup").expect("encrypt");
+    let restored = EncryptedIdentity::from_bytes(backup.as_bytes())
+        .expect("validate")
+        .decrypt("device backup")
+        .expect("decrypt");
+    for role in IdentityRole::ALL {
+        assert_eq!(
+            first.role_public_bytes(role).expect("source role key"),
+            restored.role_public_bytes(role).expect("restored role key"),
+        );
+    }
 }

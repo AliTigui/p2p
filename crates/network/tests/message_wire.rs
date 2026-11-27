@@ -8,8 +8,15 @@ use std::time::{Duration, Instant};
 
 use libp2p::{Multiaddr, PeerId as SwarmPeerId};
 use p2p_groups::MlsConversation;
-use p2p_identity::Identity;
+use p2p_identity::{Identity, IdentityRole};
 use p2p_messaging::{DeliveryState, Envelope, MessageKind, Receipt, ReceiptStatus};
+
+fn mls_key(identity: &Identity) -> Vec<u8> {
+    identity
+        .role_public_bytes(IdentityRole::Mls)
+        .expect("certified MLS role key")
+        .to_vec()
+}
 use p2p_network::{ConnectionState, MessageEvent, Network, NetworkConfig};
 
 fn local_config() -> NetworkConfig {
@@ -94,7 +101,7 @@ fn mls_conversations(
         .add_member(
             key_package.bytes(),
             bob_identity.peer_id(),
-            &bob_identity.public_key_bytes(),
+            &mls_key(bob_identity),
         )
         .expect("add bob to MLS group");
     let bob = MlsConversation::join(bob_identity, alice.id(), key_package, &welcome)

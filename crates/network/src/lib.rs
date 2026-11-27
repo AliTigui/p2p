@@ -50,7 +50,7 @@ use pending_admission::PerIpPendingTransport;
 
 pub use privacy::{
     DiscoveryEvent, DiscoverySource, IdentifyEvent, NatEvent, NetworkPrivacyStatus, RelayEvent,
-    RelayMode,
+    RelayMode, TransportPrivacyMode,
 };
 pub use protocol::{
     CONTROL_PROTOCOL, FILE_PROTOCOL, MAX_MESSAGE_BYTES, MESSAGE_PROTOCOL, MLS_SETUP_PROTOCOL,
@@ -847,6 +847,9 @@ pub struct NetworkConfig {
     /// Sliding window used by the per-peer request and byte limits.
     pub rate_window: Duration,
 
+    /// Requested transport privacy. `TorRequired` is deliberately unsupported
+    /// and is rejected by `validate_config`; direct fallback is never used.
+    pub transport_mode: TransportPrivacyMode,
     /// Enable privacy-hardened libp2p identify. Disabled by default because it
     /// reveals a protocol list even when listen addresses are hidden.
     pub enable_identify: bool,
@@ -890,6 +893,7 @@ impl Default for NetworkConfig {
             max_requests_per_peer_per_window: 64,
             max_request_bytes_per_peer_per_window: 16 * MAX_MESSAGE_BYTES,
             rate_window: Duration::from_secs(1),
+            transport_mode: TransportPrivacyMode::Direct,
             enable_identify: false,
             enable_ping: false,
             enable_mdns: false,
@@ -1446,6 +1450,7 @@ fn validate_direct_peer_address(address: &Multiaddr) -> Result<(), NetworkError>
 
 fn privacy_status_from_config(config: &NetworkConfig) -> NetworkPrivacyStatus {
     NetworkPrivacyStatus {
+        transport_mode: config.transport_mode,
         identify_enabled: config.enable_identify,
         ping_enabled: config.enable_ping,
         mdns_enabled: config.enable_mdns,
@@ -1466,6 +1471,11 @@ fn privacy_status_from_config(config: &NetworkConfig) -> NetworkPrivacyStatus {
 }
 
 fn validate_config(config: &NetworkConfig) -> Result<(), NetworkError> {
+    if config.transport_mode == TransportPrivacyMode::TorRequired {
+        return Err(NetworkError::InvalidConfig(
+            "Tor-required transport is unavailable; direct fallback is disabled".to_owned(),
+        ));
+    }
     if config.max_total_connections == 0
         || config.max_connections_per_peer == 0
         || config.max_connections_per_ip == 0
@@ -2183,7 +2193,7 @@ fn run_worker(
                             // a dedicated relay-safe file-key/transport design
                             // exists; it is not a claim that the relay can
                             // read the offer.
-                            if relayed_peers.get(&peer).copied().unwrap_or(0) > 0 {
+                            if !outbound_file_request_allowed(peer, &relayed_peers) {
                                 emit_file(&file_events, FileEvent::Failed {
                                     request_id: Some(id),
                                     response_id: None,
@@ -2637,6 +2647,13 @@ fn handle_setup_event(
     }
 }
 
+/// Refuse outbound file offers on an observed relayed path. The same policy
+/// applies to inbound requests in `file_request_policy_response_id`; neither
+/// direction depends on an application-level claim about the relay.
+fn outbound_file_request_allowed(peer: PeerId, relayed_peers: &HashMap<PeerId, usize>) -> bool {
+    relayed_peers.get(&peer).copied().unwrap_or(0) == 0
+}
+
 /// Allocate a response ID for an inbound file request unless the peer is on an
 /// observed relayed path. Rejection emits one `FileEvent::Failed` and allocates
 /// no pending response slot. This helper is separate from the libp2p event
@@ -3044,6 +3061,28 @@ mod tests {
     }
 
     #[test]
+    fn tor_required_fails_closed_without_direct_fallback() {
+        let identity = Identity::generate().expect("identity");
+        let config = NetworkConfig {
+            transport_mode: TransportPrivacyMode::TorRequired,
+            ..NetworkConfig::default()
+        };
+        assert!(matches!(
+            validate_config(&config),
+            Err(NetworkError::InvalidConfig(reason))
+                if reason.contains("direct fallback is disabled")
+        ));
+        assert!(matches!(
+            Network::start(&identity, config),
+            Err(NetworkError::InvalidConfig(_))
+        ));
+        assert_eq!(
+            privacy_status_from_config(&NetworkConfig::default()).transport_mode,
+            TransportPrivacyMode::Direct
+        );
+    }
+
+    #[test]
     fn optional_config_validation_rejects_missing_or_indirect_peers() {
         let identity = Identity::generate().expect("identity");
         let peer =
@@ -3230,6 +3269,30 @@ mod tests {
         assert!(
             !limiter.allow(peer, RequestProtocol::File, 1, now),
             "the aggregate request ceiling must still apply"
+        );
+    }
+
+    #[test]
+    fn hostile_peer_matrix_cannot_bypass_the_aggregate_byte_ceiling() {
+        let config = NetworkConfig {
+            rate_window: Duration::from_secs(1),
+            max_requests_per_peer_per_window: 64,
+            max_request_bytes_per_peer_per_window: 128,
+            ..NetworkConfig::default()
+        };
+        let mut limiter = RateLimiter::new(&config);
+        let peer = generated_peer_id();
+        let now = Instant::now();
+
+        for protocol in RequestProtocol::ALL {
+            assert!(
+                !limiter.allow(peer, protocol, 129, now),
+                "oversized request must be denied on every protocol"
+            );
+        }
+        assert!(
+            limiter.entries.is_empty() && limiter.protocol_entries.is_empty(),
+            "denied hostile requests must not reserve accounting state"
         );
     }
 
@@ -3474,6 +3537,15 @@ mod tests {
             received.try_recv().is_err(),
             "a direct peer must not produce a policy failure"
         );
+    }
+
+    #[test]
+    fn outbound_file_requests_use_the_same_relay_policy_as_inbound() {
+        let peer = generated_peer_id();
+        let relayed = HashMap::from([(peer, 2usize)]);
+        assert!(!outbound_file_request_allowed(peer, &relayed));
+        let direct = HashMap::new();
+        assert!(outbound_file_request_allowed(peer, &direct));
     }
 
     #[test]

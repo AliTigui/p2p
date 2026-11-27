@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 
 use libp2p_identity::PeerId;
 use p2p_chat::{
-    ChatError, ConversationInfo, ConversationStatus, DEFAULT_CHANNEL_ID, FileConfig, FileFormat,
-    FileScanner, GroupOperation, MessageOrigin, MessengerController, QuarantineDeletionPolicy,
-    RedialState, ReleaseApproval, ReleasePolicy, SETUP_VERSION, ScanRequest, ScanResult,
-    ScanStatus, SecurityConfig, SetupEnvelope, SetupMessage, TransferDirection, TransferStatus,
-    parse_address,
+    ChannelGroupStatus, ChatError, ConversationInfo, ConversationStatus, DEFAULT_CHANNEL_ID,
+    FileConfig, FileFormat, FileScanner, GroupOperation, MessageOrigin, MessengerController,
+    QuarantineDeletionPolicy, RedialState, ReleaseApproval, ReleasePolicy, SETUP_VERSION,
+    ScanRequest, ScanResult, ScanStatus, SecurityConfig, SetupEnvelope, SetupMessage,
+    TransferDirection, TransferStatus, parse_address,
 };
 use p2p_identity::Identity;
 use p2p_messaging::DeliveryState;
@@ -1444,7 +1444,10 @@ fn channels_are_logical_partitions_inside_one_mls_group() {
                         .into_iter()
                         .find(|channel| channel.channel_id == channel_id)
                 })
-                .is_some_and(|channel| channel.acknowledged)
+                .is_some_and(|channel| {
+                    channel.policy_acknowledged
+                        && channel.group_status == ChannelGroupStatus::DerivedReady
+                })
         },
         Duration::from_secs(10),
     );
@@ -1587,6 +1590,23 @@ fn channel_policy_is_admin_only_and_membership_is_enforced() {
         },
         Duration::from_secs(10),
     );
+    wait_for(
+        "restored channel group is acknowledged",
+        || {
+            alice.poll();
+            bob.poll();
+            [&alice, &bob].iter().all(|controller| {
+                controller.active_info().is_some_and(|info| {
+                    info.channels.iter().any(|channel| {
+                        channel.channel_id == channel_id
+                            && channel.policy_acknowledged
+                            && channel.group_status == ChannelGroupStatus::DerivedReady
+                    })
+                })
+            })
+        },
+        Duration::from_secs(10),
+    );
     alice
         .select_channel(conversation_id, channel_id)
         .expect("alice selects ops");
@@ -1654,6 +1674,24 @@ fn restricted_channel_text_reaches_only_allowed_members() {
                         })
                     })
                 })
+        },
+        Duration::from_secs(15),
+    );
+    wait_for(
+        "allowed members acknowledge the channel group",
+        || {
+            trio.alice.poll();
+            trio.bob.poll();
+            trio.charlie.poll();
+            [&trio.alice, &trio.bob].iter().all(|controller| {
+                controller.active_info().is_some_and(|info| {
+                    info.channels.iter().any(|channel| {
+                        channel.channel_id == channel_id
+                            && channel.policy_acknowledged
+                            && channel.group_status == ChannelGroupStatus::DerivedReady
+                    })
+                })
+            })
         },
         Duration::from_secs(15),
     );

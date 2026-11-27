@@ -375,9 +375,9 @@ pub(crate) fn write_current_anchor_to(
     subkeys: &Subkeys,
     profile_id: &[u8; 16],
     conn: &Connection,
+    mls_key: &Zeroizing<[u8; 32]>,
 ) -> Result<(), StorageError> {
-    let key = subkeys.derive(Purpose::Db);
-    let state = anchor_state_from_conn(conn, &key, subkeys, profile_id)?;
+    let state = anchor_state_from_conn(conn, mls_key, subkeys, profile_id)?;
     write_anchor_state_to(vault_dir, subkeys, profile_id, &state)
 }
 
@@ -550,7 +550,13 @@ impl Session {
 
     /// Write a complete anchor snapshot derived from a connection.
     pub(crate) fn write_current_anchor(&self, conn: &Connection) -> Result<(), StorageError> {
-        write_current_anchor_to(&self.vault_dir, &self.subkeys, &self.profile_id, conn)
+        write_current_anchor_to(
+            &self.vault_dir,
+            &self.subkeys,
+            &self.profile_id,
+            conn,
+            &self.mls_key(),
+        )
     }
 
     fn read_anchor(&self) -> Result<Option<AnchorState>, StorageError> {
@@ -585,7 +591,7 @@ impl Session {
     /// blessed.
     pub(crate) fn verify_anchor_full(&self) -> Result<AnchorState, StorageError> {
         let control = self.control_log_state()?;
-        let key = self.subkeys.derive(Purpose::Db);
+        let key = self.mls_key();
         let mls = collect_mls_watermarks(&self.conn, &key, &self.subkeys, &self.profile_id)?;
         match self.read_anchor()? {
             None => {
@@ -679,6 +685,27 @@ mod tests {
             ),
             "anchor is now version 2"
         );
+    }
+
+    #[test]
+    fn full_control_log_fails_closed_instead_of_dropping_replay_state() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let identity = Identity::generate().expect("identity");
+        let vault = Vault::open(directory.path()).expect("open vault");
+        let mut session = vault.create(USERNAME, PASSWORD, &identity).expect("create");
+
+        session
+            .conn
+            .execute(
+                "UPDATE control_state SET sequence = ?1",
+                [i64::try_from(MAX_CONTROL_LOG_ENTRIES).expect("sequence fits")],
+            )
+            .expect("advance control log to its cap");
+
+        assert!(matches!(
+            session.record_control_frame(b"12D3KooWFULLLOG", &[5u8; 32], false),
+            Err(StorageError::ControlLogFull)
+        ));
     }
 
     #[test]

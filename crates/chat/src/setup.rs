@@ -11,7 +11,10 @@ use std::fmt;
 
 use libp2p_identity::PeerId;
 use p2p_groups::GroupOperation;
-use p2p_identity::{Identity, verify_signature_with_public_bytes};
+use p2p_identity::{
+    Identity, IdentityError, IdentityRole, MAX_IDENTITY_PROOF_BYTES, certified_role_public_key,
+    unix_time_seconds, verify_application_signature,
+};
 
 use crate::ChatError;
 
@@ -19,7 +22,7 @@ use crate::ChatError;
 pub const SETUP_MAGIC: [u8; 4] = *b"MLS1";
 /// Setup frame version implemented by this build. Version 1 frames carried no
 /// transaction ID and are rejected rather than ambiguously accepted.
-pub const SETUP_VERSION: u16 = 2;
+pub const SETUP_VERSION: u16 = 3;
 /// Length of the random, signed transaction ID carried by every setup frame.
 pub const TRANSACTION_ID_LEN: usize = 16;
 /// A fresh random identifier shared by every frame of one setup operation.
@@ -44,6 +47,22 @@ const GROUP_WELCOME: u8 = 7;
 const GROUP_COMMIT: u8 = 8;
 const GROUP_COMMIT_ACK: u8 = 9;
 const GROUP_WELCOME_ACK: u8 = 10;
+const CHANNEL_KEY_PACKAGE_REQUEST: u8 = 11;
+const CHANNEL_KEY_PACKAGE_RESPONSE: u8 = 12;
+const CHANNEL_WELCOME: u8 = 13;
+const CHANNEL_WELCOME_ACK: u8 = 14;
+const CHANNEL_COMMIT: u8 = 15;
+const CHANNEL_COMMIT_ACK: u8 = 16;
+
+/// The signed context that distinguishes one channel setup operation from
+/// another. The peer is bound by [`SetupEnvelope::verify_channel_scope`], so
+/// these four values identify one operation without trusting application state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChannelScope {
+    pub parent_conversation_id: [u8; 16],
+    pub channel_id: [u8; 16],
+    pub transaction_id: TransactionId,
+}
 
 /// One step of the signed MLS setup and group-management exchange. Payloads are
 /// opaque here; `p2p-groups` validates KeyPackages, Welcomes, and commits before
@@ -111,6 +130,51 @@ pub enum SetupMessage {
         transaction_id: TransactionId,
         accepted: bool,
     },
+    /// Ask an allowed channel member to generate a KeyPackage for its
+    /// independent channel MLS group. `conversation_id` remains the parent.
+    ChannelKeyPackageRequest {
+        conversation_id: [u8; 16],
+        channel_id: [u8; 16],
+        transaction_id: TransactionId,
+    },
+    /// Return the KeyPackage for one bound channel group.
+    ChannelKeyPackageResponse {
+        conversation_id: [u8; 16],
+        channel_id: [u8; 16],
+        transaction_id: TransactionId,
+        key_package: Vec<u8>,
+    },
+    /// Deliver the Welcome for one bound channel group.
+    ChannelWelcome {
+        conversation_id: [u8; 16],
+        channel_id: [u8; 16],
+        transaction_id: TransactionId,
+        welcome: Vec<u8>,
+    },
+    /// Acknowledge that one channel Welcome was accepted and joined.
+    ChannelWelcomeAck {
+        conversation_id: [u8; 16],
+        channel_id: [u8; 16],
+        transaction_id: TransactionId,
+        accepted: bool,
+    },
+    /// Apply one authorized epoch-changing commit in a channel MLS group.
+    ChannelCommit {
+        conversation_id: [u8; 16],
+        channel_id: [u8; 16],
+        transaction_id: TransactionId,
+        operation: GroupOperation,
+        target: Option<PeerId>,
+        commit: Vec<u8>,
+    },
+    /// Acknowledge one channel commit.
+    ChannelCommitAck {
+        conversation_id: [u8; 16],
+        channel_id: [u8; 16],
+        transaction_id: TransactionId,
+        operation: GroupOperation,
+        accepted: bool,
+    },
 }
 
 impl SetupMessage {
@@ -126,6 +190,12 @@ impl SetupMessage {
             Self::GroupCommit { .. } => GROUP_COMMIT,
             Self::GroupCommitAck { .. } => GROUP_COMMIT_ACK,
             Self::GroupWelcomeAck { .. } => GROUP_WELCOME_ACK,
+            Self::ChannelKeyPackageRequest { .. } => CHANNEL_KEY_PACKAGE_REQUEST,
+            Self::ChannelKeyPackageResponse { .. } => CHANNEL_KEY_PACKAGE_RESPONSE,
+            Self::ChannelWelcome { .. } => CHANNEL_WELCOME,
+            Self::ChannelWelcomeAck { .. } => CHANNEL_WELCOME_ACK,
+            Self::ChannelCommit { .. } => CHANNEL_COMMIT,
+            Self::ChannelCommitAck { .. } => CHANNEL_COMMIT_ACK,
         }
     }
 
@@ -161,6 +231,24 @@ impl SetupMessage {
             }
             | Self::GroupWelcomeAck {
                 conversation_id, ..
+            }
+            | Self::ChannelKeyPackageRequest {
+                conversation_id, ..
+            }
+            | Self::ChannelKeyPackageResponse {
+                conversation_id, ..
+            }
+            | Self::ChannelWelcome {
+                conversation_id, ..
+            }
+            | Self::ChannelWelcomeAck {
+                conversation_id, ..
+            }
+            | Self::ChannelCommit {
+                conversation_id, ..
+            }
+            | Self::ChannelCommitAck {
+                conversation_id, ..
             } => conversation_id,
         }
     }
@@ -177,8 +265,62 @@ impl SetupMessage {
             | Self::GroupWelcome { transaction_id, .. }
             | Self::GroupCommit { transaction_id, .. }
             | Self::GroupCommitAck { transaction_id, .. }
-            | Self::GroupWelcomeAck { transaction_id, .. } => transaction_id,
+            | Self::GroupWelcomeAck { transaction_id, .. }
+            | Self::ChannelKeyPackageRequest { transaction_id, .. }
+            | Self::ChannelKeyPackageResponse { transaction_id, .. }
+            | Self::ChannelWelcome { transaction_id, .. }
+            | Self::ChannelWelcomeAck { transaction_id, .. }
+            | Self::ChannelCommit { transaction_id, .. }
+            | Self::ChannelCommitAck { transaction_id, .. } => transaction_id,
         }
+    }
+
+    /// The signed parent/channel/transaction context for channel setup frames.
+    /// Parent conversation setup frames have no channel scope.
+    pub fn channel_scope(&self) -> Option<ChannelScope> {
+        let scope = match self {
+            Self::ChannelKeyPackageRequest {
+                conversation_id,
+                channel_id,
+                transaction_id,
+            }
+            | Self::ChannelKeyPackageResponse {
+                conversation_id,
+                channel_id,
+                transaction_id,
+                ..
+            }
+            | Self::ChannelWelcome {
+                conversation_id,
+                channel_id,
+                transaction_id,
+                ..
+            }
+            | Self::ChannelWelcomeAck {
+                conversation_id,
+                channel_id,
+                transaction_id,
+                ..
+            }
+            | Self::ChannelCommit {
+                conversation_id,
+                channel_id,
+                transaction_id,
+                ..
+            }
+            | Self::ChannelCommitAck {
+                conversation_id,
+                channel_id,
+                transaction_id,
+                ..
+            } => ChannelScope {
+                parent_conversation_id: *conversation_id,
+                channel_id: *channel_id,
+                transaction_id: *transaction_id,
+            },
+            _ => return None,
+        };
+        Some(scope)
     }
 
     fn payload(&self) -> Result<Vec<u8>, ChatError> {
@@ -203,6 +345,43 @@ impl SetupMessage {
                 accepted,
                 ..
             } => Ok(vec![operation.code(), u8::from(*accepted)]),
+            Self::ChannelKeyPackageRequest { channel_id, .. } => {
+                Ok(channel_payload(channel_id, Vec::new()))
+            }
+            Self::ChannelKeyPackageResponse {
+                channel_id,
+                key_package,
+                ..
+            } => Ok(channel_payload(channel_id, key_package.clone())),
+            Self::ChannelWelcome {
+                channel_id,
+                welcome,
+                ..
+            } => Ok(channel_payload(channel_id, welcome.clone())),
+            Self::ChannelWelcomeAck {
+                channel_id,
+                accepted,
+                ..
+            } => Ok(channel_payload(channel_id, vec![u8::from(*accepted)])),
+            Self::ChannelCommit {
+                channel_id,
+                operation,
+                target,
+                commit,
+                ..
+            } => Ok(channel_payload(
+                channel_id,
+                group_commit_payload(*operation, target.as_ref(), commit)?,
+            )),
+            Self::ChannelCommitAck {
+                channel_id,
+                operation,
+                accepted,
+                ..
+            } => Ok(channel_payload(
+                channel_id,
+                vec![operation.code(), u8::from(*accepted)],
+            )),
         }
     }
 
@@ -300,6 +479,74 @@ impl SetupMessage {
                     accepted,
                 })
             }
+            CHANNEL_KEY_PACKAGE_REQUEST => {
+                let (channel_id, rest) = split_channel_payload(&payload)?;
+                expect_empty(rest)?;
+                Ok(Self::ChannelKeyPackageRequest {
+                    conversation_id,
+                    channel_id,
+                    transaction_id,
+                })
+            }
+            CHANNEL_KEY_PACKAGE_RESPONSE => {
+                let (channel_id, rest) = split_channel_payload(&payload)?;
+                expect_payload(rest)?;
+                Ok(Self::ChannelKeyPackageResponse {
+                    conversation_id,
+                    channel_id,
+                    transaction_id,
+                    key_package: rest.to_vec(),
+                })
+            }
+            CHANNEL_WELCOME => {
+                let (channel_id, rest) = split_channel_payload(&payload)?;
+                expect_payload(rest)?;
+                Ok(Self::ChannelWelcome {
+                    conversation_id,
+                    channel_id,
+                    transaction_id,
+                    welcome: rest.to_vec(),
+                })
+            }
+            CHANNEL_WELCOME_ACK => {
+                let (channel_id, rest) = split_channel_payload(&payload)?;
+                let accepted = parse_ack(rest, "invalid channel welcome acknowledgement")?;
+                Ok(Self::ChannelWelcomeAck {
+                    conversation_id,
+                    channel_id,
+                    transaction_id,
+                    accepted,
+                })
+            }
+            CHANNEL_COMMIT => {
+                let (channel_id, rest) = split_channel_payload(&payload)?;
+                let (operation, target, commit) = parse_group_commit_payload(rest)?;
+                Ok(Self::ChannelCommit {
+                    conversation_id,
+                    channel_id,
+                    transaction_id,
+                    operation,
+                    target,
+                    commit,
+                })
+            }
+            CHANNEL_COMMIT_ACK => {
+                let (channel_id, rest) = split_channel_payload(&payload)?;
+                if rest.len() != 2 || rest[1] > 1 {
+                    return Err(ChatError::InvalidSetup(
+                        "invalid channel commit acknowledgement",
+                    ));
+                }
+                let operation = GroupOperation::from_code(rest[0])
+                    .ok_or(ChatError::InvalidSetup("unknown group operation"))?;
+                Ok(Self::ChannelCommitAck {
+                    conversation_id,
+                    channel_id,
+                    transaction_id,
+                    operation,
+                    accepted: rest[1] == 1,
+                })
+            }
             _ => Err(ChatError::InvalidSetup("unknown setup message type")),
         }
     }
@@ -318,11 +565,21 @@ impl fmt::Debug for SetupMessage {
             Self::GroupCommit { .. } => "group-commit",
             Self::GroupCommitAck { .. } => "group-commit-ack",
             Self::GroupWelcomeAck { .. } => "group-welcome-ack",
+            Self::ChannelKeyPackageRequest { .. } => "channel-key-package-request",
+            Self::ChannelKeyPackageResponse { .. } => "channel-key-package-response",
+            Self::ChannelWelcome { .. } => "channel-welcome",
+            Self::ChannelWelcomeAck { .. } => "channel-welcome-ack",
+            Self::ChannelCommit { .. } => "channel-commit",
+            Self::ChannelCommitAck { .. } => "channel-commit-ack",
         };
         f.debug_struct("SetupMessage")
             .field("kind", &kind)
             .field("conversation_id", &hex(self.conversation_id()))
             .field("transaction_id", &hex(self.transaction_id()))
+            .field(
+                "channel_id",
+                &self.channel_scope().map(|scope| hex(&scope.channel_id)),
+            )
             .field(
                 "payload_len",
                 &self.payload().map(|payload| payload.len()).unwrap_or(0),
@@ -339,6 +596,7 @@ impl fmt::Debug for SetupMessage {
 pub struct SetupEnvelope {
     pub sender: PeerId,
     pub sender_public_key: Vec<u8>,
+    pub identity_proof: Vec<u8>,
     pub message: SetupMessage,
     signature: [u8; SIGNATURE_LEN],
 }
@@ -348,12 +606,16 @@ impl SetupEnvelope {
     pub fn new(identity: &Identity, message: SetupMessage) -> Result<Self, ChatError> {
         let mut envelope = Self {
             sender: identity.peer_id(),
-            sender_public_key: identity.public_key_bytes(),
+            sender_public_key: identity
+                .role_public_bytes(IdentityRole::Application)?
+                .to_vec(),
+            identity_proof: identity.proof().to_bytes(),
             message,
             signature: [0; SIGNATURE_LEN],
         };
         envelope.check_sizes()?;
-        let signature = identity.sign(&envelope.signing_bytes()?)?;
+        let signature =
+            identity.sign_with_role(IdentityRole::Application, &envelope.signing_bytes()?)?;
         envelope.signature = signature.as_slice().try_into().map_err(|_| {
             ChatError::InvalidSetup("identity produced an unexpected signature length")
         })?;
@@ -383,6 +645,7 @@ impl SetupEnvelope {
         let conversation_id = reader.fixed::<16>()?;
         let sender_public_key = reader.var(MAX_PUBLIC_KEY_BYTES)?;
         let sender_bytes = reader.var(MAX_PEER_ID_BYTES)?;
+        let identity_proof = reader.var(MAX_IDENTITY_PROOF_BYTES)?;
         let payload = reader.var(MAX_SETUP_PAYLOAD_BYTES)?;
         let signature = reader.fixed::<SIGNATURE_LEN>()?;
         reader.finish()?;
@@ -393,6 +656,7 @@ impl SetupEnvelope {
         let envelope = Self {
             sender,
             sender_public_key,
+            identity_proof,
             message,
             signature,
         };
@@ -419,17 +683,59 @@ impl SetupEnvelope {
             return Err(ChatError::UnexpectedSender);
         }
         self.check_sizes()?;
-        let valid = verify_signature_with_public_bytes(
+        let certified_key = match verify_application_signature(
+            &self.identity_proof,
+            IdentityRole::Application,
+            &self.sender,
             &self.signing_bytes()?,
             &self.signature,
-            &self.sender_public_key,
-            &self.sender,
-        )?;
-        if valid {
-            Ok(())
-        } else {
-            Err(ChatError::InvalidSetup("signature is invalid"))
+            unix_time_seconds(),
+        ) {
+            Ok(key) => key,
+            Err(IdentityError::InvalidSignature) => {
+                return Err(ChatError::InvalidSetup("signature is invalid"));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if self.sender_public_key != certified_key {
+            return Err(ChatError::InvalidSetup(
+                "sender role key does not match proof",
+            ));
         }
+        Ok(())
+    }
+
+    /// Certified MLS signing key for the sender. Group membership checks must
+    /// use this role key instead of the transport key carried in older frames.
+    pub fn sender_mls_public_key(&self) -> Result<[u8; 32], ChatError> {
+        Ok(certified_role_public_key(
+            &self.identity_proof,
+            IdentityRole::Mls,
+            &self.sender,
+            unix_time_seconds(),
+        )?)
+    }
+
+    /// Verify the signed peer identity and exact channel scope. Callers pass the
+    /// parent/channel/transaction they expect from their pending operation; a
+    /// frame scoped to another channel or transaction is rejected before any
+    /// KeyPackage, Welcome, or commit bytes are used.
+    pub fn verify_channel_scope(
+        &self,
+        expected_peer: &PeerId,
+        expected: &ChannelScope,
+    ) -> Result<(), ChatError> {
+        self.verify(expected_peer)?;
+        let actual = self
+            .message
+            .channel_scope()
+            .ok_or(ChatError::InvalidSetup("setup frame has no channel scope"))?;
+        if actual != *expected {
+            return Err(ChatError::InvalidSetup(
+                "setup frame channel scope does not match the operation",
+            ));
+        }
+        Ok(())
     }
 
     fn signing_bytes(&self) -> Result<Vec<u8>, ChatError> {
@@ -441,6 +747,7 @@ impl SetupEnvelope {
         bytes.extend_from_slice(self.message.conversation_id());
         put_bytes(&mut bytes, &self.sender_public_key)?;
         put_bytes(&mut bytes, &self.sender.to_bytes())?;
+        put_bytes(&mut bytes, &self.identity_proof)?;
         put_bytes(&mut bytes, &self.message.payload()?)?;
         Ok(bytes)
     }
@@ -449,9 +756,11 @@ impl SetupEnvelope {
         if SETUP_MAGIC != *b"MLS1" {
             return Err(ChatError::InvalidSetup("wrong frame magic"));
         }
-        if self.sender_public_key.is_empty() || self.sender_public_key.len() > MAX_PUBLIC_KEY_BYTES
-        {
+        if self.sender_public_key.len() != 32 {
             return Err(ChatError::InvalidSetup("invalid sender public key length"));
+        }
+        if self.identity_proof.is_empty() || self.identity_proof.len() > MAX_IDENTITY_PROOF_BYTES {
+            return Err(ChatError::InvalidSetup("invalid identity proof length"));
         }
         let peer_bytes = self.sender.to_bytes();
         if peer_bytes.is_empty() || peer_bytes.len() > MAX_PEER_ID_BYTES {
@@ -470,6 +779,7 @@ impl fmt::Debug for SetupEnvelope {
             .field("version", &SETUP_VERSION)
             .field("sender", &self.sender.to_string())
             .field("public_key_len", &self.sender_public_key.len())
+            .field("identity_proof_len", &self.identity_proof.len())
             .field("message", &self.message)
             .field("signature", &"<redacted>")
             .finish_non_exhaustive()
@@ -556,6 +866,25 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ChatError> {
     Ok(())
 }
 
+fn channel_payload(channel_id: &[u8; 16], inner: Vec<u8>) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(channel_id.len() + inner.len());
+    payload.extend_from_slice(channel_id);
+    payload.extend_from_slice(&inner);
+    payload
+}
+
+fn split_channel_payload(payload: &[u8]) -> Result<([u8; 16], &[u8]), ChatError> {
+    if payload.len() < 16 {
+        return Err(ChatError::InvalidSetup(
+            "channel setup frame is missing its channel id",
+        ));
+    }
+    let channel_id = payload[..16]
+        .try_into()
+        .map_err(|_| ChatError::InvalidSetup("invalid channel id"))?;
+    Ok((channel_id, &payload[16..]))
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -637,6 +966,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p2p_identity::{CERTIFICATE_BYTES, IDENTITY_PROOF_HEADER_BYTES};
     use p2p_messaging::random_id;
 
     fn txid() -> TransactionId {
@@ -661,6 +991,67 @@ mod tests {
         decoded
             .verify(&identity.peer_id())
             .expect("valid signature");
+    }
+
+    fn tampered_proof(identity: &Identity) -> Vec<u8> {
+        let mut bytes = identity.proof().to_bytes();
+        let index = IDENTITY_PROOF_HEADER_BYTES + CERTIFICATE_BYTES * 4 + 34;
+        bytes[index] ^= 0x01;
+        bytes
+    }
+
+    #[test]
+    fn wrong_role_and_transport_signatures_are_rejected() {
+        let identity = Identity::generate().expect("identity");
+        let mut frame = SetupEnvelope::new(&identity, message()).expect("signed frame");
+        let signed_bytes = frame.signing_bytes().expect("signed bytes");
+
+        let file_signature = identity
+            .sign_with_role(IdentityRole::File, &signed_bytes)
+            .expect("file role signature");
+        frame.signature = file_signature.as_slice().try_into().expect("signature");
+        assert!(matches!(
+            frame.verify(&identity.peer_id()),
+            Err(ChatError::InvalidSetup("signature is invalid"))
+        ));
+
+        let transport_signature = identity.sign(&signed_bytes).expect("transport signature");
+        frame.signature = transport_signature
+            .as_slice()
+            .try_into()
+            .expect("signature");
+        assert!(matches!(
+            frame.verify(&identity.peer_id()),
+            Err(ChatError::InvalidSetup("signature is invalid"))
+        ));
+    }
+
+    #[test]
+    fn substituted_and_tampered_proofs_are_rejected() {
+        let identity = Identity::generate().expect("identity");
+        let other = Identity::generate().expect("other identity");
+        let frame = SetupEnvelope::new(&identity, message()).expect("signed frame");
+
+        let mut substituted = frame.clone();
+        substituted.identity_proof = other.proof().to_bytes();
+        assert!(substituted.verify(&identity.peer_id()).is_err());
+
+        let mut tampered = frame.clone();
+        tampered.identity_proof = tampered_proof(&identity);
+        assert!(tampered.verify(&identity.peer_id()).is_err());
+        assert!(tampered.sender_mls_public_key().is_err());
+
+        let certified = frame.sender_mls_public_key().expect("certified MLS key");
+        assert_eq!(
+            certified,
+            identity
+                .role_public_bytes(IdentityRole::Mls)
+                .expect("local MLS key")
+        );
+        assert_ne!(
+            certified,
+            identity.ed25519_public_bytes().expect("transport key")
+        );
     }
 
     #[test]
@@ -1099,5 +1490,165 @@ mod tests {
         let mut trailing = bytes;
         trailing.push(0);
         assert!(SetupEnvelope::from_bytes(&trailing).is_err());
+    }
+
+    fn channel_messages(
+        parent: [u8; 16],
+        channel: [u8; 16],
+        transaction_id: TransactionId,
+    ) -> Vec<SetupMessage> {
+        vec![
+            SetupMessage::ChannelKeyPackageRequest {
+                conversation_id: parent,
+                channel_id: channel,
+                transaction_id,
+            },
+            SetupMessage::ChannelKeyPackageResponse {
+                conversation_id: parent,
+                channel_id: channel,
+                transaction_id,
+                key_package: vec![1, 2, 3],
+            },
+            SetupMessage::ChannelWelcome {
+                conversation_id: parent,
+                channel_id: channel,
+                transaction_id,
+                welcome: vec![4, 5, 6],
+            },
+            SetupMessage::ChannelWelcomeAck {
+                conversation_id: parent,
+                channel_id: channel,
+                transaction_id,
+                accepted: true,
+            },
+            SetupMessage::ChannelCommit {
+                conversation_id: parent,
+                channel_id: channel,
+                transaction_id,
+                operation: GroupOperation::Update,
+                target: None,
+                commit: vec![7, 8, 9],
+            },
+            SetupMessage::ChannelCommitAck {
+                conversation_id: parent,
+                channel_id: channel,
+                transaction_id,
+                operation: GroupOperation::Update,
+                accepted: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn channel_scope_round_trips_and_is_covered_by_the_signature() {
+        let identity = Identity::generate().expect("identity");
+        let parent = [31u8; 16];
+        let channel = [32u8; 16];
+        let transaction_id = [33u8; 16];
+        let scope = ChannelScope {
+            parent_conversation_id: parent,
+            channel_id: channel,
+            transaction_id,
+        };
+
+        for message in channel_messages(parent, channel, transaction_id) {
+            let envelope = SetupEnvelope::new(&identity, message.clone()).expect("signed frame");
+            let bytes = envelope.to_bytes().expect("encoded frame");
+            let decoded = SetupEnvelope::from_bytes(&bytes).expect("decoded frame");
+            assert_eq!(decoded.message, message);
+            assert_eq!(decoded.message.channel_scope(), Some(scope));
+            decoded
+                .verify_channel_scope(&identity.peer_id(), &scope)
+                .expect("valid channel scope");
+        }
+
+        let mut tampered = SetupEnvelope::new(
+            &identity,
+            SetupMessage::ChannelKeyPackageRequest {
+                conversation_id: parent,
+                channel_id: channel,
+                transaction_id,
+            },
+        )
+        .expect("signed request");
+        if let SetupMessage::ChannelKeyPackageRequest { channel_id, .. } = &mut tampered.message {
+            *channel_id = [34u8; 16];
+        }
+        assert!(matches!(
+            tampered.verify_channel_scope(&identity.peer_id(), &scope),
+            Err(ChatError::InvalidSetup("signature is invalid"))
+        ));
+    }
+
+    #[test]
+    fn channel_scope_frames_reject_missing_truncated_unknown_and_substituted_values() {
+        let identity = Identity::generate().expect("identity");
+        let other = Identity::generate().expect("other identity");
+        let parent = [35u8; 16];
+        let channel = [36u8; 16];
+        let transaction_id = [37u8; 16];
+        let scope = ChannelScope {
+            parent_conversation_id: parent,
+            channel_id: channel,
+            transaction_id,
+        };
+
+        assert!(
+            SetupMessage::from_parts(
+                CHANNEL_KEY_PACKAGE_REQUEST,
+                parent,
+                transaction_id,
+                Vec::new()
+            )
+            .is_err()
+        );
+        assert!(
+            SetupMessage::from_parts(
+                CHANNEL_KEY_PACKAGE_REQUEST,
+                parent,
+                transaction_id,
+                channel[..8].to_vec()
+            )
+            .is_err()
+        );
+        assert!(SetupMessage::from_parts(200, parent, transaction_id, Vec::new()).is_err());
+
+        let envelope = SetupEnvelope::new(
+            &identity,
+            SetupMessage::ChannelKeyPackageRequest {
+                conversation_id: parent,
+                channel_id: channel,
+                transaction_id,
+            },
+        )
+        .expect("signed channel request");
+        envelope
+            .verify_channel_scope(&identity.peer_id(), &scope)
+            .expect("matching scope");
+        assert!(matches!(
+            envelope.verify_channel_scope(&other.peer_id(), &scope),
+            Err(ChatError::UnexpectedSender)
+        ));
+        for wrong in [
+            ChannelScope {
+                parent_conversation_id: [38u8; 16],
+                ..scope
+            },
+            ChannelScope {
+                channel_id: [39u8; 16],
+                ..scope
+            },
+            ChannelScope {
+                transaction_id: [40u8; 16],
+                ..scope
+            },
+        ] {
+            assert!(matches!(
+                envelope.verify_channel_scope(&identity.peer_id(), &wrong),
+                Err(ChatError::InvalidSetup(
+                    "setup frame channel scope does not match the operation"
+                ))
+            ));
+        }
     }
 }

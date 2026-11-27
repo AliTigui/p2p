@@ -24,6 +24,7 @@ use p2p_crypto::{
 };
 use p2p_identity::{Identity, IdentityError};
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -48,6 +49,12 @@ const CONVERSATION_INDEX: &[u8] = b"p2p-messenger/conversation-id/v1";
 /// One MiB wire envelope plus framing overhead. Oversized rows are rejected
 /// before they reach SQLite.
 const MAX_STORED_MESSAGE_BYTES: usize = 1024 * 1024 + 1024;
+
+/// Legacy MLS rows were encrypted under the general DB key.
+const MLS_KEY_VERSION_LEGACY: i64 = 0;
+/// New vaults protect MLS rows with the dedicated `Purpose::MlsState` key.
+const MLS_KEY_VERSION_DEDICATED: i64 = 1;
+const LEGACY_MLS_SALT_LABEL: &[u8] = b"p2p-messenger/v1/legacy-mls-state-salt";
 
 /// Errors from the local vault. Authentication failures are intentionally
 /// generic so they cannot be used to distinguish wrong passwords from damage.
@@ -160,7 +167,7 @@ impl Vault {
         let wrapped_master = wrap_key(&master, &kek, &master_aad(&profile_id, &kdf_salt, params))?;
         let subkeys = Subkeys::new(master, salts);
 
-        let identity_bytes = identity.export_keypair_bytes();
+        let identity_bytes = identity.export_bundle_bytes()?;
         let encrypted_identity = encrypt_bytes(
             &subkeys.derive(Purpose::Identity),
             &identity_bytes,
@@ -181,8 +188,8 @@ impl Vault {
         conn.execute(
             "INSERT INTO profile (
                 id, profile_id, username, kdf_salt, kdf_params, wrapped_master,
-                subkey_salts, encrypted_identity, created_at
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                subkey_salts, encrypted_identity, mls_key_version, created_at
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 profile_id.to_vec(),
                 encrypted_username,
@@ -191,6 +198,7 @@ impl Vault {
                 wrapped_master,
                 flatten_salts(&salts),
                 encrypted_identity,
+                MLS_KEY_VERSION_DEDICATED,
                 now_seconds()?,
             ],
         )?;
@@ -207,6 +215,7 @@ impl Vault {
             params,
             attachment_dir,
             vault_dir: self.directory.clone(),
+            mls_key_version: MLS_KEY_VERSION_DEDICATED,
         };
         session.initialize_control_log()?;
         Ok(session)
@@ -241,7 +250,7 @@ impl Vault {
             &tagged_aad(IDENTITY_AAD, &record.profile_id),
         )
         .map_err(|_| StorageError::AuthenticationFailed)?;
-        let identity = Identity::import_keypair_bytes(&identity_plaintext)?;
+        let identity = Identity::import_bundle_bytes(&identity_plaintext)?;
         let attachment_dir = self.directory.join(attachments::ATTACHMENT_DIR);
         fs::create_dir_all(&attachment_dir)?;
         restrict_directory(&attachment_dir)?;
@@ -254,6 +263,7 @@ impl Vault {
             params: record.params,
             attachment_dir,
             vault_dir: self.directory.clone(),
+            mls_key_version: record.mls_key_version,
         };
         session.verify_control_log()?;
         session.verify_mls_state()?;
@@ -286,6 +296,9 @@ pub struct Session {
     params: Argon2Params,
     attachment_dir: PathBuf,
     vault_dir: PathBuf,
+    /// Which HKDF purpose protects this vault's MLS rows. Legacy vaults stay
+    /// on `Db`; new vaults use the dedicated `MlsState` purpose.
+    pub(crate) mls_key_version: i64,
 }
 
 impl Session {
@@ -316,6 +329,7 @@ impl Session {
             params: self.params,
             attachment_dir: self.attachment_dir.clone(),
             vault_dir: self.vault_dir.clone(),
+            mls_key_version: self.mls_key_version,
         })
     }
 
@@ -480,13 +494,14 @@ struct ProfileRecord {
     wrapped_master: Vec<u8>,
     subkey_salts: [[u8; SALT_LEN]; Purpose::ALL.len()],
     encrypted_identity: Vec<u8>,
+    mls_key_version: i64,
 }
 
 fn read_profile(conn: &Connection) -> Result<ProfileRecord, StorageError> {
     let row = conn
         .query_row(
             "SELECT profile_id, kdf_salt, kdf_params, wrapped_master, subkey_salts,
-                    encrypted_identity
+                    encrypted_identity, mls_key_version
              FROM profile WHERE id = 1",
             [],
             |row| {
@@ -497,6 +512,7 @@ fn read_profile(conn: &Connection) -> Result<ProfileRecord, StorageError> {
                     row.get::<_, Vec<u8>>(3)?,
                     row.get::<_, Vec<u8>>(4)?,
                     row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             },
         )
@@ -510,16 +526,33 @@ fn read_profile(conn: &Connection) -> Result<ProfileRecord, StorageError> {
         )));
     }
     let params = Argon2Params::from_bytes(&row.2[1..])?;
-    let salt_count = Purpose::ALL.len() * SALT_LEN;
-    if row.4.len() != salt_count {
+    if row.6 != MLS_KEY_VERSION_LEGACY && row.6 != MLS_KEY_VERSION_DEDICATED {
+        return Err(StorageError::InvalidProfile(
+            "unsupported MLS key version".to_owned(),
+        ));
+    }
+    let current_salt_count = Purpose::ALL.len() * SALT_LEN;
+    let legacy_salt_count = (Purpose::ALL.len() - 1) * SALT_LEN;
+    if row.4.len() != current_salt_count && row.4.len() != legacy_salt_count {
         return Err(StorageError::InvalidProfile(
             "bad subkey salt count".to_owned(),
         ));
     }
+    let mut first_salt = [0u8; SALT_LEN];
+    first_salt.copy_from_slice(&row.4[..SALT_LEN]);
+    let derived_mls_salt = legacy_mls_salt(&first_salt);
     let mut subkey_salts = [[0u8; SALT_LEN]; Purpose::ALL.len()];
     for (index, salt) in subkey_salts.iter_mut().enumerate() {
         let start = index * SALT_LEN;
-        salt.copy_from_slice(&row.4[start..start + SALT_LEN]);
+        if start + SALT_LEN <= row.4.len() {
+            salt.copy_from_slice(&row.4[start..start + SALT_LEN]);
+        } else {
+            // A profile written before the dedicated MLS purpose has no salt
+            // slot for it. Derive a stable replacement from the first public
+            // salt; the key remains HKDF(master, salt, purpose-info) and legacy
+            // rows stay on the `Db` key recorded by `mls_key_version`.
+            *salt = derived_mls_salt;
+        }
     }
 
     Ok(ProfileRecord {
@@ -529,7 +562,21 @@ fn read_profile(conn: &Connection) -> Result<ProfileRecord, StorageError> {
         wrapped_master: row.3,
         subkey_salts,
         encrypted_identity: row.5,
+        mls_key_version: row.6,
     })
+}
+
+/// Deterministic stand-in for the missing MLS-purpose salt in legacy profiles.
+/// Salts are public, so deriving this from the first stored salt does not add
+/// secrecy; it only keeps `Subkeys::derive` well-defined for all purposes.
+fn legacy_mls_salt(first_salt: &[u8; SALT_LEN]) -> [u8; SALT_LEN] {
+    let mut hasher = Sha256::new();
+    hasher.update(LEGACY_MLS_SALT_LABEL);
+    hasher.update(first_salt);
+    let digest = hasher.finalize();
+    let mut salt = [0u8; SALT_LEN];
+    salt.copy_from_slice(&digest[..SALT_LEN]);
+    salt
 }
 
 fn fixed<const N: usize>(bytes: &[u8], label: &str) -> Result<[u8; N], StorageError> {
@@ -664,7 +711,18 @@ CREATE TABLE mls_state (
 CREATE INDEX mls_state_by_group ON mls_state(group_bi, entity_bi);
 ";
 
-const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5];
+/// P4: record which HKDF purpose protects MLS provider state. Existing
+/// profiles default to 0 (`Purpose::Db`); newly created profiles use 1
+/// (`Purpose::MlsState`). The profile keeps its original salt blob so legacy
+/// ciphertext stays readable without a risky bulk re-encryption of chained and
+/// anchored records.
+const SCHEMA_V6: &str = "
+ALTER TABLE profile ADD COLUMN mls_key_version INTEGER NOT NULL DEFAULT 0;
+";
+
+const MIGRATIONS: &[&str] = &[
+    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6,
+];
 
 fn run_migrations(conn: &mut Connection) -> Result<(), StorageError> {
     let transaction = conn.transaction()?;

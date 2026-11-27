@@ -11,12 +11,15 @@ use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use libp2p_identity::PeerId;
-use p2p_identity::{Identity, verify_signature_with_public_bytes};
+use p2p_identity::{
+    Identity, IdentityError, IdentityRole, MAX_IDENTITY_PROOF_BYTES, certified_role_public_key,
+    unix_time_seconds, verify_application_signature,
+};
 
 use crate::MessageError;
 
 /// Wire version implemented by this build.
-pub const ENVELOPE_VERSION: u16 = 1;
+pub const ENVELOPE_VERSION: u16 = 2;
 /// Fixed protocol magic. Unknown magic is rejected, never negotiated.
 pub const PROTOCOL_MAGIC: &[u8; 4] = b"P2P1";
 /// Maximum total size of an encoded envelope.
@@ -103,6 +106,7 @@ pub struct Envelope {
     pub sender_sequence: u64,
     pub created_at: i64,
     pub kind: MessageKind,
+    pub identity_proof: Vec<u8>,
     pub payload: Vec<u8>,
     pub signature: [u8; SIGNATURE_LEN],
 }
@@ -123,16 +127,19 @@ impl Envelope {
             conversation_id: params.conversation_id,
             epoch: params.epoch,
             message_id: params.message_id,
-            sender_public_key: identity.public_key_bytes(),
+            sender_public_key: identity
+                .role_public_bytes(IdentityRole::Application)?
+                .to_vec(),
             sender: identity.peer_id(),
             sender_sequence: params.sender_sequence,
             created_at: params.created_at,
             kind: params.kind,
+            identity_proof: identity.proof().to_bytes(),
             payload,
             signature: [0; SIGNATURE_LEN],
         };
         let signing_bytes = envelope.signing_bytes()?;
-        let signature = identity.sign(&signing_bytes)?;
+        let signature = identity.sign_with_role(IdentityRole::Application, &signing_bytes)?;
         envelope.signature = signature
             .as_slice()
             .try_into()
@@ -168,6 +175,7 @@ impl Envelope {
         let created_at = reader.i64()?;
         let kind_code = reader.u8()?;
         let kind = MessageKind::from_code(kind_code).ok_or(MessageError::BadKind(kind_code))?;
+        let identity_proof = reader.var(MAX_IDENTITY_PROOF_BYTES)?;
         let payload = reader.var(MAX_PAYLOAD_BYTES)?;
         let signature = reader.fixed()?;
         reader.finish()?;
@@ -183,6 +191,7 @@ impl Envelope {
             sender_sequence,
             created_at,
             kind,
+            identity_proof,
             payload,
             signature,
         };
@@ -217,8 +226,22 @@ impl Envelope {
         bytes.extend_from_slice(&self.sender_sequence.to_le_bytes());
         bytes.extend_from_slice(&self.created_at.to_le_bytes());
         bytes.push(self.kind.code());
+        put_bytes(&mut bytes, &self.identity_proof)?;
         put_bytes(&mut bytes, &self.payload)?;
         Ok(bytes)
+    }
+
+    /// Extract a certified role key from the proof carried by this envelope.
+    /// This is used by the MLS layer to bind the inner signature key to the
+    /// same Noise-authenticated peer as the outer application signature.
+    pub fn sender_role_public_key(&self, role: IdentityRole) -> Result<[u8; 32], MessageError> {
+        certified_role_public_key(
+            &self.identity_proof,
+            role,
+            &self.sender,
+            unix_time_seconds(),
+        )
+        .map_err(map_identity_error)
     }
 
     /// Verify protocol version and signature, binding the embedded public key
@@ -232,18 +255,19 @@ impl Envelope {
         }
         self.check_sizes()?;
         let signing_bytes = self.signing_bytes()?;
-        match verify_signature_with_public_bytes(
+        let certified_key = verify_application_signature(
+            &self.identity_proof,
+            IdentityRole::Application,
+            &self.sender,
             &signing_bytes,
             &self.signature,
-            &self.sender_public_key,
-            &self.sender,
-        ) {
-            Ok(true) => Ok(()),
-            Ok(false) => Err(MessageError::BadSignature),
-            Err(p2p_identity::IdentityError::PeerIdMismatch) => Err(MessageError::BadPeerId),
-            Err(p2p_identity::IdentityError::NotEd25519) => Err(MessageError::NotEd25519),
-            Err(error) => Err(MessageError::Identity(error)),
+            unix_time_seconds(),
+        )
+        .map_err(map_identity_error)?;
+        if self.sender_public_key != certified_key {
+            return Err(MessageError::BadPeerId);
         }
+        Ok(())
     }
 
     fn check_sizes(&self) -> Result<(), MessageError> {
@@ -259,9 +283,13 @@ impl Envelope {
                 max: MAX_PAYLOAD_BYTES,
             });
         }
-        if self.sender_public_key.is_empty() || self.sender_public_key.len() > MAX_PUBLIC_KEY_BYTES
-        {
+        if self.sender_public_key.len() != 32 {
             return Err(MessageError::BadPeerId);
+        }
+        if self.identity_proof.is_empty() || self.identity_proof.len() > MAX_IDENTITY_PROOF_BYTES {
+            return Err(MessageError::Identity(IdentityError::InvalidIdentityProof(
+                "identity proof length is invalid".to_owned(),
+            )));
         }
         Ok(())
     }
@@ -277,6 +305,7 @@ impl fmt::Debug for Envelope {
             .field("sender", &self.sender.to_string())
             .field("sender_sequence", &self.sender_sequence)
             .field("kind", &self.kind)
+            .field("identity_proof_len", &self.identity_proof.len())
             .field("payload_len", &self.payload.len())
             .finish_non_exhaustive()
     }
@@ -298,6 +327,15 @@ pub(crate) fn now_seconds() -> i64 {
             .as_secs(),
     )
     .unwrap_or(i64::MAX)
+}
+
+fn map_identity_error(error: IdentityError) -> MessageError {
+    match error {
+        IdentityError::InvalidSignature => MessageError::BadSignature,
+        IdentityError::PeerIdMismatch => MessageError::BadPeerId,
+        IdentityError::NotEd25519 => MessageError::NotEd25519,
+        other => MessageError::Identity(other),
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -392,6 +430,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p2p_identity::{CERTIFICATE_BYTES, IDENTITY_PROOF_HEADER_BYTES};
 
     fn params() -> EnvelopeParams {
         EnvelopeParams {
@@ -416,6 +455,35 @@ mod tests {
     }
 
     #[test]
+    fn signed_envelope_exposes_transferable_authorship_and_clear_metadata() {
+        let identity = Identity::generate().expect("identity");
+        let expected = params();
+        let envelope = Envelope::new(&identity, expected, b"opaque ciphertext".to_vec())
+            .expect("signed envelope");
+        let bytes = envelope.to_bytes().expect("encoded envelope");
+        let decoded = Envelope::from_bytes(&bytes).expect("decoded envelope");
+
+        // Any party holding only the wire bytes can verify the signature. This
+        // is positive evidence of authorship; no deniability is claimed.
+        decoded.verify().expect("third-party verification");
+
+        // Conversation ID, epoch, time, sender, kind, and sequence are parsed
+        // before any decryption, so they are not confidential on the wire.
+        assert_eq!(decoded.conversation_id, expected.conversation_id);
+        assert_eq!(decoded.epoch, expected.epoch);
+        assert_eq!(decoded.sender_sequence, expected.sender_sequence);
+        assert_eq!(decoded.created_at, expected.created_at);
+        assert_eq!(decoded.kind, expected.kind);
+        assert_eq!(decoded.sender, identity.peer_id());
+        assert!(
+            bytes
+                .windows(expected.conversation_id.len())
+                .any(|window| window == expected.conversation_id),
+            "conversation ID is present in the clear"
+        );
+    }
+
+    #[test]
     fn tampering_with_payload_or_key_is_rejected() {
         let identity = Identity::generate().expect("identity");
         let envelope = Envelope::new(&identity, params(), b"opaque ciphertext".to_vec())
@@ -426,8 +494,77 @@ mod tests {
 
         let other = Identity::generate().expect("other identity");
         let mut mismatched = envelope;
-        mismatched.sender_public_key = other.public_key_bytes();
+        mismatched.sender_public_key = other
+            .role_public_bytes(IdentityRole::Application)
+            .expect("application role key")
+            .to_vec();
         assert!(mismatched.verify().is_err());
+    }
+
+    fn tampered_proof(identity: &Identity) -> Vec<u8> {
+        let mut bytes = identity.proof().to_bytes();
+        // The application certificate is fourth in canonical role order. This
+        // byte is inside its signed public key, so parsing still succeeds but
+        // certificate and frame verification must fail.
+        let index = IDENTITY_PROOF_HEADER_BYTES + CERTIFICATE_BYTES * 4 + 34;
+        bytes[index] ^= 0x01;
+        bytes
+    }
+
+    #[test]
+    fn wrong_role_and_transport_signatures_are_rejected() {
+        let identity = Identity::generate().expect("identity");
+        let mut envelope = Envelope::new(&identity, params(), b"opaque ciphertext".to_vec())
+            .expect("signed envelope");
+        let signed_bytes = envelope.signing_bytes().expect("signed bytes");
+
+        let file_signature = identity
+            .sign_with_role(IdentityRole::File, &signed_bytes)
+            .expect("file role signature");
+        envelope.signature = file_signature.as_slice().try_into().expect("signature");
+        assert!(matches!(envelope.verify(), Err(MessageError::BadSignature)));
+
+        let transport_signature = identity.sign(&signed_bytes).expect("transport signature");
+        envelope.signature = transport_signature
+            .as_slice()
+            .try_into()
+            .expect("signature");
+        assert!(matches!(envelope.verify(), Err(MessageError::BadSignature)));
+    }
+
+    #[test]
+    fn substituted_and_tampered_proofs_are_rejected() {
+        let identity = Identity::generate().expect("identity");
+        let other = Identity::generate().expect("other identity");
+        let envelope = Envelope::new(&identity, params(), b"opaque ciphertext".to_vec())
+            .expect("signed envelope");
+
+        let mut substituted = envelope.clone();
+        substituted.identity_proof = other.proof().to_bytes();
+        assert!(matches!(substituted.verify(), Err(MessageError::BadPeerId)));
+
+        let mut tampered = envelope.clone();
+        tampered.identity_proof = tampered_proof(&identity);
+        assert!(tampered.verify().is_err());
+        assert!(
+            tampered
+                .sender_role_public_key(IdentityRole::Application)
+                .is_err()
+        );
+
+        let certified = envelope
+            .sender_role_public_key(IdentityRole::Application)
+            .expect("certified application key");
+        assert_eq!(
+            certified,
+            identity
+                .role_public_bytes(IdentityRole::Application)
+                .expect("local application key")
+        );
+        assert_ne!(
+            certified,
+            identity.ed25519_public_bytes().expect("transport key")
+        );
     }
 
     #[test]
@@ -445,10 +582,11 @@ mod tests {
             Err(MessageError::TrailingBytes)
         ));
         bytes.truncate(bytes.len() - 1);
-        bytes[4] = 2;
+        let next_version = ENVELOPE_VERSION + 1;
+        bytes[4..6].copy_from_slice(&next_version.to_le_bytes());
         assert!(matches!(
             Envelope::from_bytes(&bytes),
-            Err(MessageError::UnsupportedVersion(2))
+            Err(MessageError::UnsupportedVersion(version)) if version == next_version
         ));
     }
 

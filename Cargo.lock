@@ -4713,6 +4713,7 @@ dependencies = [
  "p2p-identity",
  "p2p-messaging",
  "p2p-storage",
+ "sha2 0.11.2",
  "thiserror 2.0.21",
  "zeroize",
 ]

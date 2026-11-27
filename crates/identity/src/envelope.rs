@@ -13,7 +13,7 @@ use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use libp2p_identity::Keypair;
 use zeroize::Zeroizing;
 
-use crate::{Identity, IdentityError};
+use crate::{Identity, IdentityError, bundle::BUNDLE_MAGIC};
 
 const MAGIC: &[u8] = b"P2PMSGR-IDENTITY-EXP";
 const VERSION: u8 = 1;
@@ -31,7 +31,7 @@ pub const DEFAULT_P_COST: u32 = 1;
 pub const EXPORT_PURPOSE: &[u8] = b"p2p-messenger/identity-export/v1";
 /// Maximum accepted exported identity envelope. Imports stop before header or
 /// ciphertext parsing when a supplied file exceeds this bound.
-pub const MAX_ENCRYPTED_IDENTITY_BYTES: usize = 4096;
+pub const MAX_ENCRYPTED_IDENTITY_BYTES: usize = 8192;
 
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
@@ -68,12 +68,7 @@ impl EncryptedIdentity {
             return Err(IdentityError::EmptyPassword);
         }
         let password = Zeroizing::new(password.to_owned());
-        let plaintext = Zeroizing::new(
-            identity
-                .keypair()
-                .to_protobuf_encoding()
-                .map_err(|error| IdentityError::Crypto(error.to_string()))?,
-        );
+        let plaintext = identity.export_bundle_bytes()?;
 
         let mut salt = [0u8; SALT_LEN];
         getrandom::fill(&mut salt).map_err(|_| IdentityError::Randomness)?;
@@ -182,9 +177,14 @@ impl EncryptedIdentity {
                 )
                 .map_err(|_| IdentityError::DecryptionFailed)?,
         );
-        let keypair = Keypair::from_protobuf_encoding(&plaintext)
-            .map_err(|_| IdentityError::InvalidEnvelope("private key decode failed".to_owned()))?;
-        Identity::from_keypair(keypair)
+        if plaintext.starts_with(BUNDLE_MAGIC) {
+            Identity::import_bundle_bytes(&plaintext)
+        } else {
+            let keypair = Keypair::from_protobuf_encoding(&plaintext).map_err(|_| {
+                IdentityError::InvalidEnvelope("private key decode failed".to_owned())
+            })?;
+            Identity::from_keypair(keypair)
+        }
     }
 }
 
@@ -263,6 +263,13 @@ mod tests {
         assert_eq!(restored.peer_id(), original.peer_id());
         assert_eq!(restored.public_key(), original.public_key());
         assert_eq!(restored.fingerprint(), original.fingerprint());
+        for role in crate::IdentityRole::ALL {
+            assert_eq!(
+                restored.role_public_bytes(role).expect("restored role key"),
+                original.role_public_bytes(role).expect("original role key")
+            );
+        }
+        assert_eq!(restored.proof(), original.proof());
     }
 
     #[test]

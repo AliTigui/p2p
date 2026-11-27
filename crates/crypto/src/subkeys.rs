@@ -19,16 +19,22 @@ pub enum Purpose {
     SearchIndex,
     Backup,
     BlindIndex,
+    /// Dedicated key for authenticated OpenMLS provider state. New vaults use
+    /// this purpose so MLS ciphertext is not encrypted under the general DB
+    /// key. Legacy vaults retain `Db` until an explicit re-encryption runs;
+    /// the profile records which purpose protects its MLS rows.
+    MlsState,
 }
 
 impl Purpose {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Db,
         Self::Attachments,
         Self::Identity,
         Self::SearchIndex,
         Self::Backup,
         Self::BlindIndex,
+        Self::MlsState,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -39,6 +45,7 @@ impl Purpose {
             Self::SearchIndex => "storage/search-index",
             Self::Backup => "storage/backup",
             Self::BlindIndex => "storage/blind-index",
+            Self::MlsState => "storage/mls-state",
         }
     }
 
@@ -50,6 +57,7 @@ impl Purpose {
             Self::SearchIndex => 3,
             Self::Backup => 4,
             Self::BlindIndex => 5,
+            Self::MlsState => 6,
         }
     }
 }
@@ -134,6 +142,10 @@ mod tests {
 
         assert_ne!(&db[..], &identity[..]);
         assert_eq!(&db[..], &subkeys.derive(Purpose::Db)[..]);
+
+        let mls = subkeys.derive(Purpose::MlsState);
+        assert_ne!(&mls[..], &db[..], "MLS state must not reuse the DB key");
+        assert_eq!(&mls[..], &subkeys.derive(Purpose::MlsState)[..]);
     }
 
     #[test]

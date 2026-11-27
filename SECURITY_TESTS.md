@@ -1,6 +1,6 @@
 # Security Test Execution
 
-This document explains how to execute the security-relevant tests that exist in the repository. It does not claim that any command has passed in this document; exact results are recorded in `PROJECT_STATUS.md` and `tests/README.md` after each verified run.
+This document explains how to execute the security-relevant tests that exist in the repository and records exact local results. All results in this document are local-only; no CI, release, commit, push, PR, review, merge, user/manual, or external verification claim is made. The authoritative milestone records are in `PROJECT_STATUS.md` and `SECURITY_MILESTONE_REPORTS.md`, with test-suite history in `tests/README.md`.
 
 ## 1. Baseline locked verification
 
@@ -29,6 +29,42 @@ Diagnostic guard:
 python3 scripts/check_diagnostics.py
 ```
 
+Targeted channel-isolation primitive:
+
+```bash
+cargo +1.100.0 test -p p2p-groups --test channel_isolation --locked
+cargo +1.100.0 test -p p2p-groups --test channel_group_lifecycle --locked
+cargo +1.100.0 test -p p2p-chat --lib --locked
+```
+
+The first command is the adversarial proof for the P1a primitive; the second proves the P1b bound lifecycle API; the third covers P1c channel-scope round trips, tampering/substitution rejection, controller scope binding, excluded-parent-member rejection, the P1d controller tests for injected ciphertext, derived-group receipts, and rejection of non-default text on the parent group, and the P1e restart tests for bound receipts, queued ciphertext, tampered/incomplete records, and lifecycle deletion. These tests prove cryptographic exclusion and authenticated channel-group restore for non-default controller text, not parent policy metadata confidentiality. P1f adds GUI model tests for default parent-group status, derived readiness, derived setup state, and absence of a complete-ACL claim; the final P14 GUI-feature run passed **20 tests, 0 failures**.
+
+Targeted P2/P3/P4 adversarial gates:
+
+```bash
+cargo +1.100.0 test -p p2p-identity --locked -- --test-threads=1
+cargo +1.100.0 test -p p2p-messaging -p p2p-files --locked -- --test-threads=1
+cargo +1.100.0 test -p p2p-chat --lib --locked -- --test-threads=1
+cargo +1.100.0 test -p p2p-storage --locked -- --test-threads=1
+cargo +1.100.0 test -p p2p-crypto --locked -- --test-threads=1
+```
+
+The identity run covers wrong-role/expired/revoked/substituted-proof rejection and certified role-key extraction. The messaging/files runs cover role-domain rejection at the envelope, setup, and file layers plus transport-signature reuse rejection. The chat run covers channel-bound durable acks and parent/channel ack separation. The storage run covers the dedicated MLS HKDF purpose, legacy key-version migration, fail-closed unknown versions, full control-log fail-closed behavior, and anchor-first crash recovery. Exact counts and results are recorded in `PROJECT_STATUS.md`.
+
+Targeted P5–P13 adversarial gates:
+
+```bash
+cargo +1.100.0 test -p p2p-network --lib --locked -- --test-threads=1
+cargo +1.100.0 test -p p2p-identity --lib --locked -- --test-threads=1
+cargo +1.100.0 test -p p2p-chat --lib --locked -- --test-threads=1
+cargo +1.100.0 test -p p2p-groups --lib --locked -- --test-threads=1
+cargo +1.100.0 test -p p2p-messaging --lib --locked -- --test-threads=1
+cargo +1.100.0 test -p p2p-identity --test identity_flow --locked -- --test-threads=1
+cargo +1.100.0 test -p p2p-desktop --features gui --locked -- --test-threads=1
+```
+
+These cover P5 fail-closed `TorRequired`, P6 delegation conflicts/expiry/wrong-role/redacted `Debug`, P7 outbound/inbound relay-policy symmetry and native-picker copy, P8 queue-full rejection before composing, P9 classical-only OpenMLS evidence, P10 transferable authorship and clear metadata, P11 independent devices plus portable bundle restore, and P13 oversized requests on every protocol. P12 uses the separate audit/deny/fuzz/SBOM commands in sections 5 and 6. The final serialized workspace run remains the authoritative aggregate gate.
+
 Fuzz targets:
 
 ```bash
@@ -48,8 +84,10 @@ done
 | Unit security tests | `cargo test --locked --workspace -- --test-threads=1` | Bounded codecs, signatures, key derivation, redacted `Debug`, redacted local paths, static untrusted-field errors, scanner policy, privacy defaults |
 | Envelope replay | `cargo test --locked -p p2p-messaging` | Duplicate IDs, sequence regression, conversation/epoch mismatch, tampered signature, deterministic bit-flip and truncation smoke tests |
 | MLS group isolation | `cargo test --locked -p p2p-groups` | 1:1 and three-member setup, Add/Remove/Update, epoch exclusion, stale-epoch rejection |
+| Channel-group primitive | `cargo test --locked -p p2p-groups --test channel_isolation` | Domain-separated ID derivation; excluded parent member cannot decrypt captured ciphertext; locally created same-ID group is not an oracle; channel update does not grant parent access |
+| Bound channel lifecycle | `cargo test --locked -p p2p-groups --test channel_group_lifecycle` | Explicit parent/channel binding; wrong-parent and wrong-channel KeyPackage/Welcome rejection; Add/Update/Remove commits; wrong-sender commit rejection; parent ciphertext rejection |
 | Setup/group control | `cargo test --locked -p p2p-chat` | Signed `MLS1` frames, peer/sender binding, acknowledgement state, strict parsers, signed v2 transaction binding, stale/cross-transaction rejection, bounded 512-entry digest cache, exact request/response replay suppression, durable control-log rejection of exact authenticated terminal replays after restart, idempotent request retry after restart (two controller restart regressions) |
-| Channel policy | `cargo test --locked -p p2p-chat` | Bounded `CHN1` frames, admin-only policy changes, revision checks, restricted honest delivery |
+| Channel policy and routing | `cargo test --locked -p p2p-chat` | Bounded `CHN1` frames, admin-only policy changes, revision checks, parent policy receipts, readiness-gated non-default text, derived-group ciphertext/receipts, exclusion of non-members, and rejection of misplaced frames |
 | Direct network | `cargo test --locked -p p2p-network` | Zero-bootstrap loopback connect, PeerId authentication, duplicate dial rejection, public `dial` circuit rejection before queueing, address validation |
 | Network resilience | `cargo test --locked -p p2p-network` | Pre-authentication global and per-IP socket caps, stalled-socket and extra-per-IP rejection before Noise, established connection caps, aggregate and per-protocol request/byte budgets, denied-request non-charging, expired rate-limiter entry cleanup, malformed/oversized frame handling, peerless-failure state preservation |
 | Relay policy | `cargo test --locked -p p2p-network` | Inbound relayed file requests emit only a policy failure, no pending response or `RequestReceived` |
@@ -57,7 +95,7 @@ done
 | File security | `cargo test --locked -p p2p-files` | Fresh keys, AEAD chunks, manifest verification, quarantine ciphertext-only, cancellation/release gates, abort clears partial state and quarantine |
 | File lifetime | `cargo test --locked -p p2p-chat --test controller` | Inactivity timeout, late-frame rejection, pending-request cleanup, terminal-state replacement transfer, cancellation only after verification |
 | Scanner policy | `cargo test --locked -p p2p-security` | Exact status categories, no-scanner `Unavailable`, default deny, narrow format validation |
-| Storage security | `cargo test --locked -p p2p-storage` | Wrong password, password change, DB/WAL/SHM plaintext scans, symlink refusal on Unix, schema v4 `control_log`/`control_state`, durable idempotent requests and non-repeatable terminal frames across reopen, chain/blind-index/anchor verification on unlock, older-DB-with-current-anchor rollback detection, anchor bit-flip detection (15 crate tests) |
+| Storage security | `cargo test --locked -p p2p-storage` | Wrong password, password change, DB/WAL/SHM plaintext scans, symlink refusal on Unix, schema v4 `control_log`/`control_state`, durable idempotent requests and non-repeatable terminal frames across reopen, chain/blind-index/anchor verification on unlock, older-DB-with-current-anchor rollback detection, anchor bit-flip detection, full-log fail-closed behavior, and dedicated/legacy MLS key-version handling |
 | GUI model | `cargo test --locked -p p2p-desktop --features gui` | Honest status rows, address validation, no fake connection state |
 | Diagnostic guard | `python3 scripts/check_diagnostics.py` | Unmarked raw output macros, derived `Debug` on protected types, secret-named types/fields, self-tests for fail-closed behavior |
 | Fuzz smoke | `cargo fuzz run` in `fuzz/` and `cargo clippy --manifest-path fuzz/Cargo.toml` | Canonical codec decoding, signature verification, redacted `Debug`, canonical re-encoding, hostile identity export and contact text |
@@ -69,6 +107,7 @@ When modifying a codec or state machine, add a test for each applicable case:
 
 - wrong magic, unknown version, truncated field, trailing bytes, oversized field, invalid UTF-8, duplicate/empty member sets;
 - tampered signature, wrong expected PeerId, wrong public key, cross-conversation substitution, stale epoch;
+- captured restricted-channel ciphertext injected into an excluded parent member, a locally created group with the same derived channel ID, post-update channel ciphertext, an allowed controller whose receipt must use the derived group, and non-default text injected into the parent group;
 - duplicate request with a different transaction ID, exact signed-frame replay, stale acknowledgement, out-of-order operations;
 - durable control-log cases: an exact authenticated terminal frame must not be re-applied after restart, while an idempotent `KeyPackageRequest`/`GroupJoinRequest` retry must stay idempotent after restart;
 - older database restored while keeping the current anchor and anchor bit flip must fail unlock (both tested); a missing anchor after a nonempty log and a broken chain (non-contiguous sequence or mismatched `chain_hash`, blind index, or record AEAD) must fail `verify_control_log` — these are source-backed fail-closed checks, but no dedicated missing-anchor or broken-chain test is recorded in the final 207-test run;
@@ -165,3 +204,25 @@ Checksum sidecars use bare filenames; verification must run from `dist/`. Checks
 - Structural file validation is not malware detection.
 - Absence of a plaintext sentinel in one database snapshot is not proof for every platform or future schema.
 - Absence of local detection after restoring the entire vault directory including `control.anchor` is not evidence of rollback resistance; it only shows that no external anchor exists. An external anchor would be an optional, future, user-controlled design, not a current control.
+
+## 8. Final recorded local gates (2026-11-27)
+
+These are local-only results for the final uncommitted P0–P14 code state. They do not claim CI, release, commit, push, PR, review, merge, user/manual, external, two-machine, visual-GUI, or production verification. Historical 207/257/285-test results remain in `PROJECT_STATUS.md` and are not evidence for this workstream.
+
+| Gate | Command | Result |
+|---|---|---|
+| Format | `cargo +1.100.0 fmt --all -- --check` | Passed. |
+| Diff hygiene | `git diff --check` | Passed. |
+| Diagnostics | `python3 scripts/check_diagnostics.py` | Passed; 62 Rust sources checked. |
+| Workspace check | `cargo +1.100.0 check --locked --workspace --all-targets` | Passed. |
+| Workspace clippy | `cargo +1.100.0 clippy --locked --workspace --all-targets -- -D warnings` | Passed; two pre-existing advisory manifest warnings remain non-fatal (`p2p-core` in `p2p-crypto`, `zeroize` in `p2p-security`). |
+| Workspace tests | `cargo +1.100.0 test --workspace --locked -- --test-threads=1` | **339 passed, 0 failed**, 0 doc-tests: chat 86 (66 unit + 20 integration), core 4, crypto 8, desktop 17, files 20, groups 19 (1 unit + 6 lifecycle + 3 isolation + 9 MLS integration), identity 61 (58 unit + 3 integration), messaging 20 (17 unit + 3 integration), network 44 (33 unit + 11 integration), security 11, storage 49 (12 unit + 28 vault + 9 provider integration). |
+| GUI feature | `cargo +1.100.0 check --locked -p p2p-desktop --features gui`, matching clippy, and `cargo +1.100.0 test -p p2p-desktop --features gui --locked -- --test-threads=1` | Passed; **20 tests, 0 failures**. |
+| Native feature | `cargo +1.100.0 check --locked -p p2p-desktop --features native`, matching clippy, and `cargo +1.100.0 build --locked -p p2p-desktop --features native` | Passed; no visual inspection claimed. |
+| Fuzz locked build | `cargo +1.100.0 check/clippy/build --locked --manifest-path fuzz/Cargo.toml` | Passed. |
+| Fuzz smoke | Six `cargo fuzz run` targets, 1000 plain-libFuzzer inputs each | All six completed without crashes; not coverage-instrumented and not a long campaign. |
+| Root advisories | `cargo audit --file Cargo.lock`; `cargo deny --locked --manifest-path Cargo.toml check` | Zero vulnerabilities with five allowed unmaintained warnings; `advisories ok, bans ok, licenses ok, sources ok`. |
+| Fuzz advisories | `cargo audit --file fuzz/Cargo.lock`; `cargo deny --locked --manifest-path fuzz/Cargo.toml check` | Zero vulnerabilities with two allowed unmaintained warnings; `advisories ok, bans ok, licenses ok, sources ok` after the one-line locked metadata refresh. |
+| SBOM | Two `python3 scripts/generate_sbom.py` runs per graph, compared with `cmp` | Root and fuzz documents regenerated byte-for-byte, 479 packages each. |
+
+The aggregate workspace and GUI test runs are authoritative; targeted commands above are retained for diagnosis. No result in this section establishes availability, anonymity, full rollback resistance, distributed-flood capacity, signed release identity, reproducibility, or production readiness.

@@ -13,7 +13,10 @@ use p2p_files::{
     FileConfig, FileEnvelope, FileMessage, FileTransferInfo, IncomingFile, OutgoingFile,
     ReleaseApproval, ReleasedFile, TransferDirection,
 };
-use p2p_groups::{GroupOperation, MlsConversation, MlsKeyPackage};
+use p2p_groups::{
+    ChannelGroupBinding, ChannelKeyPackage, ChannelWelcome, GroupOperation, MlsChannelGroup,
+    MlsConversation, MlsKeyPackage, channel_group_id,
+};
 use p2p_identity::Identity;
 use p2p_messaging::{DeliveryState, Envelope, MessageKind, ReceiptStatus, random_id};
 use p2p_network::{
@@ -29,7 +32,7 @@ use crate::channel::{
     ChannelFrame, ChannelFrameKind, DEFAULT_CHANNEL_ID, MAX_CHANNEL_MEMBERS,
     MAX_CHANNEL_NAME_BYTES, MAX_CHANNELS_PER_GROUP,
 };
-use crate::setup::TransactionId;
+use crate::setup::{ChannelScope, TransactionId};
 use crate::{ChatError, SetupEnvelope, SetupMessage};
 
 /// Default maximum quiet period for one active file transfer. The timer is
@@ -120,9 +123,34 @@ pub struct ConversationInfo {
     pub active_channel: Option<[u8; 16]>,
 }
 
-/// Public snapshot of one channel inside a joined MLS group. Channel membership
-/// is local application policy; every MLS group member can still decrypt the
-/// ciphertext, so this is never a cryptographic access-control claim.
+/// Where a channel's text and delivery receipts are encrypted. This is a
+/// transport observation, not a complete channel access-control claim: policy
+/// frames and the default channel always stay on the parent MLS group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelGroupStatus {
+    /// The default channel uses the parent MLS group; all parent members have
+    /// its keys.
+    DefaultOnParent,
+    /// A non-default channel's bound derived MLS group has converged.
+    DerivedReady,
+    /// A derived group exists but bound setup is not complete.
+    DerivedSettingUp { awaited: usize },
+    /// A non-default channel has no derived group yet.
+    Missing,
+}
+
+impl ChannelGroupStatus {
+    /// Whether text and receipts for this channel are currently encryptable by
+    /// the controller. This says nothing about parent policy confidentiality.
+    pub fn is_ready_for_text(self) -> bool {
+        matches!(self, Self::DefaultOnParent | Self::DerivedReady)
+    }
+}
+
+/// Public snapshot of one channel inside a joined MLS group. Parent policy
+/// receipts and derived text-group readiness are deliberately separate: the
+/// first is an application-policy observation, the second is the actual
+/// transport boundary for non-default text. Neither is a complete ACL claim.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ChannelInfo {
     pub channel_id: [u8; 16],
@@ -131,7 +159,10 @@ pub struct ChannelInfo {
     pub members: Vec<PeerId>,
     pub revision: u32,
     /// False while a local policy change is waiting for member receipts.
-    pub acknowledged: bool,
+    pub policy_acknowledged: bool,
+    /// Where channel text/receipts are encrypted and whether that group is
+    /// ready. Default traffic remains on the parent group.
+    pub group_status: ChannelGroupStatus,
 }
 
 impl fmt::Debug for ChannelInfo {
@@ -143,7 +174,8 @@ impl fmt::Debug for ChannelInfo {
             .field("creator", &self.creator.to_string())
             .field("members", &self.members.len())
             .field("revision", &self.revision)
-            .field("acknowledged", &self.acknowledged)
+            .field("policy_acknowledged", &self.policy_acknowledged)
+            .field("group_status", &self.group_status)
             .finish_non_exhaustive()
     }
 }
@@ -160,9 +192,16 @@ const PERSISTED_CONVERSATION_VERSION: u8 = 2;
 /// the reserved global provider bucket so they survive restart without being
 /// mistaken for a conversation by `mls_group_ids()`.
 const PERSISTED_GROUP_ACK_LABEL: &str = "p2p.app.group-ack/v1";
-const GROUP_ACK_VERSION: u8 = 1;
+const GROUP_ACK_VERSION: u8 = 2;
 const GROUP_ACK_COMMIT_CODE: u8 = 1;
 const GROUP_ACK_WELCOME_CODE: u8 = 2;
+const GROUP_ACK_CHANNEL_COMMIT_CODE: u8 = 3;
+const GROUP_ACK_CHANNEL_WELCOME_CODE: u8 = 4;
+/// Encrypted application binding for one derived channel group. It is stored
+/// under the derived group ID with a distinct authenticated label, so parent
+/// policy restore and channel-group restore cannot consume each other's record.
+const PERSISTED_CHANNEL_GROUP_LABEL: &str = "p2p.app.channel-group/v1";
+const PERSISTED_CHANNEL_GROUP_VERSION: u8 = 1;
 
 const MAX_PENDING_RECEIPTS: usize = 64;
 const MAX_OFFLINE_QUEUE: usize = 16;
@@ -245,6 +284,10 @@ struct PersistedGroupAck {
     transaction_id: [u8; 16],
     operation: u8,
     accepted: bool,
+    /// Present in version 2 records. A parent group ack and a channel ack are
+    /// never interchangeable, even when all other fields are identical.
+    #[serde(default)]
+    channel_id: Option<[u8; 16]>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -273,6 +316,38 @@ struct PersistedConversation {
     queued: Vec<PersistedQueuedMessage>,
 }
 
+/// Encrypted snapshot for one non-default channel group. It binds the derived
+/// group ID to its parent conversation, channel ID, policy revision, MLS epoch,
+/// membership, and pending ciphertext state. Decrypted text is never stored.
+#[derive(Serialize, Deserialize)]
+struct PersistedChannelGroup {
+    version: u8,
+    group_id: [u8; 16],
+    parent_conversation_id: [u8; 16],
+    channel_id: [u8; 16],
+    channel_revision: u32,
+    epoch: u64,
+    next_sequence: u64,
+    /// Members present in the derived MLS group.
+    members: Vec<Vec<u8>>,
+    /// Members allowed by the parent `CHN1` policy.
+    allowed_members: Vec<Vec<u8>>,
+    awaited: Vec<Vec<u8>>,
+    ready: bool,
+    outgoing: Vec<PersistedOutgoing>,
+    receipts: Vec<PersistedReceiptExpectation>,
+    queued: Vec<PersistedChannelQueuedMessage>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedChannelQueuedMessage {
+    peer: Vec<u8>,
+    conversation_id: [u8; 16],
+    channel_id: [u8; 16],
+    message_id: [u8; 16],
+    envelope_bytes: Vec<u8>,
+}
+
 struct RestoredConversations {
     conversations: HashMap<[u8; 16], ConversationState>,
     peer_conversations: HashMap<PeerId, [u8; 16]>,
@@ -280,6 +355,8 @@ struct RestoredConversations {
     active: Option<[u8; 16]>,
     pending_receipts: HashMap<[u8; 16], BTreeSet<PeerId>>,
     message_conversations: HashMap<[u8; 16], [u8; 16]>,
+    message_channel_routes: HashMap<[u8; 16], [u8; 16]>,
+    channel_groups: HashMap<[u8; 16], ChannelGroupState>,
     offline_queue: VecDeque<QueuedMessage>,
 }
 
@@ -292,6 +369,8 @@ impl RestoredConversations {
             active: None,
             pending_receipts: HashMap::new(),
             message_conversations: HashMap::new(),
+            message_channel_routes: HashMap::new(),
+            channel_groups: HashMap::new(),
             offline_queue: VecDeque::new(),
         }
     }
@@ -304,19 +383,24 @@ impl PersistedConversation {
         active_channel: Option<[u8; 16]>,
         pending_receipts: &HashMap<[u8; 16], BTreeSet<PeerId>>,
         message_conversations: &HashMap<[u8; 16], [u8; 16]>,
+        message_channel_routes: &HashMap<[u8; 16], [u8; 16]>,
         offline_queue: &VecDeque<QueuedMessage>,
     ) -> Self {
         let (status_code, status_reason) = status_code(&state.status);
         let conversation_id = state.conversation.id();
         let queued_ids: HashSet<[u8; 16]> = offline_queue
             .iter()
-            .filter(|item| item.conversation_id == conversation_id)
+            .filter(|item| {
+                item.conversation_id == conversation_id && item.channel_id == DEFAULT_CHANNEL_ID
+            })
             .map(|item| item.message_id)
             .collect();
         let mut outgoing = Vec::new();
         let mut receipts = Vec::new();
         for (message_id, peers) in pending_receipts {
+            // Non-default channel state belongs to the derived group record.
             if message_conversations.get(message_id) != Some(&conversation_id)
+                || message_channel_routes.contains_key(message_id)
                 || !matches!(
                     state.conversation.delivery_state(message_id),
                     Some(DeliveryState::Queued)
@@ -396,7 +480,9 @@ impl PersistedConversation {
             receipts,
             queued: offline_queue
                 .iter()
-                .filter(|item| item.conversation_id == conversation_id)
+                .filter(|item| {
+                    item.conversation_id == conversation_id && item.channel_id == DEFAULT_CHANNEL_ID
+                })
                 .map(|item| PersistedQueuedMessage {
                     peer: item.peer.to_bytes().to_vec(),
                     conversation_id: item.conversation_id,
@@ -441,6 +527,129 @@ impl PersistedConversation {
         {
             return Err(ChatError::MlsRestore(
                 "restored queued envelope is too large",
+            ));
+        }
+        Ok(decoded)
+    }
+}
+
+impl PersistedChannelGroup {
+    #[allow(clippy::too_many_arguments)]
+    fn from_state(
+        state: &ConversationState,
+        group_state: &ChannelGroupState,
+        pending_receipts: &HashMap<[u8; 16], BTreeSet<PeerId>>,
+        message_conversations: &HashMap<[u8; 16], [u8; 16]>,
+        message_channel_routes: &HashMap<[u8; 16], [u8; 16]>,
+        offline_queue: &VecDeque<QueuedMessage>,
+    ) -> Result<Self, ChatError> {
+        let parent_conversation_id = state.conversation.id();
+        let channel_id = group_state.binding.channel_id();
+        let channel = state
+            .channels
+            .get(&channel_id)
+            .ok_or(ChatError::ChannelNotFound)?;
+        let group_id = group_state.binding.group_id();
+        let queued_ids: HashSet<[u8; 16]> = offline_queue
+            .iter()
+            .filter(|item| {
+                item.conversation_id == parent_conversation_id && item.channel_id == channel_id
+            })
+            .map(|item| item.message_id)
+            .collect();
+        let mut outgoing = Vec::new();
+        let mut receipts = Vec::new();
+        for (message_id, peers) in pending_receipts {
+            if message_conversations.get(message_id) != Some(&parent_conversation_id)
+                || message_channel_routes.get(message_id) != Some(&channel_id)
+                || !matches!(
+                    group_state.group.delivery_state(message_id),
+                    Some(DeliveryState::Queued)
+                        | Some(DeliveryState::SentToPeer)
+                        | Some(DeliveryState::Composed)
+                )
+            {
+                continue;
+            }
+            outgoing.push(PersistedOutgoing {
+                message_id: *message_id,
+                state_code: if queued_ids.contains(message_id) {
+                    OUTGOING_QUEUED_CODE
+                } else {
+                    OUTGOING_SENT_CODE
+                },
+            });
+            receipts.push(PersistedReceiptExpectation {
+                message_id: *message_id,
+                peers: peers.iter().map(|peer| peer.to_bytes().to_vec()).collect(),
+            });
+        }
+        outgoing.sort_by_key(|item| item.message_id);
+        receipts.sort_by_key(|item| item.message_id);
+        let queued = offline_queue
+            .iter()
+            .filter(|item| {
+                item.conversation_id == parent_conversation_id && item.channel_id == channel_id
+            })
+            .map(|item| PersistedChannelQueuedMessage {
+                peer: item.peer.to_bytes().to_vec(),
+                conversation_id: item.conversation_id,
+                channel_id: item.channel_id,
+                message_id: item.message_id,
+                envelope_bytes: item.envelope_bytes.clone(),
+            })
+            .collect();
+        Ok(Self {
+            version: PERSISTED_CHANNEL_GROUP_VERSION,
+            group_id,
+            parent_conversation_id,
+            channel_id,
+            channel_revision: channel.revision,
+            epoch: group_state.group.epoch(),
+            next_sequence: group_state.group.next_sequence(),
+            members: group_state
+                .group
+                .members()?
+                .into_iter()
+                .map(|peer| peer.to_bytes().to_vec())
+                .collect(),
+            allowed_members: channel
+                .members
+                .iter()
+                .map(|peer| peer.to_bytes().to_vec())
+                .collect(),
+            awaited: group_state
+                .awaited
+                .iter()
+                .map(|peer| peer.to_bytes().to_vec())
+                .collect(),
+            ready: group_state.ready,
+            outgoing,
+            receipts,
+            queued,
+        })
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, ChatError> {
+        let decoded: Self = serde_json::from_slice(bytes)
+            .map_err(|_| ChatError::MlsRestore("invalid encrypted channel group metadata"))?;
+        if decoded.version != PERSISTED_CHANNEL_GROUP_VERSION
+            || decoded.next_sequence == 0
+            || decoded.members.is_empty()
+            || decoded.members.len() > MAX_CHANNEL_MEMBERS
+            || decoded.allowed_members.is_empty()
+            || decoded.allowed_members.len() > MAX_CHANNEL_MEMBERS
+            || decoded.awaited.len() > MAX_CHANNEL_MEMBERS
+            || decoded.outgoing.len() > MAX_PENDING_RECEIPTS
+            || decoded.receipts.len() > MAX_PENDING_RECEIPTS
+            || decoded.queued.len() > MAX_OFFLINE_QUEUE
+            || decoded
+                .queued
+                .iter()
+                .any(|item| item.envelope_bytes.len() > MAX_QUEUED_ENVELOPE_BYTES)
+        {
+            return Err(ChatError::MlsRestore(
+                "unsupported restored channel group metadata",
             ));
         }
         Ok(decoded)
@@ -651,6 +860,50 @@ struct ChannelState {
     last_frame_id: Option<[u8; 16]>,
 }
 
+/// An independent MLS group for one non-default channel. `awaited` tracks the
+/// peers whose bound setup has not been acknowledged yet; `ready` gates channel
+/// ciphertext until the local group contains every allowed member.
+#[derive(Debug)]
+struct ChannelGroupState {
+    binding: ChannelGroupBinding,
+    group: MlsChannelGroup,
+    awaited: BTreeSet<PeerId>,
+    ready: bool,
+}
+
+/// How far one allowed peer's channel-group setup has progressed. The admin
+/// adds peers sequentially so every member converges on the same epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelMemberSetupStage {
+    KeyPackageRequested,
+    WelcomeSent,
+}
+
+/// No derived `Debug`: Welcome and commit bytes are sensitive setup state and
+/// must never enter diagnostics through a container dump.
+struct PendingChannelMemberSetup {
+    channel_id: [u8; 16],
+    peer: PeerId,
+    scope: ChannelScope,
+    stage: ChannelMemberSetupStage,
+    welcome: Vec<u8>,
+    commit: Vec<u8>,
+    welcome_acked: bool,
+    commit_acks: BTreeSet<PeerId>,
+    required_commit_acks: BTreeSet<PeerId>,
+}
+
+/// A policy frame whose receipts gate creation or recreation of a channel MLS
+/// group. Setup starts only after every parent-group member has acknowledged
+/// the policy, so a member cannot receive a channel request before it knows the
+/// channel exists.
+#[derive(Debug, Clone, Copy)]
+struct PendingChannelPolicyAck {
+    conversation_id: [u8; 16],
+    channel_id: [u8; 16],
+    recreate: bool,
+}
+
 impl ConversationState {
     fn new(conversation: MlsConversation, admin: PeerId, members: BTreeSet<PeerId>) -> Self {
         let mut state = Self {
@@ -807,12 +1060,23 @@ struct PendingKeyPackage {
     response_bytes: Vec<u8>,
 }
 
+/// A channel KeyPackage retained until its bound Welcome arrives. The scope is
+/// the map key, so a response or Welcome from another channel cannot reach it.
+/// No derived `Debug`: the retained package and response bytes are sensitive.
+struct PendingChannelKeyPackage {
+    peer: PeerId,
+    key_package: ChannelKeyPackage,
+    response_bytes: Vec<u8>,
+}
+
 /// What kind of response completes one locally initiated setup request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutgoingSetupKind {
     KeyPackageRequest,
     Welcome,
     GroupJoinRequest,
+    ChannelKeyPackageRequest,
+    ChannelWelcome,
 }
 
 #[derive(Debug, Clone)]
@@ -820,6 +1084,7 @@ struct OutgoingSetup {
     conversation_id: [u8; 16],
     transaction_id: TransactionId,
     kind: OutgoingSetupKind,
+    scope: Option<ChannelScope>,
 }
 
 impl OutgoingSetupKind {
@@ -828,6 +1093,8 @@ impl OutgoingSetupKind {
             SetupMessage::KeyPackageRequest { .. } => Ok(Self::KeyPackageRequest),
             SetupMessage::Welcome { .. } => Ok(Self::Welcome),
             SetupMessage::GroupJoinRequest { .. } => Ok(Self::GroupJoinRequest),
+            SetupMessage::ChannelKeyPackageRequest { .. } => Ok(Self::ChannelKeyPackageRequest),
+            SetupMessage::ChannelWelcome { .. } => Ok(Self::ChannelWelcome),
             _ => Err(ChatError::InvalidSetup(
                 "unexpected outbound setup request type",
             )),
@@ -844,6 +1111,7 @@ enum GroupRequestKind {
 #[derive(Debug, Clone, Copy)]
 struct GroupRequest {
     conversation_id: [u8; 16],
+    channel_scope: Option<ChannelScope>,
     transaction_id: TransactionId,
     peer: PeerId,
     operation: GroupOperation,
@@ -880,6 +1148,7 @@ impl RequestOutcome {
 struct QueuedMessage {
     peer: PeerId,
     conversation_id: [u8; 16],
+    channel_id: [u8; 16],
     message_id: [u8; 16],
     envelope_bytes: Vec<u8>,
 }
@@ -889,6 +1158,7 @@ impl fmt::Debug for QueuedMessage {
         f.debug_struct("QueuedMessage")
             .field("peer", &self.peer.to_string())
             .field("conversation_id", &hex(&self.conversation_id))
+            .field("channel_id", &hex(&self.channel_id))
             .field("message_id", &hex(&self.message_id))
             .field("envelope_len", &self.envelope_bytes.len())
             .field("envelope_bytes", &"<mls-ciphertext>")
@@ -1002,10 +1272,17 @@ pub struct MessengerController {
     conversations: HashMap<[u8; 16], ConversationState>,
     peer_conversations: HashMap<PeerId, [u8; 16]>,
     pending_key_packages: HashMap<([u8; 16], TransactionId), PendingKeyPackage>,
+    pending_channel_key_packages: HashMap<ChannelScope, PendingChannelKeyPackage>,
+    channel_groups: HashMap<[u8; 16], ChannelGroupState>,
+    pending_channel_setups: HashMap<ChannelScope, PendingChannelMemberSetup>,
+    pending_channel_policy_acks: HashMap<[u8; 16], PendingChannelPolicyAck>,
     outstanding_setup: HashMap<p2p_network::SetupRequestId, OutgoingSetup>,
     group_requests: HashMap<p2p_network::SetupRequestId, GroupRequest>,
     outstanding_messages: HashMap<MessageRequestId, [u8; 16]>,
     message_conversations: HashMap<[u8; 16], [u8; 16]>,
+    /// Non-default channel messages are composed in a derived group, so their
+    /// message IDs map back to the parent channel for display and receipts.
+    message_channel_routes: HashMap<[u8; 16], [u8; 16]>,
     pending_receipts: HashMap<[u8; 16], BTreeSet<PeerId>>,
     applied_commits: HashMap<[u8; 16], HashSet<Vec<u8>>>,
     setup_replay: SetupReplayCache,
@@ -1088,7 +1365,37 @@ impl MessengerController {
         let local = identity.peer_id();
         let mut restored = RestoredConversations::empty();
         let mut first_joined = None;
-        for conversation_id in storage.mls_group_ids()? {
+        let mut parent_ids = Vec::new();
+        let mut channel_records = Vec::new();
+        for group_id in storage.mls_group_ids()? {
+            let parent_bytes = storage.load_mls_state(
+                &group_id,
+                PERSISTED_CONVERSATION_LABEL,
+                PERSISTED_CONVERSATION_LABEL.as_bytes(),
+            )?;
+            let channel_bytes = storage.load_mls_state(
+                &group_id,
+                PERSISTED_CHANNEL_GROUP_LABEL,
+                PERSISTED_CHANNEL_GROUP_LABEL.as_bytes(),
+            )?;
+            match (parent_bytes, channel_bytes) {
+                (Some(_), Some(_)) => {
+                    return Err(ChatError::MlsRestore(
+                        "one MLS group has both parent and channel metadata",
+                    ));
+                }
+                (Some(_), None) => parent_ids.push(group_id),
+                (None, Some(bytes)) => {
+                    channel_records.push((group_id, PersistedChannelGroup::decode(&bytes)?));
+                }
+                (None, None) => {
+                    return Err(ChatError::MlsRestore(
+                        "encrypted conversation metadata is missing",
+                    ));
+                }
+            }
+        }
+        for conversation_id in parent_ids {
             let bytes = storage
                 .load_mls_state(
                     &conversation_id,
@@ -1266,6 +1573,7 @@ impl MessengerController {
                 queued_messages.push_back(QueuedMessage {
                     peer: queued_peer,
                     conversation_id,
+                    channel_id: DEFAULT_CHANNEL_ID,
                     message_id: item.message_id,
                     envelope_bytes: item.envelope_bytes.clone(),
                 });
@@ -1357,6 +1665,253 @@ impl MessengerController {
                 first_joined = Some(conversation_id);
             }
         }
+
+        for (group_id, record) in channel_records {
+            let binding =
+                ChannelGroupBinding::new(record.parent_conversation_id, record.channel_id);
+            if binding.group_id() != group_id
+                || record.group_id != group_id
+                || record.parent_conversation_id == group_id
+                || record.channel_id == DEFAULT_CHANNEL_ID
+            {
+                return Err(ChatError::MlsRestore(
+                    "restored channel group binding is inconsistent",
+                ));
+            }
+            let allowed =
+                {
+                    let parent_state = restored
+                        .conversations
+                        .get(&record.parent_conversation_id)
+                        .ok_or(ChatError::MlsRestore(
+                        "restored channel group has no parent conversation",
+                    ))?;
+                    if parent_state.status != ConversationStatus::Joined {
+                        return Err(ChatError::MlsRestore(
+                            "restored channel group parent is not joined",
+                        ));
+                    }
+                    let channel = parent_state.channels.get(&record.channel_id).ok_or(
+                        ChatError::MlsRestore("restored channel group has no parent channel"),
+                    )?;
+                    let mut allowed = BTreeSet::new();
+                    for encoded in &record.allowed_members {
+                        let member = parse_persisted_peer(encoded)?;
+                        if !parent_state.members.contains(&member) || !allowed.insert(member) {
+                            return Err(ChatError::MlsRestore(
+                                "restored channel allowed membership is inconsistent",
+                            ));
+                        }
+                    }
+                    if allowed != channel.members || channel.revision != record.channel_revision {
+                        return Err(ChatError::MlsRestore(
+                            "restored channel group does not match channel policy",
+                        ));
+                    }
+                    allowed
+                };
+            // The local admin is always in the derived MLS group even when the
+            // channel policy lists only remote peers.
+            let mut expected_group_members = allowed.clone();
+            expected_group_members.insert(local);
+            let mut group_members = BTreeSet::new();
+            for encoded in &record.members {
+                let member = parse_persisted_peer(encoded)?;
+                if !expected_group_members.contains(&member) || !group_members.insert(member) {
+                    return Err(ChatError::MlsRestore(
+                        "restored channel group membership is inconsistent",
+                    ));
+                }
+            }
+            if group_members != expected_group_members {
+                return Err(ChatError::MlsRestore(
+                    "restored channel group membership does not match policy",
+                ));
+            }
+            let mut awaited = BTreeSet::new();
+            for encoded in &record.awaited {
+                if !awaited.insert(parse_persisted_peer(encoded)?) {
+                    return Err(ChatError::MlsRestore(
+                        "restored channel acknowledgement peer is duplicated",
+                    ));
+                }
+            }
+            if !record.ready || !awaited.is_empty() {
+                return Err(ChatError::MlsRestore(
+                    "a channel group setup was pending at shutdown",
+                ));
+            }
+            let mut group =
+                MlsChannelGroup::load_with_storage(identity, binding, storage.try_clone()?)?;
+            if group.id() != group_id || group.epoch() != record.epoch {
+                return Err(ChatError::MlsRestore(
+                    "restored channel MLS epoch does not match its record",
+                ));
+            }
+            group.restore_epoch(record.epoch)?;
+            group.restore_sequence(record.next_sequence)?;
+            let mls_members: BTreeSet<PeerId> = group.members()?.into_iter().collect();
+            if mls_members != group_members {
+                return Err(ChatError::MlsRestore(
+                    "restored channel MLS membership does not match its record",
+                ));
+            }
+
+            let mut receipt_expectations = HashMap::new();
+            for item in &record.receipts {
+                if item.peers.is_empty() || receipt_expectations.contains_key(&item.message_id) {
+                    return Err(ChatError::MlsRestore(
+                        "restored channel receipt expectation is invalid",
+                    ));
+                }
+                let mut peers = BTreeSet::new();
+                for encoded in &item.peers {
+                    let expected = parse_persisted_peer(encoded)?;
+                    if expected == local || !allowed.contains(&expected) || !peers.insert(expected)
+                    {
+                        return Err(ChatError::MlsRestore(
+                            "restored channel receipt peer is inconsistent",
+                        ));
+                    }
+                }
+                receipt_expectations.insert(item.message_id, peers);
+            }
+            let mut queued_messages = VecDeque::new();
+            let mut queued_ids = HashSet::new();
+            for item in &record.queued {
+                let queued_peer = parse_persisted_peer(&item.peer)?;
+                if queued_peer == local
+                    || !allowed.contains(&queued_peer)
+                    || item.conversation_id != record.parent_conversation_id
+                    || item.channel_id != record.channel_id
+                    || !queued_ids.insert((queued_peer, item.message_id))
+                {
+                    return Err(ChatError::MlsRestore(
+                        "restored channel queued message is inconsistent",
+                    ));
+                }
+                let envelope = Envelope::from_bytes(&item.envelope_bytes).map_err(|_| {
+                    ChatError::MlsRestore("restored channel queue envelope is invalid")
+                })?;
+                envelope.verify().map_err(|_| {
+                    ChatError::MlsRestore("restored channel queue envelope signature is invalid")
+                })?;
+                if envelope.conversation_id != group_id
+                    || envelope.message_id != item.message_id
+                    || envelope.sender != local
+                    || envelope.epoch != record.epoch
+                    || envelope.sender_sequence == 0
+                    || envelope.sender_sequence >= record.next_sequence
+                    || envelope.kind != MessageKind::Channel
+                {
+                    return Err(ChatError::MlsRestore(
+                        "restored channel queue envelope is not bound to this group",
+                    ));
+                }
+                queued_messages.push_back(QueuedMessage {
+                    peer: queued_peer,
+                    conversation_id: record.parent_conversation_id,
+                    channel_id: record.channel_id,
+                    message_id: item.message_id,
+                    envelope_bytes: item.envelope_bytes.clone(),
+                });
+            }
+            let queued_message_ids: HashSet<[u8; 16]> =
+                queued_messages.iter().map(|item| item.message_id).collect();
+            let mut restored_outgoing = HashSet::new();
+            for item in &record.outgoing {
+                if !restored_outgoing.insert(item.message_id)
+                    || !receipt_expectations.contains_key(&item.message_id)
+                {
+                    return Err(ChatError::MlsRestore(
+                        "restored channel outgoing state has no receipt expectation",
+                    ));
+                }
+                let delivery = if queued_message_ids.contains(&item.message_id) {
+                    match item.state_code {
+                        OUTGOING_QUEUED_CODE => DeliveryState::Queued,
+                        _ => {
+                            return Err(ChatError::MlsRestore(
+                                "restored queued channel message has an invalid state",
+                            ));
+                        }
+                    }
+                } else {
+                    match item.state_code {
+                        OUTGOING_SENT_CODE => DeliveryState::SentToPeer,
+                        _ => {
+                            return Err(ChatError::MlsRestore(
+                                "restored channel receipt expectation has an invalid state",
+                            ));
+                        }
+                    }
+                };
+                group.restore_outgoing(&item.message_id, delivery)?;
+            }
+            if receipt_expectations
+                .keys()
+                .any(|id| !restored_outgoing.contains(id))
+                || queued_message_ids
+                    .iter()
+                    .any(|id| !receipt_expectations.contains_key(id))
+            {
+                return Err(ChatError::MlsRestore(
+                    "restored channel pending state is incomplete",
+                ));
+            }
+            if record
+                .receipts
+                .iter()
+                .any(|item| queued_message_ids.contains(&item.message_id))
+                && record.outgoing.iter().any(|item| {
+                    queued_message_ids.contains(&item.message_id)
+                        && item.state_code != OUTGOING_QUEUED_CODE
+                })
+            {
+                return Err(ChatError::MlsRestore(
+                    "restored channel queue state is inconsistent",
+                ));
+            }
+            for message_id in receipt_expectations.keys() {
+                match restored.message_conversations.get(message_id) {
+                    Some(existing) if existing != &record.parent_conversation_id => {
+                        return Err(ChatError::MlsRestore(
+                            "restored message id is bound to two conversations",
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        restored
+                            .message_conversations
+                            .insert(*message_id, record.parent_conversation_id);
+                    }
+                }
+                match restored.message_channel_routes.get(message_id) {
+                    Some(existing) if existing != &record.channel_id => {
+                        return Err(ChatError::MlsRestore(
+                            "restored message id is bound to two channel groups",
+                        ));
+                    }
+                    Some(_) => {}
+                    None => {
+                        restored
+                            .message_channel_routes
+                            .insert(*message_id, record.channel_id);
+                    }
+                }
+            }
+            restored.pending_receipts.extend(receipt_expectations);
+            restored.offline_queue.extend(queued_messages);
+            restored.channel_groups.insert(
+                group_id,
+                ChannelGroupState {
+                    binding,
+                    group,
+                    awaited: BTreeSet::new(),
+                    ready: true,
+                },
+            );
+        }
         restored.active = first_joined;
         Ok(restored)
     }
@@ -1393,10 +1948,15 @@ impl MessengerController {
             conversations: restored.conversations,
             peer_conversations: restored.peer_conversations,
             pending_key_packages: HashMap::new(),
+            pending_channel_key_packages: HashMap::new(),
+            channel_groups: restored.channel_groups,
+            pending_channel_setups: HashMap::new(),
+            pending_channel_policy_acks: HashMap::new(),
             outstanding_setup: HashMap::new(),
             group_requests: HashMap::new(),
             outstanding_messages: HashMap::new(),
             message_conversations: restored.message_conversations,
+            message_channel_routes: restored.message_channel_routes,
             pending_receipts: restored.pending_receipts,
             applied_commits: HashMap::new(),
             setup_replay: SetupReplayCache::default(),
@@ -1771,6 +2331,14 @@ impl MessengerController {
                     .collect::<Vec<_>>(),
             )
         };
+        if channel_id != DEFAULT_CHANNEL_ID
+            && !self
+                .channel_groups
+                .get(&channel_group_id(conversation_id, channel_id))
+                .is_some_and(|state| state.ready)
+        {
+            return Err(ChatError::ChannelGroupNotReady);
+        }
         self.broadcast_channel_frame(
             conversation_id,
             channel_id,
@@ -1831,6 +2399,7 @@ impl MessengerController {
                 .collect::<Vec<_>>();
             (channel_id, frame, recipients)
         };
+        let no_policy_recipients = recipients.is_empty();
         let message_id = self.broadcast_channel_frame(
             conversation_id,
             channel_id,
@@ -1852,6 +2421,23 @@ impl MessengerController {
                 last_frame_id: Some(message_id),
             },
         );
+        self.pending_channel_policy_acks.insert(
+            message_id,
+            PendingChannelPolicyAck {
+                conversation_id,
+                channel_id,
+                recreate: false,
+            },
+        );
+        if no_policy_recipients
+            && let Some(trigger) = self.pending_channel_policy_acks.remove(&message_id)
+        {
+            self.start_channel_setup_for_channel(
+                trigger.conversation_id,
+                trigger.channel_id,
+                trigger.recreate,
+            )?;
+        }
         self.persist_conversation(conversation_id)?;
         Ok(channel_id)
     }
@@ -1915,7 +2501,7 @@ impl MessengerController {
         members: Vec<PeerId>,
     ) -> Result<(), ChatError> {
         let local = self.identity.peer_id();
-        let (frame, recipients) = {
+        let (frame, recipients, members_changed) = {
             let state = self
                 .conversations
                 .get(&conversation_id)
@@ -1944,8 +2530,11 @@ impl MessengerController {
                 .copied()
                 .filter(|member| *member != local)
                 .collect::<Vec<_>>();
-            (frame, recipients)
+            let next_members = members.iter().copied().collect::<BTreeSet<_>>();
+            let members_changed = channel.members != next_members;
+            (frame, recipients, members_changed)
         };
+        let no_policy_recipients = recipients.is_empty();
         let message_id = self.broadcast_channel_frame(
             conversation_id,
             channel_id,
@@ -1959,6 +2548,29 @@ impl MessengerController {
             channel.members = members.into_iter().collect();
             channel.revision = frame.revision;
             channel.last_frame_id = Some(message_id);
+        }
+        if members_changed {
+            // Fail closed immediately: no ciphertext from the old group is
+            // reused under the new policy. Setup resumes after the policy is
+            // acknowledged by every parent-group member.
+            self.drop_channel_group(conversation_id, channel_id)?;
+            self.pending_channel_policy_acks.insert(
+                message_id,
+                PendingChannelPolicyAck {
+                    conversation_id,
+                    channel_id,
+                    recreate: true,
+                },
+            );
+            if no_policy_recipients
+                && let Some(trigger) = self.pending_channel_policy_acks.remove(&message_id)
+            {
+                self.start_channel_setup_for_channel(
+                    trigger.conversation_id,
+                    trigger.channel_id,
+                    trigger.recreate,
+                )?;
+            }
         }
         self.persist_conversation(conversation_id)?;
         Ok(())
@@ -2050,6 +2662,7 @@ impl MessengerController {
                 welcome_acked: true,
             });
         }
+        self.drop_all_channel_groups(conversation_id)?;
         self.prune_removed_peer_state(conversation_id, &peer);
         self.persist_conversation(conversation_id)?;
         self.dispatch_group_operation(conversation_id)
@@ -2405,7 +3018,12 @@ impl MessengerController {
                 state.members.contains(&item.peer)
                     && state.status == ConversationStatus::Joined
                     && state.pending_operation.is_none()
-            });
+            })
+            && (item.channel_id == DEFAULT_CHANNEL_ID
+                || self
+                    .channel_groups
+                    .get(&channel_group_id(item.conversation_id, item.channel_id))
+                    .is_some_and(|state| state.ready));
         if !ready {
             return Err(ChatError::ConversationNotReady);
         }
@@ -2413,24 +3031,31 @@ impl MessengerController {
         let request_id = self
             .network
             .send_message(swarm_peer(&item.peer)?, item.envelope_bytes.clone())?;
-        let transition = {
-            let Some(state) = self.conversations.get_mut(&item.conversation_id) else {
-                let _ = self.outstanding_messages.remove(&request_id);
-                return Err(ChatError::UnknownConversation);
-            };
-            match state.conversation.delivery_state(&item.message_id) {
-                Some(DeliveryState::SentToPeer)
-                | Some(DeliveryState::Delivered)
-                | Some(DeliveryState::Read)
-                | Some(DeliveryState::Failed) => Ok(()),
-                _ => state.conversation.mark_sent_to_peer(&item.message_id),
-            }
+        let channel_route = (item.channel_id != DEFAULT_CHANNEL_ID).then_some(item.channel_id);
+        let transition = match self.message_group_delivery_state(
+            item.conversation_id,
+            channel_route,
+            &item.message_id,
+        ) {
+            Some(DeliveryState::SentToPeer)
+            | Some(DeliveryState::Delivered)
+            | Some(DeliveryState::Read)
+            | Some(DeliveryState::Failed) => Ok(()),
+            _ => self.mark_message_group(
+                item.conversation_id,
+                channel_route,
+                item.message_id,
+                DeliveryState::SentToPeer,
+            ),
         };
         if let Err(error) = transition {
             let _ = self.outstanding_messages.remove(&request_id);
-            if let Some(state) = self.conversations.get_mut(&item.conversation_id) {
-                let _ = state.conversation.mark_failed(&item.message_id);
-            }
+            let _ = self.mark_message_group(
+                item.conversation_id,
+                channel_route,
+                item.message_id,
+                DeliveryState::Failed,
+            );
             self.set_line_delivery(item.message_id, DeliveryState::Failed);
             self.last_error = Some(error.to_string());
             self.persist_conversation(item.conversation_id)?;
@@ -2487,16 +3112,31 @@ impl MessengerController {
             .channels
             .iter()
             .map(|(id, channel)| {
-                let acknowledged = channel
+                let policy_acknowledged = channel
                     .last_frame_id
                     .is_none_or(|message_id| !self.pending_receipts.contains_key(&message_id));
+                let group_status = if *id == DEFAULT_CHANNEL_ID {
+                    ChannelGroupStatus::DefaultOnParent
+                } else {
+                    match self
+                        .channel_groups
+                        .get(&channel_group_id(conversation_id, *id))
+                    {
+                        Some(state) if state.ready => ChannelGroupStatus::DerivedReady,
+                        Some(state) => ChannelGroupStatus::DerivedSettingUp {
+                            awaited: state.awaited.len(),
+                        },
+                        None => ChannelGroupStatus::Missing,
+                    }
+                };
                 ChannelInfo {
                     channel_id: *id,
                     name: channel.name.clone(),
                     creator: channel.creator,
                     members: channel.members.iter().copied().collect(),
                     revision: channel.revision,
-                    acknowledged,
+                    policy_acknowledged,
+                    group_status,
                 }
             })
             .collect();
@@ -2551,12 +3191,49 @@ impl MessengerController {
                 active_channel,
                 &self.pending_receipts,
                 &self.message_conversations,
+                &self.message_channel_routes,
                 &self.offline_queue,
             );
             let bytes = serde_json::to_vec(&record)
                 .map_err(|_| ChatError::MlsRestore("conversation metadata encoding failed"))?;
             (state.conversation.epoch(), bytes)
         };
+        // A not-yet-ready channel group has no authenticated application
+        // record. Its MLS provider state may already be staged or flushed, so
+        // restart fails closed instead of reviving an incomplete setup.
+        let mut channel_records: Vec<([u8; 16], u64, Vec<u8>)> = Vec::new();
+        {
+            let groups: Vec<&ChannelGroupState> = self
+                .channel_groups
+                .values()
+                .filter(|group| {
+                    group.ready
+                        && group.binding.parent_conversation_id() == conversation_id
+                        && self
+                            .conversations
+                            .get(&conversation_id)
+                            .is_some_and(|state| {
+                                state.channels.contains_key(&group.binding.channel_id())
+                            })
+                })
+                .collect();
+            let Some(state) = self.conversations.get(&conversation_id) else {
+                return Ok(());
+            };
+            for group in groups {
+                let record = PersistedChannelGroup::from_state(
+                    state,
+                    group,
+                    &self.pending_receipts,
+                    &self.message_conversations,
+                    &self.message_channel_routes,
+                    &self.offline_queue,
+                )?;
+                let bytes = serde_json::to_vec(&record)
+                    .map_err(|_| ChatError::MlsRestore("channel group metadata encoding failed"))?;
+                channel_records.push((group.binding.group_id(), group.group.epoch(), bytes));
+            }
+        }
         if let Some(storage) = self.storage.as_mut() {
             storage.store_mls_state(
                 &conversation_id,
@@ -2565,6 +3242,15 @@ impl MessengerController {
                 epoch,
                 &bytes,
             )?;
+            for (group_id, group_epoch, bytes) in channel_records {
+                storage.store_mls_state(
+                    &group_id,
+                    PERSISTED_CHANNEL_GROUP_LABEL,
+                    PERSISTED_CHANNEL_GROUP_LABEL.as_bytes(),
+                    group_epoch,
+                    &bytes,
+                )?;
+            }
         }
         Ok(())
     }
@@ -2640,6 +3326,7 @@ impl MessengerController {
                 if self.is_connected(&joiner) {
                     let request = GroupRequest {
                         conversation_id,
+                        channel_scope: None,
                         transaction_id,
                         peer: joiner,
                         operation: GroupOperation::Add,
@@ -2676,6 +3363,7 @@ impl MessengerController {
             }
             let request = GroupRequest {
                 conversation_id,
+                channel_scope: None,
                 transaction_id,
                 peer,
                 operation: op,
@@ -2735,6 +3423,7 @@ impl MessengerController {
             {
                 let request = GroupRequest {
                     conversation_id,
+                    channel_scope: None,
                     transaction_id,
                     peer: *peer,
                     operation: GroupOperation::Add,
@@ -2755,6 +3444,7 @@ impl MessengerController {
             if awaited == Some(false) {
                 let request = GroupRequest {
                     conversation_id,
+                    channel_scope: None,
                     transaction_id,
                     peer: *peer,
                     operation: op,
@@ -2825,15 +3515,61 @@ impl MessengerController {
         for message_id in empty_messages {
             self.pending_receipts.remove(&message_id);
             self.message_conversations.remove(&message_id);
+            self.message_channel_routes.remove(&message_id);
         }
         self.offline_queue
             .retain(|item| item.conversation_id != conversation_id || item.peer != *removed);
     }
 
     fn remove_local_conversation(&mut self, conversation_id: [u8; 16]) {
+        // Collect every derived group before dropping in-memory state so the
+        // encrypted records are deleted too. A removed parent must never be
+        // restored with stale channel ciphertext. Storage is authoritative
+        // here: a persisted group that is not currently loaded still belongs
+        // to this parent.
+        let mut derived_group_ids: BTreeSet<[u8; 16]> = self
+            .channel_groups
+            .values()
+            .filter(|state| state.binding.parent_conversation_id() == conversation_id)
+            .map(|state| state.binding.group_id())
+            .collect();
+        let mut derivation_error = None;
+        if let Some(storage) = self.storage.as_ref() {
+            match storage.mls_group_ids() {
+                Ok(group_ids) => {
+                    for group_id in group_ids {
+                        match storage.load_mls_state(
+                            &group_id,
+                            PERSISTED_CHANNEL_GROUP_LABEL,
+                            PERSISTED_CHANNEL_GROUP_LABEL.as_bytes(),
+                        ) {
+                            Ok(Some(bytes)) => match PersistedChannelGroup::decode(&bytes) {
+                                Ok(record) if record.parent_conversation_id == conversation_id => {
+                                    derived_group_ids.insert(group_id);
+                                }
+                                Ok(_) => {}
+                                Err(error) => derivation_error = Some(error.to_string()),
+                            },
+                            Ok(None) => {}
+                            Err(error) => derivation_error = Some(error.to_string()),
+                        }
+                    }
+                }
+                Err(error) => derivation_error = Some(error.to_string()),
+            }
+        }
+        let derived_group_ids: Vec<[u8; 16]> = derived_group_ids.into_iter().collect();
         self.conversations.remove(&conversation_id);
         self.pending_key_packages
             .retain(|(id, _), _| *id != conversation_id);
+        self.pending_channel_key_packages
+            .retain(|scope, _| scope.parent_conversation_id != conversation_id);
+        self.channel_groups
+            .retain(|_, state| state.binding.parent_conversation_id() != conversation_id);
+        self.pending_channel_setups
+            .retain(|_, setup| setup.scope.parent_conversation_id != conversation_id);
+        self.pending_channel_policy_acks
+            .retain(|_, trigger| trigger.conversation_id != conversation_id);
         self.outstanding_setup
             .retain(|_, setup| setup.conversation_id != conversation_id);
         self.group_requests
@@ -2851,17 +3587,29 @@ impl MessengerController {
             .collect();
         for message_id in affected {
             self.message_conversations.remove(&message_id);
+            self.message_channel_routes.remove(&message_id);
             self.pending_receipts.remove(&message_id);
         }
         if self.active == Some(conversation_id) {
             self.active = None;
         }
-        let deletion = self
+        if let Some(error) = derivation_error {
+            self.last_error = Some(error);
+        }
+        let deletions = self
             .storage
             .as_mut()
             .map(|storage| storage.delete_mls_state_group(&conversation_id));
-        if let Some(Err(error)) = deletion {
+        if let Some(Err(error)) = deletions {
             self.last_error = Some(error.to_string());
+        }
+        if let Some(storage) = self.storage.as_mut() {
+            for group_id in derived_group_ids {
+                if let Err(error) = storage.delete_mls_state_group(&group_id) {
+                    self.last_error = Some(error.to_string());
+                    break;
+                }
+            }
         }
     }
 
@@ -2878,6 +3626,7 @@ impl MessengerController {
             return Err(ChatError::InvalidSetup("outbound setup IDs mismatch"));
         }
         let kind = OutgoingSetupKind::from_message(&message)?;
+        let scope = message.channel_scope();
         let frame = SetupEnvelope::new(&self.identity, message)?;
         let request_id = self
             .network
@@ -2888,6 +3637,7 @@ impl MessengerController {
                 conversation_id,
                 transaction_id,
                 kind,
+                scope,
             },
         );
         Ok(())
@@ -2914,12 +3664,45 @@ impl MessengerController {
         Ok((peer, frame))
     }
 
+    /// Validate the exact `(parent conversation, channel, transaction, peer)`
+    /// scope of an inbound channel setup frame before any KeyPackage, Welcome,
+    /// or commit bytes are used. P1d drives the bound `MlsChannelGroup` through
+    /// this gate; it does not make the GUI's default-channel traffic special.
+    pub fn validate_channel_setup_scope(
+        &self,
+        expected_peer: &PeerId,
+        frame: &SetupEnvelope,
+        expected_scope: &ChannelScope,
+    ) -> Result<ChannelGroupBinding, ChatError> {
+        frame.verify_channel_scope(expected_peer, expected_scope)?;
+        let state = self
+            .conversations
+            .get(&expected_scope.parent_conversation_id)
+            .ok_or(ChatError::UnknownConversation)?;
+        if state.status != ConversationStatus::Joined {
+            return Err(ChatError::ConversationNotReady);
+        }
+        let channel = state
+            .channels
+            .get(&expected_scope.channel_id)
+            .ok_or(ChatError::ChannelNotFound)?;
+        if !state.members.contains(expected_peer) || !channel.members.contains(expected_peer) {
+            return Err(ChatError::NotChannelMember);
+        }
+        Ok(ChannelGroupBinding::new(
+            expected_scope.parent_conversation_id,
+            expected_scope.channel_id,
+        ))
+    }
+
     /// Only requests that can be retried after a lost response remain
     /// idempotent. Terminal frames and every acknowledgement are one-shot.
     fn is_repeatable_setup_message(message: &SetupMessage) -> bool {
         matches!(
             message,
-            SetupMessage::KeyPackageRequest { .. } | SetupMessage::GroupJoinRequest { .. }
+            SetupMessage::KeyPackageRequest { .. }
+                | SetupMessage::GroupJoinRequest { .. }
+                | SetupMessage::ChannelKeyPackageRequest { .. }
         )
     }
 
@@ -2958,6 +3741,39 @@ impl MessengerController {
                 hasher.update(transaction_id);
                 hasher.update(welcome);
             }
+            SetupMessage::ChannelCommit {
+                conversation_id,
+                channel_id,
+                transaction_id,
+                operation,
+                target,
+                commit,
+            } => {
+                hasher.update(b"p2p.app.channel-commit-outcome/v2");
+                hasher.update(peer.to_bytes());
+                hasher.update(conversation_id);
+                hasher.update(channel_id);
+                hasher.update(transaction_id);
+                hasher.update([operation.code()]);
+                hasher.update([u8::from(target.is_some())]);
+                if let Some(target) = target {
+                    hasher.update(target.to_bytes());
+                }
+                hasher.update(commit);
+            }
+            SetupMessage::ChannelWelcome {
+                conversation_id,
+                channel_id,
+                transaction_id,
+                welcome,
+            } => {
+                hasher.update(b"p2p.app.channel-welcome-outcome/v2");
+                hasher.update(peer.to_bytes());
+                hasher.update(conversation_id);
+                hasher.update(channel_id);
+                hasher.update(transaction_id);
+                hasher.update(welcome);
+            }
             _ => return None,
         }
         Some(hasher.finalize().into())
@@ -2976,13 +3792,13 @@ impl MessengerController {
         };
         let record: PersistedGroupAck = serde_json::from_slice(&bytes)
             .map_err(|_| ChatError::MlsRestore("stored group ack is invalid"))?;
-        if record.version != GROUP_ACK_VERSION {
+        if record.version == 0 || record.version > GROUP_ACK_VERSION {
             return Err(ChatError::MlsRestore(
                 "stored group ack version is unsupported",
             ));
         }
         match record.response {
-            GROUP_ACK_COMMIT_CODE => {
+            GROUP_ACK_COMMIT_CODE if record.channel_id.is_none() => {
                 let operation = GroupOperation::from_code(record.operation).ok_or(
                     ChatError::MlsRestore("stored group ack operation is invalid"),
                 )?;
@@ -2993,11 +3809,39 @@ impl MessengerController {
                     accepted: record.accepted,
                 }))
             }
-            GROUP_ACK_WELCOME_CODE => Ok(Some(SetupMessage::GroupWelcomeAck {
-                conversation_id: record.conversation_id,
-                transaction_id: record.transaction_id,
-                accepted: record.accepted,
-            })),
+            GROUP_ACK_WELCOME_CODE if record.channel_id.is_none() => {
+                Ok(Some(SetupMessage::GroupWelcomeAck {
+                    conversation_id: record.conversation_id,
+                    transaction_id: record.transaction_id,
+                    accepted: record.accepted,
+                }))
+            }
+            GROUP_ACK_CHANNEL_COMMIT_CODE => {
+                let operation = GroupOperation::from_code(record.operation).ok_or(
+                    ChatError::MlsRestore("stored channel ack operation is invalid"),
+                )?;
+                let channel_id = record.channel_id.ok_or(ChatError::MlsRestore(
+                    "stored channel ack has no channel binding",
+                ))?;
+                Ok(Some(SetupMessage::ChannelCommitAck {
+                    conversation_id: record.conversation_id,
+                    channel_id,
+                    transaction_id: record.transaction_id,
+                    operation,
+                    accepted: record.accepted,
+                }))
+            }
+            GROUP_ACK_CHANNEL_WELCOME_CODE => {
+                let channel_id = record.channel_id.ok_or(ChatError::MlsRestore(
+                    "stored channel ack has no channel binding",
+                ))?;
+                Ok(Some(SetupMessage::ChannelWelcomeAck {
+                    conversation_id: record.conversation_id,
+                    channel_id,
+                    transaction_id: record.transaction_id,
+                    accepted: record.accepted,
+                }))
+            }
             _ => Err(ChatError::MlsRestore("stored group ack type is invalid")),
         }
     }
@@ -3025,6 +3869,7 @@ impl MessengerController {
                 transaction_id: *transaction_id,
                 operation: operation.code(),
                 accepted: *accepted,
+                channel_id: None,
             },
             SetupMessage::GroupWelcomeAck {
                 conversation_id,
@@ -3037,6 +3882,36 @@ impl MessengerController {
                 transaction_id: *transaction_id,
                 operation: GroupOperation::Add.code(),
                 accepted: *accepted,
+                channel_id: None,
+            },
+            SetupMessage::ChannelCommitAck {
+                conversation_id,
+                channel_id,
+                transaction_id,
+                operation,
+                accepted,
+            } => PersistedGroupAck {
+                version: GROUP_ACK_VERSION,
+                response: GROUP_ACK_CHANNEL_COMMIT_CODE,
+                conversation_id: *conversation_id,
+                transaction_id: *transaction_id,
+                operation: operation.code(),
+                accepted: *accepted,
+                channel_id: Some(*channel_id),
+            },
+            SetupMessage::ChannelWelcomeAck {
+                conversation_id,
+                channel_id,
+                transaction_id,
+                accepted,
+            } => PersistedGroupAck {
+                version: GROUP_ACK_VERSION,
+                response: GROUP_ACK_CHANNEL_WELCOME_CODE,
+                conversation_id: *conversation_id,
+                transaction_id: *transaction_id,
+                operation: GroupOperation::Add.code(),
+                accepted: *accepted,
+                channel_id: Some(*channel_id),
             },
             _ => return Ok(()),
         };
@@ -3121,6 +3996,9 @@ impl MessengerController {
                 let group_request = self.group_requests.remove(&request_id);
                 let outgoing_setup = self.outstanding_setup.remove(&request_id);
                 if let Some(request) = group_request {
+                    if request.channel_scope.is_some() {
+                        return self.handle_channel_group_ack(peer, &frame, request);
+                    }
                     return self.handle_group_ack(peer, frame.message, request);
                 }
                 self.process_setup_response(peer, frame, outgoing_setup)
@@ -3173,8 +4051,44 @@ impl MessengerController {
         peer: PeerId,
         frame: SetupEnvelope,
     ) -> Result<RequestOutcome, ChatError> {
-        let public_key = frame.sender_public_key;
+        let public_key = frame.sender_mls_public_key()?.to_vec();
         let outcome_key = Self::group_request_outcome_key(&peer, &frame.message);
+        if let Some(scope) = frame.message.channel_scope() {
+            match &frame.message {
+                SetupMessage::ChannelKeyPackageRequest { .. } => {
+                    return self.register_pending_channel_key_package(peer, &frame, scope);
+                }
+                SetupMessage::ChannelWelcome { welcome, .. } => {
+                    let ack =
+                        self.join_channel_from_welcome(peer, &frame, scope, welcome.clone())?;
+                    let outcome = RequestOutcome::respond(ack);
+                    if let Some(key) = &outcome_key {
+                        self.persist_group_ack(key, &outcome)?;
+                    }
+                    return Ok(outcome);
+                }
+                SetupMessage::ChannelCommit {
+                    operation,
+                    target,
+                    commit,
+                    ..
+                } => {
+                    let outcome = self.process_channel_commit_request(
+                        peer,
+                        &frame,
+                        scope,
+                        *operation,
+                        *target,
+                        commit.clone(),
+                    )?;
+                    if let Some(key) = &outcome_key {
+                        self.persist_group_ack(key, &outcome)?;
+                    }
+                    return Ok(outcome);
+                }
+                _ => {}
+            }
+        }
         match frame.message {
             SetupMessage::KeyPackageRequest {
                 conversation_id,
@@ -3299,6 +4213,7 @@ impl MessengerController {
                     let local = self.identity.peer_id();
                     self.refresh_peer_conversations(conversation_id, &local);
                     for removed in removed_members {
+                        self.drop_all_channel_groups(conversation_id)?;
                         self.prune_removed_peer_state(conversation_id, &removed);
                     }
                     self.persist_conversation(conversation_id)?;
@@ -3474,13 +4389,715 @@ impl MessengerController {
         }
     }
 
+    /// Drop the independent group for one channel, including its authenticated
+    /// encrypted record. This is the conservative response to a changed channel
+    /// member set: ciphertext from an older group is never reused with a newer
+    /// policy, and restart cannot revive the older group.
+    fn drop_channel_group(
+        &mut self,
+        conversation_id: [u8; 16],
+        channel_id: [u8; 16],
+    ) -> Result<(), ChatError> {
+        let group_id = channel_group_id(conversation_id, channel_id);
+        self.channel_groups.remove(&group_id);
+        self.pending_channel_setups
+            .retain(|_, setup| setup.channel_id != channel_id);
+        self.pending_channel_key_packages.retain(|scope, _| {
+            scope.parent_conversation_id != conversation_id || scope.channel_id != channel_id
+        });
+        self.pending_channel_policy_acks.retain(|_, trigger| {
+            trigger.conversation_id != conversation_id || trigger.channel_id != channel_id
+        });
+        let affected: Vec<[u8; 16]> = self
+            .message_channel_routes
+            .iter()
+            .filter_map(|(message_id, routed)| {
+                (*routed == channel_id
+                    && self.message_conversations.get(message_id) == Some(&conversation_id))
+                .then_some(*message_id)
+            })
+            .collect();
+        for message_id in affected {
+            self.pending_receipts.remove(&message_id);
+            self.message_conversations.remove(&message_id);
+            self.message_channel_routes.remove(&message_id);
+        }
+        self.offline_queue.retain(|item| {
+            item.conversation_id != conversation_id || item.channel_id != channel_id
+        });
+        if let Some(storage) = self.storage.as_mut() {
+            storage.delete_mls_state_group(&group_id)?;
+        }
+        Ok(())
+    }
+
+    /// A parent-group removal invalidates every channel group in that
+    /// conversation. No removed peer can remain in an active channel group.
+    fn drop_all_channel_groups(&mut self, conversation_id: [u8; 16]) -> Result<(), ChatError> {
+        let channels: Vec<[u8; 16]> = self
+            .conversations
+            .get(&conversation_id)
+            .map(|state| state.channels.keys().copied().collect())
+            .unwrap_or_default();
+        for channel_id in channels {
+            self.drop_channel_group(conversation_id, channel_id)?;
+        }
+        // Also drop any persisted derived group whose parent policy has already
+        // been removed from the in-memory conversation list.
+        let group_ids: Vec<[u8; 16]> = self
+            .channel_groups
+            .values()
+            .filter(|state| state.binding.parent_conversation_id() == conversation_id)
+            .map(|state| state.binding.group_id())
+            .collect();
+        for group_id in group_ids {
+            if let Some(storage) = self.storage.as_mut() {
+                storage.delete_mls_state_group(&group_id)?;
+            }
+        }
+        self.channel_groups
+            .retain(|_, state| state.binding.parent_conversation_id() != conversation_id);
+        self.message_channel_routes
+            .retain(|_, routed| self.message_conversations.get(routed) != Some(&conversation_id));
+        Ok(())
+    }
+
+    /// Delivery state for one composed frame lives in the group that produced
+    /// its ciphertext: the parent for policy/default traffic, the derived group
+    /// for non-default channel text.
+    fn message_group_delivery_state(
+        &self,
+        conversation_id: [u8; 16],
+        channel_id: Option<[u8; 16]>,
+        message_id: &[u8; 16],
+    ) -> Option<DeliveryState> {
+        match channel_id {
+            Some(channel_id) => self
+                .channel_groups
+                .get(&channel_group_id(conversation_id, channel_id))
+                .and_then(|state| state.group.delivery_state(message_id)),
+            None => self
+                .conversations
+                .get(&conversation_id)
+                .and_then(|state| state.conversation.delivery_state(message_id)),
+        }
+    }
+
+    fn mark_message_group(
+        &mut self,
+        conversation_id: [u8; 16],
+        channel_id: Option<[u8; 16]>,
+        message_id: [u8; 16],
+        delivery: DeliveryState,
+    ) -> Result<(), ChatError> {
+        match channel_id {
+            Some(channel_id) => {
+                let state = self
+                    .channel_groups
+                    .get_mut(&channel_group_id(conversation_id, channel_id))
+                    .ok_or(ChatError::ChannelGroupNotReady)?;
+                match delivery {
+                    DeliveryState::Queued => state.group.mark_queued(&message_id)?,
+                    DeliveryState::SentToPeer => state.group.mark_sent_to_peer(&message_id)?,
+                    DeliveryState::Failed => state.group.mark_failed(&message_id)?,
+                    _ => return Err(ChatError::InvalidSetup("invalid message transition")),
+                }
+            }
+            None => {
+                let state = self
+                    .conversations
+                    .get_mut(&conversation_id)
+                    .ok_or(ChatError::UnknownConversation)?;
+                match delivery {
+                    DeliveryState::Queued => state.conversation.mark_queued(&message_id)?,
+                    DeliveryState::SentToPeer => {
+                        state.conversation.mark_sent_to_peer(&message_id)?
+                    }
+                    DeliveryState::Failed => state.conversation.mark_failed(&message_id)?,
+                    _ => return Err(ChatError::InvalidSetup("invalid message transition")),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Register the signed channel KeyPackage request. The exact scope is the
+    /// map key, so an exact retry returns the same bytes and a different
+    /// channel or transaction cannot reach this provider.
+    fn register_pending_channel_key_package(
+        &mut self,
+        peer: PeerId,
+        frame: &SetupEnvelope,
+        scope: ChannelScope,
+    ) -> Result<RequestOutcome, ChatError> {
+        let binding = self.validate_channel_setup_scope(&peer, frame, &scope)?;
+        if let Some(pending) = self.pending_channel_key_packages.get(&scope) {
+            if pending.peer != peer {
+                return Err(ChatError::UnexpectedSender);
+            }
+            return Ok(RequestOutcome::respond(
+                SetupMessage::ChannelKeyPackageResponse {
+                    conversation_id: scope.parent_conversation_id,
+                    channel_id: scope.channel_id,
+                    transaction_id: scope.transaction_id,
+                    key_package: pending.response_bytes.clone(),
+                },
+            ));
+        }
+        let key_package = match self.storage.as_ref() {
+            Some(storage) => MlsChannelGroup::key_package_with_storage(
+                &self.identity,
+                binding,
+                storage.try_clone()?,
+            )?,
+            None => MlsChannelGroup::key_package(&self.identity, binding)?,
+        };
+        let bytes = key_package.bytes().to_vec();
+        self.pending_channel_key_packages.insert(
+            scope,
+            PendingChannelKeyPackage {
+                peer,
+                key_package,
+                response_bytes: bytes.clone(),
+            },
+        );
+        Ok(RequestOutcome::respond(
+            SetupMessage::ChannelKeyPackageResponse {
+                conversation_id: scope.parent_conversation_id,
+                channel_id: scope.channel_id,
+                transaction_id: scope.transaction_id,
+                key_package: bytes,
+            },
+        ))
+    }
+
+    /// Join a bound channel group from a signed Welcome and acknowledge the
+    /// exact scope that produced the KeyPackage.
+    fn join_channel_from_welcome(
+        &mut self,
+        peer: PeerId,
+        frame: &SetupEnvelope,
+        scope: ChannelScope,
+        welcome: Vec<u8>,
+    ) -> Result<SetupMessage, ChatError> {
+        let binding = self.validate_channel_setup_scope(&peer, frame, &scope)?;
+        let pending = self
+            .pending_channel_key_packages
+            .remove(&scope)
+            .ok_or(ChatError::PendingKeyPackageMissing)?;
+        if pending.peer != peer {
+            return Err(ChatError::UnexpectedSender);
+        }
+        let ack = |accepted| SetupMessage::ChannelWelcomeAck {
+            conversation_id: scope.parent_conversation_id,
+            channel_id: scope.channel_id,
+            transaction_id: scope.transaction_id,
+            accepted,
+        };
+        let channel_welcome = ChannelWelcome::from_bytes(binding, welcome);
+        match MlsChannelGroup::join(
+            &self.identity,
+            binding,
+            pending.key_package,
+            &channel_welcome,
+        ) {
+            Ok(group) => {
+                self.channel_groups.insert(
+                    binding.group_id(),
+                    ChannelGroupState {
+                        binding,
+                        group,
+                        awaited: BTreeSet::new(),
+                        ready: true,
+                    },
+                );
+                self.persist_conversation(scope.parent_conversation_id)?;
+                Ok(ack(true))
+            }
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                Ok(ack(false))
+            }
+        }
+    }
+
+    /// Apply a signed channel commit in the derived group. Only the parent
+    /// administrator may drive channel membership transitions.
+    fn process_channel_commit_request(
+        &mut self,
+        peer: PeerId,
+        frame: &SetupEnvelope,
+        scope: ChannelScope,
+        operation: GroupOperation,
+        target: Option<PeerId>,
+        commit: Vec<u8>,
+    ) -> Result<RequestOutcome, ChatError> {
+        let binding = self.validate_channel_setup_scope(&peer, frame, &scope)?;
+        let admin = self
+            .conversations
+            .get(&scope.parent_conversation_id)
+            .ok_or(ChatError::UnknownConversation)?
+            .admin;
+        if peer != admin {
+            return Err(ChatError::NotAdmin);
+        }
+        let applied = {
+            let Some(state) = self.channel_groups.get_mut(&binding.group_id()) else {
+                return Err(ChatError::ChannelGroupNotReady);
+            };
+            let mls_key = frame.sender_mls_public_key()?;
+            state
+                .group
+                .process_commit(&commit, &peer, &mls_key, operation, target)
+        };
+        let ack = SetupMessage::ChannelCommitAck {
+            conversation_id: scope.parent_conversation_id,
+            channel_id: scope.channel_id,
+            transaction_id: scope.transaction_id,
+            operation,
+            accepted: applied.is_ok(),
+        };
+        match applied {
+            Ok(outcome) => {
+                if outcome.self_removed {
+                    self.drop_channel_group(scope.parent_conversation_id, scope.channel_id)?;
+                }
+                self.persist_conversation(scope.parent_conversation_id)?;
+                Ok(RequestOutcome::respond(ack))
+            }
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                Ok(RequestOutcome::respond_and_reject(
+                    ack,
+                    ChatError::GroupOperationRejected,
+                ))
+            }
+        }
+    }
+
+    /// Create or recreate the derived MLS group and start the first allowed
+    /// peer's setup. Called only after the parent-group policy is acknowledged.
+    fn start_channel_setup_for_channel(
+        &mut self,
+        conversation_id: [u8; 16],
+        channel_id: [u8; 16],
+        recreate: bool,
+    ) -> Result<(), ChatError> {
+        let binding = ChannelGroupBinding::new(conversation_id, channel_id);
+        if recreate {
+            self.drop_channel_group(conversation_id, channel_id)?;
+        }
+        if !self.channel_groups.contains_key(&binding.group_id()) {
+            let group = match self.storage.as_ref() {
+                Some(storage) => MlsChannelGroup::create_with_storage(
+                    &self.identity,
+                    binding,
+                    storage.try_clone()?,
+                )?,
+                None => MlsChannelGroup::create(&self.identity, binding)?,
+            };
+            self.channel_groups.insert(
+                binding.group_id(),
+                ChannelGroupState {
+                    binding,
+                    group,
+                    awaited: BTreeSet::new(),
+                    ready: false,
+                },
+            );
+        }
+        self.advance_channel_setup(conversation_id, channel_id)
+    }
+
+    /// Start the next not-yet-added allowed peer, or mark the channel group
+    /// ready when every allowed peer has converged on the same epoch.
+    fn advance_channel_setup(
+        &mut self,
+        conversation_id: [u8; 16],
+        channel_id: [u8; 16],
+    ) -> Result<(), ChatError> {
+        let binding = ChannelGroupBinding::new(conversation_id, channel_id);
+        if self
+            .pending_channel_setups
+            .values()
+            .any(|setup| setup.channel_id == channel_id)
+        {
+            return Ok(());
+        }
+        let (allowed, group_members) = {
+            let state = self
+                .conversations
+                .get(&conversation_id)
+                .ok_or(ChatError::UnknownConversation)?;
+            let channel = state
+                .channels
+                .get(&channel_id)
+                .ok_or(ChatError::ChannelNotFound)?;
+            let members = self
+                .channel_groups
+                .get(&binding.group_id())
+                .ok_or(ChatError::ChannelGroupNotReady)?
+                .group
+                .members()?;
+            (
+                channel.members.clone(),
+                members.into_iter().collect::<BTreeSet<_>>(),
+            )
+        };
+        let local = self.identity.peer_id();
+        let Some(peer) = allowed
+            .iter()
+            .copied()
+            .find(|peer| *peer != local && !group_members.contains(peer))
+        else {
+            if let Some(state) = self.channel_groups.get_mut(&binding.group_id()) {
+                state.ready = true;
+                state.awaited.clear();
+            }
+            return Ok(());
+        };
+        if !self.is_connected(&peer) {
+            self.last_error =
+                Some("channel setup is pending until every member reconnects".to_owned());
+            return Ok(());
+        }
+        let transaction_id = random_id()?;
+        let scope = ChannelScope {
+            parent_conversation_id: conversation_id,
+            channel_id,
+            transaction_id,
+        };
+        self.send_setup(
+            &peer,
+            SetupMessage::ChannelKeyPackageRequest {
+                conversation_id,
+                channel_id,
+                transaction_id,
+            },
+            conversation_id,
+            transaction_id,
+        )?;
+        self.pending_channel_setups.insert(
+            scope,
+            PendingChannelMemberSetup {
+                channel_id,
+                peer,
+                scope,
+                stage: ChannelMemberSetupStage::KeyPackageRequested,
+                welcome: Vec::new(),
+                commit: Vec::new(),
+                welcome_acked: false,
+                commit_acks: BTreeSet::new(),
+                required_commit_acks: BTreeSet::new(),
+            },
+        );
+        if let Some(state) = self.channel_groups.get_mut(&binding.group_id()) {
+            state.ready = false;
+            state.awaited.insert(peer);
+        }
+        Ok(())
+    }
+
+    /// Complete one peer's setup and advance to the next allowed peer. A
+    /// rejected acknowledgement fails the whole channel group closed.
+    fn finish_channel_member_setup(
+        &mut self,
+        scope: ChannelScope,
+        accepted: bool,
+    ) -> Result<(), ChatError> {
+        let pending = self
+            .pending_channel_setups
+            .remove(&scope)
+            .ok_or(ChatError::InvalidSetup("no channel setup is pending"))?;
+        if !accepted {
+            self.drop_channel_group(scope.parent_conversation_id, scope.channel_id)?;
+            self.last_error = Some("channel setup was rejected by a member".to_owned());
+            return Ok(());
+        }
+        let group_id = channel_group_id(scope.parent_conversation_id, scope.channel_id);
+        if let Some(state) = self.channel_groups.get_mut(&group_id) {
+            state.awaited.remove(&pending.peer);
+        }
+        self.advance_channel_setup(scope.parent_conversation_id, scope.channel_id)?;
+        // Persist only when setup actually converged. `advance_channel_setup`
+        // leaves `ready=false` while another peer or commit ack is missing, so
+        // an incomplete group still has no authenticated application record.
+        let ready = self
+            .channel_groups
+            .get(&group_id)
+            .is_some_and(|state| state.ready);
+        if ready {
+            self.persist_conversation(scope.parent_conversation_id)?;
+        }
+        Ok(())
+    }
+
+    /// Add one allowed peer to the derived group after its signed KeyPackage
+    /// response. Existing members receive the matching channel commit; the new
+    /// member receives the Welcome. No channel text is sent until both acks.
+    #[allow(clippy::too_many_arguments)]
+    fn process_channel_key_package_response(
+        &mut self,
+        peer: PeerId,
+        frame: &SetupEnvelope,
+        scope: ChannelScope,
+        public_key: Vec<u8>,
+        key_package: Vec<u8>,
+        outgoing: Option<OutgoingSetup>,
+    ) -> Result<(), ChatError> {
+        let outgoing = outgoing.ok_or(ChatError::InvalidSetup("untracked setup response"))?;
+        if outgoing.kind != OutgoingSetupKind::ChannelKeyPackageRequest
+            || outgoing.conversation_id != scope.parent_conversation_id
+            || outgoing.transaction_id != scope.transaction_id
+            || outgoing.scope != Some(scope)
+        {
+            return Err(ChatError::InvalidSetup(
+                "unexpected channel KeyPackage response transaction",
+            ));
+        }
+        let binding = self.validate_channel_setup_scope(&peer, frame, &scope)?;
+        {
+            let pending = self
+                .pending_channel_setups
+                .get_mut(&scope)
+                .ok_or(ChatError::InvalidSetup("no channel setup is pending"))?;
+            if pending.peer != peer || pending.stage != ChannelMemberSetupStage::KeyPackageRequested
+            {
+                return Err(ChatError::InvalidSetup(
+                    "channel KeyPackage response does not match pending member",
+                ));
+            }
+        }
+        let required_commit_acks = {
+            let state = self
+                .conversations
+                .get(&scope.parent_conversation_id)
+                .ok_or(ChatError::UnknownConversation)?;
+            let allowed = &state
+                .channels
+                .get(&scope.channel_id)
+                .ok_or(ChatError::ChannelNotFound)?
+                .members;
+            let group_members = self
+                .channel_groups
+                .get(&binding.group_id())
+                .ok_or(ChatError::ChannelGroupNotReady)?
+                .group
+                .members()?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            allowed
+                .iter()
+                .copied()
+                .filter(|member| {
+                    *member != self.identity.peer_id()
+                        && *member != peer
+                        && group_members.contains(member)
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        let (welcome, commit) = {
+            let state = self
+                .channel_groups
+                .get_mut(&binding.group_id())
+                .ok_or(ChatError::ChannelGroupNotReady)?;
+            let key_package = ChannelKeyPackage::from_public_bytes(binding, key_package);
+            state
+                .group
+                .add_member_parts(&key_package, peer, &public_key)?
+        };
+        let welcome_bytes = welcome.bytes().to_vec();
+        self.send_setup(
+            &peer,
+            SetupMessage::ChannelWelcome {
+                conversation_id: scope.parent_conversation_id,
+                channel_id: scope.channel_id,
+                transaction_id: scope.transaction_id,
+                welcome: welcome_bytes.clone(),
+            },
+            scope.parent_conversation_id,
+            scope.transaction_id,
+        )?;
+        for member in required_commit_acks.iter().copied() {
+            if !self.is_connected(&member) {
+                self.last_error =
+                    Some("channel commit is pending until every member reconnects".to_owned());
+                continue;
+            }
+            let request = GroupRequest {
+                conversation_id: scope.parent_conversation_id,
+                channel_scope: Some(scope),
+                transaction_id: scope.transaction_id,
+                peer: member,
+                operation: GroupOperation::Add,
+                kind: GroupRequestKind::Commit,
+            };
+            if let Err(error) = self.send_group_request(
+                &member,
+                SetupMessage::ChannelCommit {
+                    conversation_id: scope.parent_conversation_id,
+                    channel_id: scope.channel_id,
+                    transaction_id: scope.transaction_id,
+                    operation: GroupOperation::Add,
+                    target: Some(peer),
+                    commit: commit.clone(),
+                },
+                request,
+            ) {
+                self.last_error = Some(error.to_string());
+            }
+        }
+        let pending = self
+            .pending_channel_setups
+            .get_mut(&scope)
+            .ok_or(ChatError::InvalidSetup("no channel setup is pending"))?;
+        pending.stage = ChannelMemberSetupStage::WelcomeSent;
+        pending.welcome = welcome_bytes;
+        pending.commit = commit;
+        pending.required_commit_acks = required_commit_acks.clone();
+        if let Some(state) = self.channel_groups.get_mut(&binding.group_id()) {
+            for member in required_commit_acks {
+                state.awaited.insert(member);
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark a bound Welcome acknowledgement and advance when every required
+    /// commit acknowledgement has also arrived.
+    fn process_channel_welcome_ack(
+        &mut self,
+        peer: PeerId,
+        frame: &SetupEnvelope,
+        scope: ChannelScope,
+        accepted: bool,
+        outgoing: Option<OutgoingSetup>,
+    ) -> Result<(), ChatError> {
+        let outgoing = outgoing.ok_or(ChatError::InvalidSetup("untracked setup response"))?;
+        if outgoing.kind != OutgoingSetupKind::ChannelWelcome
+            || outgoing.conversation_id != scope.parent_conversation_id
+            || outgoing.transaction_id != scope.transaction_id
+            || outgoing.scope != Some(scope)
+        {
+            return Err(ChatError::InvalidSetup(
+                "unexpected channel Welcome acknowledgement",
+            ));
+        }
+        self.validate_channel_setup_scope(&peer, frame, &scope)?;
+        if !accepted {
+            return self.finish_channel_member_setup(scope, false);
+        }
+        let complete = {
+            let pending = self
+                .pending_channel_setups
+                .get_mut(&scope)
+                .ok_or(ChatError::InvalidSetup("no channel setup is pending"))?;
+            if pending.peer != peer || pending.stage != ChannelMemberSetupStage::WelcomeSent {
+                return Err(ChatError::InvalidSetup(
+                    "channel Welcome acknowledgement does not match pending member",
+                ));
+            }
+            pending.welcome_acked = true;
+            pending.commit_acks == pending.required_commit_acks
+        };
+        if complete {
+            self.finish_channel_member_setup(scope, true)?;
+        }
+        Ok(())
+    }
+
+    /// Handle a channel commit acknowledgement routed through the existing
+    /// group-request correlation map.
+    fn handle_channel_group_ack(
+        &mut self,
+        peer: PeerId,
+        frame: &SetupEnvelope,
+        request: GroupRequest,
+    ) -> Result<(), ChatError> {
+        let (conversation_id, channel_id, transaction_id, operation, accepted) =
+            match &frame.message {
+                SetupMessage::ChannelCommitAck {
+                    conversation_id,
+                    channel_id,
+                    transaction_id,
+                    operation,
+                    accepted,
+                } => (
+                    *conversation_id,
+                    *channel_id,
+                    *transaction_id,
+                    *operation,
+                    *accepted,
+                ),
+                _ => {
+                    return Err(ChatError::InvalidSetup(
+                        "unexpected channel acknowledgement",
+                    ));
+                }
+            };
+        if peer != request.peer {
+            return Err(ChatError::UnexpectedSender);
+        }
+        let scope = ChannelScope {
+            parent_conversation_id: conversation_id,
+            channel_id,
+            transaction_id,
+        };
+        if request.channel_scope != Some(scope)
+            || request.transaction_id != transaction_id
+            || request.operation != operation
+        {
+            return Err(ChatError::InvalidSetup(
+                "channel acknowledgement does not match its request",
+            ));
+        }
+        self.validate_channel_setup_scope(&peer, frame, &scope)?;
+        if !accepted {
+            return self.finish_channel_member_setup(scope, false);
+        }
+        let complete = {
+            let pending = self
+                .pending_channel_setups
+                .get_mut(&scope)
+                .ok_or(ChatError::InvalidSetup("no channel setup is pending"))?;
+            if !pending.required_commit_acks.contains(&peer) || !pending.commit_acks.insert(peer) {
+                return Err(ChatError::UnexpectedSender);
+            }
+            pending.welcome_acked && pending.commit_acks == pending.required_commit_acks
+        };
+        if complete {
+            self.finish_channel_member_setup(scope, true)?;
+        }
+        Ok(())
+    }
+
     fn process_setup_response(
         &mut self,
         peer: PeerId,
         frame: SetupEnvelope,
         outgoing: Option<OutgoingSetup>,
     ) -> Result<(), ChatError> {
-        let public_key = frame.sender_public_key;
+        let public_key = frame.sender_mls_public_key()?.to_vec();
+        let channel_scope = frame.message.channel_scope();
+        if let Some(scope) = channel_scope {
+            match &frame.message {
+                SetupMessage::ChannelKeyPackageResponse { key_package, .. } => {
+                    return self.process_channel_key_package_response(
+                        peer,
+                        &frame,
+                        scope,
+                        public_key,
+                        key_package.clone(),
+                        outgoing,
+                    );
+                }
+                SetupMessage::ChannelWelcomeAck { accepted, .. } => {
+                    return self
+                        .process_channel_welcome_ack(peer, &frame, scope, *accepted, outgoing);
+                }
+                _ => {}
+            }
+        }
         match frame.message {
             SetupMessage::KeyPackageResponse {
                 conversation_id,
@@ -4214,19 +5831,28 @@ impl MessengerController {
             return Ok(());
         };
         let mut persist_conversation = None;
-        if let Some(conversation_id) = self.message_conversations.get(&message_id).copied()
-            && let Some(state) = self.conversations.get_mut(&conversation_id)
-        {
+        if let Some(conversation_id) = self.message_conversations.get(&message_id).copied() {
+            let channel_id = self.message_channel_routes.get(&message_id).copied();
             match delivery {
                 DeliveryState::SentToPeer => {
-                    if state.conversation.delivery_state(&message_id)
+                    if self.message_group_delivery_state(conversation_id, channel_id, &message_id)
                         != Some(DeliveryState::SentToPeer)
                     {
-                        state.conversation.mark_sent_to_peer(&message_id)?;
+                        self.mark_message_group(
+                            conversation_id,
+                            channel_id,
+                            message_id,
+                            DeliveryState::SentToPeer,
+                        )?;
                     }
                     persist_conversation = Some(conversation_id);
                 }
-                DeliveryState::Failed => state.conversation.mark_failed(&message_id)?,
+                DeliveryState::Failed => self.mark_message_group(
+                    conversation_id,
+                    channel_id,
+                    message_id,
+                    DeliveryState::Failed,
+                )?,
                 _ => return Err(ChatError::InvalidSetup("invalid outgoing transition")),
             }
         }
@@ -4259,10 +5885,13 @@ impl MessengerController {
         display_text: Option<String>,
     ) -> Result<[u8; 16], ChatError> {
         let body = frame.to_bytes()?;
-        let (message_id, envelope_bytes) = {
+        let derived =
+            channel_id != DEFAULT_CHANNEL_ID && matches!(frame.kind, ChannelFrameKind::Text { .. });
+        let channel_route = derived.then_some(channel_id);
+        {
             let state = self
                 .conversations
-                .get_mut(&conversation_id)
+                .get(&conversation_id)
                 .ok_or(ChatError::UnknownConversation)?;
             if state.status != ConversationStatus::Joined {
                 return Err(ChatError::ConversationNotReady);
@@ -4270,6 +5899,34 @@ impl MessengerController {
             if state.pending_operation.is_some() {
                 return Err(ChatError::GroupOperationPending);
             }
+        }
+        // Only ciphertext is queued, and the queue must stay bounded even for
+        // a hostile peer that never reconnects. Check before composing so a
+        // rejected send cannot leave a half-tracked message behind.
+        let would_queue = recipients
+            .iter()
+            .filter(|peer| !self.is_connected(peer))
+            .count();
+        if self.offline_queue.len().saturating_add(would_queue) > MAX_OFFLINE_QUEUE {
+            return Err(ChatError::OfflineQueueFull);
+        }
+        let (message_id, envelope_bytes) = if derived {
+            let state = self
+                .channel_groups
+                .get_mut(&channel_group_id(conversation_id, channel_id))
+                .ok_or(ChatError::ChannelGroupNotReady)?;
+            if !state.ready {
+                return Err(ChatError::ChannelGroupNotReady);
+            }
+            let envelope = state
+                .group
+                .compose(&self.identity, MessageKind::Channel, &body)?;
+            (envelope.message_id, envelope.to_bytes()?)
+        } else {
+            let state = self
+                .conversations
+                .get_mut(&conversation_id)
+                .ok_or(ChatError::UnknownConversation)?;
             let envelope =
                 state
                     .conversation
@@ -4281,11 +5938,12 @@ impl MessengerController {
             .iter()
             .any(|recipient| !self.is_connected(recipient));
         if has_offline {
-            let state = self
-                .conversations
-                .get_mut(&conversation_id)
-                .ok_or(ChatError::UnknownConversation)?;
-            state.conversation.mark_queued(&message_id)?;
+            self.mark_message_group(
+                conversation_id,
+                channel_route,
+                message_id,
+                DeliveryState::Queued,
+            )?;
         }
 
         let mut sent_error = None;
@@ -4304,18 +5962,25 @@ impl MessengerController {
                 self.offline_queue.push_back(QueuedMessage {
                     peer: *recipient,
                     conversation_id,
+                    channel_id: channel_route.unwrap_or(DEFAULT_CHANNEL_ID),
                     message_id,
                     envelope_bytes: envelope_bytes.clone(),
                 });
             }
         }
         if let Some(error) = sent_error {
-            if let Some(state) = self.conversations.get_mut(&conversation_id) {
-                let _ = state.conversation.mark_failed(&message_id);
-            }
+            let _ = self.mark_message_group(
+                conversation_id,
+                channel_route,
+                message_id,
+                DeliveryState::Failed,
+            );
             return Err(error);
         }
 
+        if derived {
+            self.message_channel_routes.insert(message_id, channel_id);
+        }
         self.message_conversations
             .insert(message_id, conversation_id);
         self.pending_receipts
@@ -4345,50 +6010,165 @@ impl MessengerController {
         bytes: &[u8],
     ) -> Result<(), ChatError> {
         let peer = identity_peer(swarm_peer)?;
+        let receipt_bytes = self.receive_message(peer, bytes)?;
+        if let Some(receipt_bytes) = receipt_bytes {
+            self.network
+                .respond_to_message(response_id, receipt_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Verify, decrypt, and apply one inbound application envelope. The
+    /// returned receipt bytes belong to the same MLS group as the ciphertext;
+    /// the transport wrapper sends them after this function has finished.
+    fn receive_message(
+        &mut self,
+        peer: PeerId,
+        bytes: &[u8],
+    ) -> Result<Option<Vec<u8>>, ChatError> {
         let envelope = Envelope::from_bytes(bytes)?;
-        let conversation_id = envelope.conversation_id;
         let kind = envelope.kind;
 
-        let (message_id, plaintext, receipt_bytes, channel_text, apply_error) = {
-            let state = self
-                .conversations
-                .get_mut(&conversation_id)
-                .ok_or(ChatError::UnknownConversation)?;
-            if !state.members.contains(&peer) {
-                return Err(ChatError::NotGroupMember);
-            }
-            let received = state.conversation.receive(envelope)?;
-            let message_id = received.metadata.message_id;
-            let plaintext = received.plaintext.to_vec();
-            if received.metadata.kind == MessageKind::Receipt {
-                (message_id, plaintext, None, None, None)
+        let group_id = envelope.conversation_id;
+        let (parent_conversation_id, derived_channel) =
+            if self.conversations.contains_key(&group_id) {
+                let state = self
+                    .conversations
+                    .get(&group_id)
+                    .ok_or(ChatError::UnknownConversation)?;
+                if !state.members.contains(&peer) {
+                    return Err(ChatError::NotGroupMember);
+                }
+                (group_id, None)
+            } else if let Some(state) = self.channel_groups.get(&group_id) {
+                let parent = state.binding.parent_conversation_id();
+                let channel = state.binding.channel_id();
+                let parent_state = self
+                    .conversations
+                    .get(&parent)
+                    .ok_or(ChatError::UnknownConversation)?;
+                if !parent_state.members.contains(&peer) {
+                    return Err(ChatError::NotGroupMember);
+                }
+                if !parent_state
+                    .channels
+                    .get(&channel)
+                    .is_some_and(|channel_state| channel_state.members.contains(&peer))
+                {
+                    return Err(ChatError::NotChannelMember);
+                }
+                (parent, Some(channel))
             } else {
+                return Err(ChatError::UnknownConversation);
+            };
+
+        let (message_id, plaintext, receipt_bytes, channel_text, apply_error) = {
+            if let Some(channel_id) = derived_channel {
+                if kind != MessageKind::Channel {
+                    return Err(ChatError::InvalidChannelFrame(
+                        "derived channel group accepted a non-channel frame",
+                    ));
+                }
+                let received = self
+                    .channel_groups
+                    .get_mut(&group_id)
+                    .ok_or(ChatError::ChannelGroupNotReady)?
+                    .group
+                    .receive(envelope)?;
+                let message_id = received.metadata.message_id;
+                let plaintext = received.plaintext.to_vec();
                 let mut channel_text = None;
                 let mut apply_error = None;
-                if received.metadata.kind == MessageKind::Channel {
-                    match ChannelFrame::from_bytes(&plaintext) {
-                        Ok(frame) => match state.apply_channel_frame(peer, frame) {
-                            Ok(text) => channel_text = text,
-                            Err(error) => apply_error = Some(error.to_string()),
-                        },
-                        Err(error) => apply_error = Some(error.to_string()),
+                match ChannelFrame::from_bytes(&plaintext) {
+                    Ok(frame) => {
+                        if frame.channel_id != channel_id {
+                            apply_error = Some(
+                                "channel frame ID does not match the derived MLS group".to_owned(),
+                            );
+                        } else if !matches!(frame.kind, ChannelFrameKind::Text { .. }) {
+                            apply_error =
+                                Some("derived channel group accepted a policy frame".to_owned());
+                        } else {
+                            let applied = self
+                                .conversations
+                                .get_mut(&parent_conversation_id)
+                                .ok_or(ChatError::UnknownConversation)?
+                                .apply_channel_frame(peer, frame);
+                            match applied {
+                                Ok(text) => channel_text = text,
+                                Err(error) => apply_error = Some(error.to_string()),
+                            }
+                        }
                     }
+                    Err(error) => apply_error = Some(error.to_string()),
                 }
-                if apply_error.is_some() {
-                    (message_id, plaintext, None, None, apply_error)
+                let receipt_bytes = if apply_error.is_some() {
+                    None
                 } else {
-                    let receipt = state.conversation.receipt(
-                        &self.identity,
-                        ReceiptStatus::Delivered,
-                        message_id,
-                    )?;
-                    (
-                        message_id,
-                        plaintext,
-                        Some(receipt.to_bytes()?),
-                        channel_text,
-                        None,
-                    )
+                    let receipt = self
+                        .channel_groups
+                        .get_mut(&group_id)
+                        .ok_or(ChatError::ChannelGroupNotReady)?
+                        .group
+                        .receipt(&self.identity, ReceiptStatus::Delivered, message_id)?;
+                    Some(receipt.to_bytes()?)
+                };
+                (
+                    message_id,
+                    plaintext,
+                    receipt_bytes,
+                    channel_text,
+                    apply_error,
+                )
+            } else {
+                let state = self
+                    .conversations
+                    .get_mut(&parent_conversation_id)
+                    .ok_or(ChatError::UnknownConversation)?;
+                let received = state.conversation.receive(envelope)?;
+                let message_id = received.metadata.message_id;
+                let plaintext = received.plaintext.to_vec();
+                if received.metadata.kind == MessageKind::Receipt {
+                    (message_id, plaintext, None, None, None)
+                } else {
+                    let mut channel_text = None;
+                    let mut apply_error = None;
+                    if received.metadata.kind == MessageKind::Channel {
+                        match ChannelFrame::from_bytes(&plaintext) {
+                            Ok(frame) => {
+                                if matches!(frame.kind, ChannelFrameKind::Text { .. })
+                                    && frame.channel_id != DEFAULT_CHANNEL_ID
+                                {
+                                    apply_error = Some(
+                                        "non-default channel text must use a derived MLS group"
+                                            .to_owned(),
+                                    );
+                                } else {
+                                    match state.apply_channel_frame(peer, frame) {
+                                        Ok(text) => channel_text = text,
+                                        Err(error) => apply_error = Some(error.to_string()),
+                                    }
+                                }
+                            }
+                            Err(error) => apply_error = Some(error.to_string()),
+                        }
+                    }
+                    if apply_error.is_some() {
+                        (message_id, plaintext, None, None, apply_error)
+                    } else {
+                        let receipt = state.conversation.receipt(
+                            &self.identity,
+                            ReceiptStatus::Delivered,
+                            message_id,
+                        )?;
+                        (
+                            message_id,
+                            plaintext,
+                            Some(receipt.to_bytes()?),
+                            channel_text,
+                            None,
+                        )
+                    }
                 }
             }
         };
@@ -4397,19 +6177,14 @@ impl MessengerController {
             // An unauthorised or malformed channel frame gets no delivery
             // receipt: that would falsely acknowledge a policy change.
             self.last_error = Some(reason);
-            return Ok(());
-        }
-
-        if let Some(receipt_bytes) = receipt_bytes {
-            self.network
-                .respond_to_message(response_id, receipt_bytes)?;
+            return Ok(None);
         }
 
         if kind == MessageKind::Text {
             match String::from_utf8(plaintext) {
                 Ok(text) => {
                     self.message_conversations
-                        .insert(message_id, conversation_id);
+                        .insert(message_id, parent_conversation_id);
                     self.messages.push(ChatMessage {
                         message_id,
                         channel_id: DEFAULT_CHANNEL_ID,
@@ -4425,7 +6200,7 @@ impl MessengerController {
             }
         } else if let Some((channel_id, text)) = channel_text {
             self.message_conversations
-                .insert(message_id, conversation_id);
+                .insert(message_id, parent_conversation_id);
             self.messages.push(ChatMessage {
                 message_id,
                 channel_id,
@@ -4436,9 +6211,9 @@ impl MessengerController {
             });
         }
         if kind == MessageKind::Channel {
-            self.persist_conversation(conversation_id)?;
+            self.persist_conversation(parent_conversation_id)?;
         }
-        Ok(())
+        Ok(receipt_bytes)
     }
 
     fn handle_message_response(
@@ -4447,23 +6222,61 @@ impl MessengerController {
         swarm_peer: SwarmPeerId,
         bytes: &[u8],
     ) -> Result<(), ChatError> {
-        let Some(_local_message_id) = self.outstanding_messages.remove(&request_id) else {
+        let Some(local_message_id) = self.outstanding_messages.remove(&request_id) else {
             return Ok(());
         };
         let peer = identity_peer(swarm_peer)?;
         let envelope = Envelope::from_bytes(bytes)?;
-        let conversation_id = envelope.conversation_id;
-        let received = {
+        let parent_conversation_id = *self
+            .message_conversations
+            .get(&local_message_id)
+            .ok_or(ChatError::UnknownConversation)?;
+        let channel_id = self.message_channel_routes.get(&local_message_id).copied();
+        let expected_group_id = match channel_id {
+            Some(channel_id) => channel_group_id(parent_conversation_id, channel_id),
+            None => parent_conversation_id,
+        };
+        if envelope.conversation_id != expected_group_id {
+            return Err(ChatError::InvalidChannelFrame(
+                "receipt MLS group does not match the composed message",
+            ));
+        }
+        let received = if let Some(channel_id) = channel_id {
+            let parent_state = self
+                .conversations
+                .get(&parent_conversation_id)
+                .ok_or(ChatError::UnknownConversation)?;
+            if !parent_state.members.contains(&peer) {
+                return Err(ChatError::NotGroupMember);
+            }
+            if !parent_state
+                .channels
+                .get(&channel_id)
+                .is_some_and(|state| state.members.contains(&peer))
+            {
+                return Err(ChatError::NotChannelMember);
+            }
+            let Some(state) = self.channel_groups.get_mut(&expected_group_id) else {
+                return Ok(());
+            };
+            state.group.receive(envelope)?
+        } else {
             let state = self
                 .conversations
-                .get_mut(&conversation_id)
+                .get_mut(&parent_conversation_id)
                 .ok_or(ChatError::UnknownConversation)?;
             if !state.members.contains(&peer) {
                 return Err(ChatError::NotGroupMember);
             }
             state.conversation.receive(envelope)?
         };
+        let mut setup_trigger = None;
         if let Some(receipt) = received.metadata.receipt {
+            if receipt.message_id != local_message_id {
+                return Err(ChatError::InvalidChannelFrame(
+                    "receipt message ID does not match the request",
+                ));
+            }
             let complete = match self.pending_receipts.get_mut(&receipt.message_id) {
                 Some(expected) => {
                     expected.remove(&peer);
@@ -4475,6 +6288,9 @@ impl MessengerController {
                 }
                 None => true,
             };
+            if complete {
+                setup_trigger = self.pending_channel_policy_acks.remove(&receipt.message_id);
+            }
             self.set_line_delivery(
                 receipt.message_id,
                 if complete {
@@ -4484,7 +6300,14 @@ impl MessengerController {
                 },
             );
         }
-        self.persist_conversation(conversation_id)?;
+        if let Some(trigger) = setup_trigger {
+            self.start_channel_setup_for_channel(
+                trigger.conversation_id,
+                trigger.channel_id,
+                trigger.recreate,
+            )?;
+        }
+        self.persist_conversation(parent_conversation_id)?;
         Ok(())
     }
 }
@@ -4551,7 +6374,15 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use p2p_groups::GroupError;
+    use p2p_identity::IdentityRole;
     use p2p_storage::Vault;
+
+    fn mls_public_key(identity: &Identity) -> Vec<u8> {
+        identity
+            .role_public_bytes(IdentityRole::Mls)
+            .expect("certified MLS role key")
+            .to_vec()
+    }
 
     #[test]
     fn default_controller_privacy_status_is_all_off_and_unobserved() {
@@ -4586,8 +6417,355 @@ mod tests {
         (identity, controller)
     }
 
+    #[test]
+    fn offline_queue_rejects_a_full_queue_before_composing_ciphertext() {
+        let (local, mut controller) = test_controller();
+        let peer = Identity::generate().expect("peer");
+        let conversation = MlsConversation::new(&local).expect("joined group");
+        let conversation_id = conversation.id();
+        let members = BTreeSet::from([local.peer_id(), peer.peer_id()]);
+        let state = ConversationState::new(conversation, local.peer_id(), members);
+        controller.conversations.insert(conversation_id, state);
+        controller
+            .peer_conversations
+            .insert(peer.peer_id(), conversation_id);
+        controller.active = Some(conversation_id);
+        controller
+            .active_channel
+            .insert(conversation_id, DEFAULT_CHANNEL_ID);
+        for index in 0..MAX_OFFLINE_QUEUE {
+            controller.offline_queue.push_back(QueuedMessage {
+                peer: peer.peer_id(),
+                conversation_id,
+                channel_id: DEFAULT_CHANNEL_ID,
+                message_id: [index as u8; 16],
+                envelope_bytes: vec![0u8; 4],
+            });
+        }
+
+        let before = controller.offline_queue.len();
+        let error = controller
+            .send_text(peer.peer_id(), "must not be queued")
+            .expect_err("a full offline queue must fail closed");
+        assert!(matches!(error, ChatError::OfflineQueueFull));
+        assert_eq!(controller.offline_queue.len(), before);
+        assert!(controller.messages.is_empty());
+    }
+
     fn signed(identity: &Identity, message: SetupMessage) -> SetupEnvelope {
         SetupEnvelope::new(identity, message).expect("signed setup frame")
+    }
+
+    fn controller_with_restricted_channel(
+        allowed: PeerId,
+        excluded: PeerId,
+    ) -> (
+        Identity,
+        MessengerController,
+        [u8; 16],
+        [u8; 16],
+        ChannelScope,
+    ) {
+        let local = Identity::generate().expect("local identity");
+        let conversation = MlsConversation::new(&local).expect("joined parent MLS group");
+        let parent = conversation.id();
+        let channel = [0x51u8; 16];
+        let transaction_id = [0x52u8; 16];
+        let mut members = BTreeSet::new();
+        members.insert(local.peer_id());
+        members.insert(allowed);
+        members.insert(excluded);
+        let mut state = ConversationState::new(conversation, local.peer_id(), members);
+        let allowed_members = [local.peer_id(), allowed].into_iter().collect();
+        state.channels.insert(
+            channel,
+            ChannelState {
+                name: "private".to_owned(),
+                creator: local.peer_id(),
+                members: allowed_members,
+                revision: 1,
+                last_frame_id: None,
+            },
+        );
+        let (_, mut controller) = test_controller();
+        controller.conversations.insert(parent, state);
+        (
+            local,
+            controller,
+            parent,
+            channel,
+            ChannelScope {
+                parent_conversation_id: parent,
+                channel_id: channel,
+                transaction_id,
+            },
+        )
+    }
+
+    #[test]
+    fn channel_setup_scope_binds_parent_channel_transaction_and_peer() {
+        let allowed = Identity::generate().expect("allowed peer");
+        let excluded = Identity::generate().expect("excluded peer");
+        let (_local, controller, parent, channel, scope) =
+            controller_with_restricted_channel(allowed.peer_id(), excluded.peer_id());
+        let frame = signed(
+            &allowed,
+            SetupMessage::ChannelKeyPackageRequest {
+                conversation_id: parent,
+                channel_id: channel,
+                transaction_id: scope.transaction_id,
+            },
+        );
+
+        let binding = controller
+            .validate_channel_setup_scope(&allowed.peer_id(), &frame, &scope)
+            .expect("allowed member has a valid channel scope");
+        assert_eq!(binding.parent_conversation_id(), parent);
+        assert_eq!(binding.channel_id(), channel);
+        assert_eq!(
+            binding.group_id(),
+            p2p_groups::channel_group_id(parent, channel)
+        );
+
+        let wrong_parent = ChannelScope {
+            parent_conversation_id: [0x61u8; 16],
+            ..scope
+        };
+        let wrong_channel = ChannelScope {
+            channel_id: [0x62u8; 16],
+            ..scope
+        };
+        let wrong_transaction = ChannelScope {
+            transaction_id: [0x63u8; 16],
+            ..scope
+        };
+        for wrong in [wrong_parent, wrong_channel, wrong_transaction] {
+            assert!(matches!(
+                controller.validate_channel_setup_scope(&allowed.peer_id(), &frame, &wrong),
+                Err(ChatError::InvalidSetup(_))
+            ));
+        }
+        assert!(matches!(
+            controller.validate_channel_setup_scope(&excluded.peer_id(), &frame, &scope),
+            Err(ChatError::UnexpectedSender)
+        ));
+    }
+
+    #[test]
+    fn excluded_parent_member_cannot_validate_a_channel_setup_scope() {
+        let allowed = Identity::generate().expect("allowed peer");
+        let excluded = Identity::generate().expect("excluded parent member");
+        let (_local, controller, parent, channel, scope) =
+            controller_with_restricted_channel(allowed.peer_id(), excluded.peer_id());
+        let frame = signed(
+            &excluded,
+            SetupMessage::ChannelWelcome {
+                conversation_id: parent,
+                channel_id: channel,
+                transaction_id: scope.transaction_id,
+                welcome: vec![1, 2, 3],
+            },
+        );
+
+        let error = controller
+            .validate_channel_setup_scope(&excluded.peer_id(), &frame, &scope)
+            .expect_err("excluded parent member must not open channel setup");
+        assert!(matches!(error, ChatError::NotChannelMember));
+        let state = controller
+            .conversations
+            .get(&parent)
+            .expect("parent conversation remains");
+        assert!(
+            !state
+                .channels
+                .get(&channel)
+                .expect("restricted channel remains")
+                .members
+                .contains(&excluded.peer_id())
+        );
+    }
+
+    fn bound_channel_pair(
+        parent: [u8; 16],
+        channel: [u8; 16],
+    ) -> (
+        Identity,
+        Identity,
+        ChannelGroupBinding,
+        MlsChannelGroup,
+        MlsChannelGroup,
+    ) {
+        let admin = Identity::generate().expect("channel admin");
+        let allowed = Identity::generate().expect("allowed member");
+        let binding = ChannelGroupBinding::new(parent, channel);
+        let mut admin_group =
+            MlsChannelGroup::create(&admin, binding).expect("admin channel group");
+        let package = MlsChannelGroup::key_package(&allowed, binding).expect("allowed key package");
+        let (welcome, _commit) = admin_group
+            .add_member_parts(&package, allowed.peer_id(), &mls_public_key(&allowed))
+            .expect("admin adds allowed member");
+        let allowed_group =
+            MlsChannelGroup::join(&allowed, binding, package, &welcome).expect("allowed joins");
+        (admin, allowed, binding, admin_group, allowed_group)
+    }
+
+    fn channel_parent_state(
+        local: &Identity,
+        peer: PeerId,
+        channel: [u8; 16],
+        members: &[PeerId],
+    ) -> ConversationState {
+        let mut state = joined_state(local, peer, local.peer_id());
+        state.channels.insert(
+            channel,
+            ChannelState {
+                name: "private".to_owned(),
+                creator: local.peer_id(),
+                members: members.iter().copied().collect(),
+                revision: 1,
+                last_frame_id: None,
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn excluded_parent_member_cannot_decrypt_injected_channel_ciphertext() {
+        let parent = [0x71u8; 16];
+        let channel = [0x72u8; 16];
+        let secret = "excluded member must not decrypt this";
+        let (admin, allowed, binding, mut admin_group, _allowed_group) =
+            bound_channel_pair(parent, channel);
+        let frame = ChannelFrame::text(channel, 1, secret).expect("channel text frame");
+        let envelope = admin_group
+            .compose(
+                &admin,
+                MessageKind::Channel,
+                &frame.to_bytes().expect("frame bytes"),
+            )
+            .expect("compose channel ciphertext");
+        let ciphertext = envelope.to_bytes().expect("encode channel ciphertext");
+
+        let (excluded, mut controller) = test_controller();
+        let allowed_members = [admin.peer_id(), allowed.peer_id()];
+        let state = channel_parent_state(&excluded, admin.peer_id(), channel, &allowed_members);
+        controller.conversations.insert(parent, state);
+
+        let error = controller
+            .receive_message(admin.peer_id(), &ciphertext)
+            .expect_err("excluded member has no bound channel group");
+        assert!(matches!(error, ChatError::UnknownConversation));
+        assert!(controller.messages.is_empty());
+        assert_eq!(controller.last_error, None);
+        assert!(binding.group_id() != parent);
+    }
+
+    #[test]
+    fn allowed_member_decrypts_channel_ciphertext_and_receipt_uses_the_bound_group() {
+        let parent = [0x73u8; 16];
+        let channel = [0x74u8; 16];
+        let secret = "bound group decrypts this";
+        let (admin, allowed, binding, mut admin_group, allowed_group) =
+            bound_channel_pair(parent, channel);
+        let frame = ChannelFrame::text(channel, 1, secret).expect("channel text frame");
+        let envelope = admin_group
+            .compose(
+                &admin,
+                MessageKind::Channel,
+                &frame.to_bytes().expect("frame bytes"),
+            )
+            .expect("compose channel ciphertext");
+        let ciphertext = envelope.to_bytes().expect("encode channel ciphertext");
+
+        let mut controller =
+            MessengerController::start(&allowed, NetworkConfig::default()).expect("controller");
+        let allowed_members = [admin.peer_id(), allowed.peer_id()];
+        let state = channel_parent_state(&allowed, admin.peer_id(), channel, &allowed_members);
+        controller.conversations.insert(parent, state);
+        controller.channel_groups.insert(
+            binding.group_id(),
+            ChannelGroupState {
+                binding,
+                group: allowed_group,
+                awaited: BTreeSet::new(),
+                ready: true,
+            },
+        );
+
+        let receipt_bytes = controller
+            .receive_message(admin.peer_id(), &ciphertext)
+            .expect("bound member decrypts channel ciphertext")
+            .expect("delivery receipt");
+        let receipt = Envelope::from_bytes(&receipt_bytes).expect("decode receipt");
+        assert_eq!(receipt.conversation_id, binding.group_id());
+        assert_eq!(receipt.kind, MessageKind::Receipt);
+        let verified = admin_group
+            .receive(receipt)
+            .expect("receipt is in admin group");
+        assert_eq!(
+            verified.metadata.receipt.expect("receipt body").message_id,
+            envelope.message_id
+        );
+        assert_eq!(controller.messages.len(), 1);
+        assert_eq!(controller.messages[0].channel_id, channel);
+        assert_eq!(controller.messages[0].text, secret);
+    }
+
+    #[test]
+    fn non_default_channel_text_on_the_parent_group_is_rejected() {
+        let admin = Identity::generate().expect("admin");
+        let member = Identity::generate().expect("parent member");
+        let mut admin_parent = MlsConversation::new(&admin).expect("admin parent group");
+        let member_package =
+            MlsConversation::key_package(&member).expect("member parent key package");
+        let (welcome, _commit) = admin_parent
+            .add_member_parts(
+                member_package.bytes(),
+                member.peer_id(),
+                &mls_public_key(&member),
+            )
+            .expect("admin adds parent member");
+        let member_parent =
+            MlsConversation::join(&member, admin_parent.id(), member_package, &welcome)
+                .expect("member joins parent group");
+
+        let channel = [0x75u8; 16];
+        let secret = "parent group must not carry this";
+        let mut state = ConversationState::new(
+            member_parent,
+            admin.peer_id(),
+            BTreeSet::from([admin.peer_id(), member.peer_id()]),
+        );
+        state.channels.insert(
+            channel,
+            ChannelState {
+                name: "private".to_owned(),
+                creator: admin.peer_id(),
+                members: [admin.peer_id(), member.peer_id()].into_iter().collect(),
+                revision: 1,
+                last_frame_id: None,
+            },
+        );
+        let frame = ChannelFrame::text(channel, 1, secret).expect("channel text frame");
+        let envelope = admin_parent
+            .compose(
+                &admin,
+                MessageKind::Channel,
+                &frame.to_bytes().expect("frame bytes"),
+            )
+            .expect("compose parent-group frame");
+        let ciphertext = envelope.to_bytes().expect("encode parent-group frame");
+        let parent = envelope.conversation_id;
+        let mut controller =
+            MessengerController::start(&member, NetworkConfig::default()).expect("controller");
+        controller.conversations.insert(parent, state);
+
+        let receipt = controller
+            .receive_message(admin.peer_id(), &ciphertext)
+            .expect("invalid placement is rejected without a transport error");
+        assert!(receipt.is_none());
+        assert!(controller.last_error.is_some());
+        assert!(controller.messages.is_empty());
     }
 
     #[test]
@@ -4739,6 +6917,81 @@ mod tests {
     }
 
     #[test]
+    fn durable_channel_acks_are_separate_from_parent_group_acks() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (identity, vault, session) = vault_session(directory.path());
+        let admin = Identity::generate().expect("admin");
+        let conversation_id = [71u8; 16];
+        let channel_id = [72u8; 16];
+        let transaction_id = [73u8; 16];
+        let payload = b"identical-looking MLS commit".to_vec();
+
+        let parent_key = MessengerController::group_request_outcome_key(
+            &admin.peer_id(),
+            &SetupMessage::GroupCommit {
+                conversation_id,
+                transaction_id,
+                operation: GroupOperation::Update,
+                target: None,
+                commit: payload.clone(),
+            },
+        )
+        .expect("parent outcome key");
+        let channel_key = MessengerController::group_request_outcome_key(
+            &admin.peer_id(),
+            &SetupMessage::ChannelCommit {
+                conversation_id,
+                channel_id,
+                transaction_id,
+                operation: GroupOperation::Update,
+                target: None,
+                commit: payload,
+            },
+        )
+        .expect("channel outcome key");
+        assert_ne!(parent_key, channel_key);
+
+        let ack = SetupMessage::ChannelCommitAck {
+            conversation_id,
+            channel_id,
+            transaction_id,
+            operation: GroupOperation::Update,
+            accepted: true,
+        };
+        {
+            let mut controller = MessengerController::start_with_control_log(
+                &identity,
+                NetworkConfig::default(),
+                session,
+            )
+            .expect("controller with vault");
+            controller
+                .persist_group_ack(&channel_key, &RequestOutcome::respond(ack.clone()))
+                .expect("persist channel ack");
+        }
+
+        let storage = vault.unlock("phase4-password").expect("reopen vault");
+        let controller = MessengerController::start_with_control_log(
+            &identity,
+            NetworkConfig::default(),
+            storage,
+        )
+        .expect("restored controller");
+        assert_eq!(
+            controller
+                .durable_group_ack(&channel_key)
+                .expect("channel ack"),
+            Some(ack)
+        );
+        assert_eq!(
+            controller
+                .durable_group_ack(&parent_key)
+                .expect("parent ack"),
+            None
+        );
+    }
+
+    #[test]
     fn restored_group_commit_replay_returns_the_original_ack_without_reapplying() {
         let directory = tempfile::tempdir().expect("temp dir");
         let (identity, vault, mut session) = vault_session(directory.path());
@@ -4757,7 +7010,7 @@ mod tests {
             .add_member(
                 key_package.bytes(),
                 identity.peer_id(),
-                &identity.public_key_bytes(),
+                &mls_public_key(&identity),
             )
             .expect("add recipient");
         let conversation = MlsConversation::join(&identity, conversation_id, key_package, &welcome)
@@ -4773,6 +7026,7 @@ mod tests {
             &state,
             display_peer,
             None,
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &VecDeque::new(),
@@ -4878,7 +7132,7 @@ mod tests {
             .add_member(
                 key_package.bytes(),
                 identity.peer_id(),
-                &identity.public_key_bytes(),
+                &mls_public_key(&identity),
             )
             .expect("create group Welcome");
 
@@ -5078,7 +7332,7 @@ mod tests {
             MlsConversation::create_with_storage(identity, conversation_id, storage)
                 .expect("vault-backed MLS group");
         let key_package = MlsConversation::key_package(peer).expect("peer key package");
-        let public_key = peer.public_key_bytes();
+        let public_key = mls_public_key(peer);
         conversation
             .add_member(key_package.bytes(), peer.peer_id(), &public_key)
             .expect("add peer to MLS group");
@@ -5096,6 +7350,7 @@ mod tests {
             MessengerController::display_peer(&state, &identity.peer_id()).expect("display peer");
         let pending_receipts: HashMap<[u8; 16], BTreeSet<PeerId>> = HashMap::new();
         let message_conversations: HashMap<[u8; 16], [u8; 16]> = HashMap::new();
+        let message_channel_routes: HashMap<[u8; 16], [u8; 16]> = HashMap::new();
         let offline_queue: VecDeque<QueuedMessage> = VecDeque::new();
         let record = PersistedConversation::from_state(
             &state,
@@ -5103,6 +7358,7 @@ mod tests {
             active_channel,
             &pending_receipts,
             &message_conversations,
+            &message_channel_routes,
             &offline_queue,
         );
         let bytes = serde_json::to_vec(&record).expect("encode conversation policy");
@@ -5144,6 +7400,7 @@ mod tests {
         active_channel: Option<[u8; 16]>,
         pending_receipts: &HashMap<[u8; 16], BTreeSet<PeerId>>,
         message_conversations: &HashMap<[u8; 16], [u8; 16]>,
+        message_channel_routes: &HashMap<[u8; 16], [u8; 16]>,
         offline_queue: &VecDeque<QueuedMessage>,
     ) {
         let peer =
@@ -5154,6 +7411,7 @@ mod tests {
             active_channel,
             pending_receipts,
             message_conversations,
+            message_channel_routes,
             offline_queue,
         );
         store_record(
@@ -5182,6 +7440,7 @@ mod tests {
         QueuedMessage {
             peer,
             conversation_id,
+            channel_id: DEFAULT_CHANNEL_ID,
             message_id: envelope.message_id,
             envelope_bytes: envelope.to_bytes().expect("encode queued envelope"),
         }
@@ -5442,12 +7701,14 @@ mod tests {
         controller.offline_queue.push_back(QueuedMessage {
             peer: removed,
             conversation_id,
+            channel_id: DEFAULT_CHANNEL_ID,
             message_id: removed_only_message,
             envelope_bytes: vec![1],
         });
         controller.offline_queue.push_back(QueuedMessage {
             peer: kept,
             conversation_id,
+            channel_id: DEFAULT_CHANNEL_ID,
             message_id: shared_message,
             envelope_bytes: vec![2],
         });
@@ -5523,6 +7784,7 @@ mod tests {
             None,
             &pending_receipts,
             &message_conversations,
+            &HashMap::new(),
             &VecDeque::new(),
         );
         drop(session);
@@ -5553,13 +7815,15 @@ mod tests {
             Some(DeliveryState::Delivered)
         );
         let info = controller.info(conversation_id).expect("conversation info");
-        assert!(
-            !info
-                .channels
-                .iter()
-                .find(|channel| channel.channel_id == DEFAULT_CHANNEL_ID)
-                .expect("default channel")
-                .acknowledged
+        let default_channel = info
+            .channels
+            .iter()
+            .find(|channel| channel.channel_id == DEFAULT_CHANNEL_ID)
+            .expect("default channel");
+        assert!(!default_channel.policy_acknowledged);
+        assert_eq!(
+            default_channel.group_status,
+            ChannelGroupStatus::DefaultOnParent
         );
     }
 
@@ -5597,6 +7861,7 @@ mod tests {
             None,
             &pending_receipts,
             &message_conversations,
+            &HashMap::new(),
             &offline_queue,
         );
         drop(session);
@@ -5731,6 +7996,7 @@ mod tests {
             None,
             &pending_receipts,
             &message_conversations,
+            &HashMap::new(),
             &offline_queue,
         );
         drop(session);
@@ -5928,6 +8194,7 @@ mod tests {
             conversation_id,
             transaction_id: current,
             kind: OutgoingSetupKind::Welcome,
+            scope: None,
         };
         let stale_frame = signed(
             &peer,
@@ -6023,6 +8290,7 @@ mod tests {
         controller.conversations.insert(conversation_id, state);
         let welcome_request = GroupRequest {
             conversation_id,
+            channel_scope: None,
             transaction_id: current,
             peer: member.peer_id(),
             operation: GroupOperation::Add,
@@ -6030,6 +8298,7 @@ mod tests {
         };
         let commit_request = GroupRequest {
             conversation_id,
+            channel_scope: None,
             transaction_id: current,
             peer: member.peer_id(),
             operation: GroupOperation::Add,
@@ -6216,5 +8485,546 @@ mod tests {
             .expect("pending operation");
         assert_eq!(operation.transaction_id, transaction_id);
         assert_eq!(operation.awaited.get(&admin.peer_id()), Some(&false));
+    }
+
+    /// A vault with one joined parent conversation and one ready derived
+    /// channel group, plus one queued ciphertext and its outstanding receipt.
+    struct ChannelVaultFixture {
+        identity: Identity,
+        peer: Identity,
+        vault: Vault,
+        parent: [u8; 16],
+        channel: [u8; 16],
+        group_id: [u8; 16],
+        message_id: [u8; 16],
+        peer_parent: MlsConversation,
+        peer_group: MlsChannelGroup,
+    }
+
+    fn ready_channel_vault(directory: &Path, secret: &str) -> ChannelVaultFixture {
+        let identity = Identity::generate().expect("local identity");
+        let peer = Identity::generate().expect("channel peer");
+        let vault = Vault::open(directory).expect("vault");
+        let session = vault
+            .create("phase4", "phase4-password", &identity)
+            .expect("vault session");
+        let parent = [0x91u8; 16];
+        let channel = [0x92u8; 16];
+        let binding = ChannelGroupBinding::new(parent, channel);
+        let group_id = binding.group_id();
+
+        let mut admin_parent = MlsConversation::create_with_storage(
+            &identity,
+            parent,
+            session.try_clone().expect("clone session"),
+        )
+        .expect("vault-backed parent group");
+        let parent_package = MlsConversation::key_package(&peer).expect("peer parent key package");
+        let (parent_welcome, _parent_commit) = admin_parent
+            .add_member_parts(
+                parent_package.bytes(),
+                peer.peer_id(),
+                &mls_public_key(&peer),
+            )
+            .expect("admin adds peer to parent");
+        let peer_parent = MlsConversation::join(&peer, parent, parent_package, &parent_welcome)
+            .expect("peer joins parent");
+        let members = BTreeSet::from([identity.peer_id(), peer.peer_id()]);
+
+        let mut admin_group = MlsChannelGroup::create_with_storage(
+            &identity,
+            binding,
+            session.try_clone().expect("clone session"),
+        )
+        .expect("vault-backed channel group");
+        let channel_package =
+            MlsChannelGroup::key_package(&peer, binding).expect("peer channel key package");
+        let (welcome, _commit) = admin_group
+            .add_member_parts(&channel_package, peer.peer_id(), &mls_public_key(&peer))
+            .expect("admin adds peer to channel group");
+        let peer_group = MlsChannelGroup::join(&peer, binding, channel_package, &welcome)
+            .expect("peer joins channel group");
+
+        let frame = ChannelFrame::text(channel, 1, secret).expect("channel text frame");
+        let envelope = admin_group
+            .compose(
+                &identity,
+                MessageKind::Channel,
+                &frame.to_bytes().expect("frame bytes"),
+            )
+            .expect("compose queued channel ciphertext");
+        let message_id = envelope.message_id;
+        admin_group
+            .mark_queued(&message_id)
+            .expect("mark queued ciphertext");
+        let queued = QueuedMessage {
+            peer: peer.peer_id(),
+            conversation_id: parent,
+            channel_id: channel,
+            message_id,
+            envelope_bytes: envelope.to_bytes().expect("encode ciphertext"),
+        };
+
+        let mut state = ConversationState::new(admin_parent, identity.peer_id(), members.clone());
+        state.channels.insert(
+            channel,
+            ChannelState {
+                name: "private".to_owned(),
+                creator: identity.peer_id(),
+                members,
+                revision: 1,
+                last_frame_id: None,
+            },
+        );
+        // Use the no-restore constructor because this fixture creates its MLS
+        // state before an application record exists. The controller identity
+        // must still match the vault identity: `persist_conversation` derives
+        // the display peer by excluding the controller's local peer.
+        let (_, mut controller) = test_controller();
+        controller.identity = identity.clone();
+        controller.storage = Some(session.try_clone().expect("clone session"));
+        controller.conversations.insert(parent, state);
+        controller.channel_groups.insert(
+            group_id,
+            ChannelGroupState {
+                binding,
+                group: admin_group,
+                awaited: BTreeSet::new(),
+                ready: true,
+            },
+        );
+        controller
+            .pending_receipts
+            .insert(message_id, BTreeSet::from([peer.peer_id()]));
+        controller.message_conversations.insert(message_id, parent);
+        controller
+            .message_channel_routes
+            .insert(message_id, channel);
+        controller.offline_queue.push_back(queued);
+        controller
+            .persist_conversation(parent)
+            .expect("persist parent and channel records");
+        drop(controller);
+        drop(session);
+
+        ChannelVaultFixture {
+            identity,
+            peer,
+            vault,
+            parent,
+            channel,
+            group_id,
+            message_id,
+            peer_parent,
+            peer_group,
+        }
+    }
+
+    fn reopen_vault(vault: &Vault, identity: &Identity) -> Result<MessengerController, ChatError> {
+        let storage = vault.unlock("phase4-password")?;
+        MessengerController::start_with_control_log(identity, NetworkConfig::default(), storage)
+    }
+
+    /// A vault where MLS state for a derived channel exists but its
+    /// authenticated application record was never written. This models a
+    /// shutdown during channel setup, before the group became ready.
+    fn pending_channel_vault(directory: &Path) -> (Vault, Identity) {
+        let identity = Identity::generate().expect("local identity");
+        let peer = Identity::generate().expect("channel peer");
+        let vault = Vault::open(directory).expect("vault");
+        let session = vault
+            .create("phase4", "phase4-password", &identity)
+            .expect("vault session");
+        let parent = [0x97u8; 16];
+        let channel = [0x98u8; 16];
+        let binding = ChannelGroupBinding::new(parent, channel);
+
+        let mut admin_parent = MlsConversation::create_with_storage(
+            &identity,
+            parent,
+            session.try_clone().expect("clone session"),
+        )
+        .expect("vault-backed parent group");
+        let parent_package = MlsConversation::key_package(&peer).expect("peer parent key package");
+        let (parent_welcome, _parent_commit) = admin_parent
+            .add_member_parts(
+                parent_package.bytes(),
+                peer.peer_id(),
+                &mls_public_key(&peer),
+            )
+            .expect("admin adds peer to parent");
+        let _peer_parent = MlsConversation::join(&peer, parent, parent_package, &parent_welcome)
+            .expect("peer joins parent");
+
+        let mut admin_group = MlsChannelGroup::create_with_storage(
+            &identity,
+            binding,
+            session.try_clone().expect("clone session"),
+        )
+        .expect("vault-backed channel group");
+        let channel_package =
+            MlsChannelGroup::key_package(&peer, binding).expect("peer channel key package");
+        let (_welcome, _commit) = admin_group
+            .add_member_parts(&channel_package, peer.peer_id(), &mls_public_key(&peer))
+            .expect("admin adds peer to channel group");
+
+        let members = BTreeSet::from([identity.peer_id(), peer.peer_id()]);
+        let mut state = ConversationState::new(admin_parent, identity.peer_id(), members.clone());
+        state.channels.insert(
+            channel,
+            ChannelState {
+                name: "private".to_owned(),
+                creator: identity.peer_id(),
+                members,
+                revision: 1,
+                last_frame_id: None,
+            },
+        );
+        let (_, mut controller) = test_controller();
+        controller.identity = identity.clone();
+        controller.storage = Some(session.try_clone().expect("clone session"));
+        controller.conversations.insert(parent, state);
+        controller
+            .persist_conversation(parent)
+            .expect("persist parent record only");
+        drop(controller);
+        drop(session);
+        (vault, identity)
+    }
+
+    fn mutate_channel_record(
+        vault: &Vault,
+        group_id: [u8; 16],
+        mutate: impl FnOnce(&mut PersistedChannelGroup),
+    ) {
+        let mut storage = vault.unlock("phase4-password").expect("unlock vault");
+        let bytes = storage
+            .load_mls_state(
+                &group_id,
+                PERSISTED_CHANNEL_GROUP_LABEL,
+                PERSISTED_CHANNEL_GROUP_LABEL.as_bytes(),
+            )
+            .expect("load channel record")
+            .expect("channel record exists");
+        let mut record = PersistedChannelGroup::decode(&bytes).expect("decode channel record");
+        mutate(&mut record);
+        let epoch = record.epoch;
+        let bytes = serde_json::to_vec(&record).expect("encode channel record");
+        storage
+            .store_mls_state(
+                &group_id,
+                PERSISTED_CHANNEL_GROUP_LABEL,
+                PERSISTED_CHANNEL_GROUP_LABEL.as_bytes(),
+                epoch,
+                &bytes,
+            )
+            .expect("store mutated channel record");
+    }
+
+    fn assert_channel_restore_fails(mutate: impl FnOnce(&mut PersistedChannelGroup)) {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let fixture = ready_channel_vault(directory.path(), "restore must fail closed");
+        mutate_channel_record(&fixture.vault, fixture.group_id, mutate);
+        let error = reopen_vault(&fixture.vault, &fixture.identity)
+            .expect_err("tampered channel metadata must fail startup");
+        assert!(
+            matches!(error, ChatError::MlsRestore(_) | ChatError::ControlLog(_)),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn channel_group_and_queued_ciphertext_restore_without_plaintext() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let secret = "P1e plaintext must never be persisted";
+        let fixture = ready_channel_vault(directory.path(), secret);
+        let controller = reopen_vault(&fixture.vault, &fixture.identity).expect("restart restores");
+
+        assert_eq!(controller.conversations.len(), 1);
+        let state = controller
+            .channel_groups
+            .get(&fixture.group_id)
+            .expect("derived channel group restored");
+        assert!(state.ready);
+        assert!(state.awaited.is_empty());
+        assert_eq!(state.binding.parent_conversation_id(), fixture.parent);
+        assert_eq!(state.binding.channel_id(), fixture.channel);
+        assert_eq!(
+            state.group.delivery_state(&fixture.message_id),
+            Some(DeliveryState::Queued)
+        );
+        assert!(state.group.next_sequence() > 1);
+        assert!(
+            controller
+                .pending_receipts
+                .contains_key(&fixture.message_id)
+        );
+        assert_eq!(
+            controller.message_channel_routes.get(&fixture.message_id),
+            Some(&fixture.channel)
+        );
+        assert_eq!(controller.offline_queue.len(), 1);
+        assert_eq!(controller.offline_queue[0].channel_id, fixture.channel);
+        assert_eq!(controller.offline_queue[0].message_id, fixture.message_id);
+        assert!(controller.messages.is_empty());
+
+        let storage = controller.storage.as_ref().expect("storage is attached");
+        for group_id in storage.mls_group_ids().expect("encrypted group ids") {
+            for entry in storage
+                .load_mls_state_group(&group_id)
+                .expect("encrypted group state")
+            {
+                assert!(
+                    !entry
+                        .value
+                        .windows(secret.len())
+                        .any(|window| window == secret.as_bytes()),
+                    "decrypted text appeared in a persisted record"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn restored_channel_group_routes_a_bound_receipt_and_rejects_parent_group_receipt() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let mut fixture = ready_channel_vault(directory.path(), "receipt routing secret");
+        let mut controller = reopen_vault(&fixture.vault, &fixture.identity).expect("restart");
+        let swarm_peer = swarm_peer(&fixture.peer.peer_id()).expect("swarm peer id");
+
+        let parent_receipt = fixture
+            .peer_parent
+            .receipt(&fixture.peer, ReceiptStatus::Delivered, fixture.message_id)
+            .expect("peer parent receipt")
+            .to_bytes()
+            .expect("encode parent receipt");
+        let first_request = controller
+            .network
+            .send_message(swarm_peer, parent_receipt.clone())
+            .expect("track parent receipt request");
+        controller
+            .outstanding_messages
+            .insert(first_request, fixture.message_id);
+        assert!(matches!(
+            controller.handle_message_response(first_request, swarm_peer, &parent_receipt),
+            Err(ChatError::InvalidChannelFrame(_))
+        ));
+        assert!(
+            controller
+                .pending_receipts
+                .contains_key(&fixture.message_id)
+        );
+
+        let channel_receipt = fixture
+            .peer_group
+            .receipt(&fixture.peer, ReceiptStatus::Delivered, fixture.message_id)
+            .expect("peer channel receipt")
+            .to_bytes()
+            .expect("encode channel receipt");
+        let second_request = controller
+            .network
+            .send_message(swarm_peer, channel_receipt.clone())
+            .expect("track channel receipt request");
+        controller
+            .outstanding_messages
+            .insert(second_request, fixture.message_id);
+        controller
+            .handle_message_response(second_request, swarm_peer, &channel_receipt)
+            .expect("bound channel receipt is accepted after restart");
+        assert!(
+            !controller
+                .pending_receipts
+                .contains_key(&fixture.message_id)
+        );
+        assert_eq!(controller.last_error, None);
+    }
+
+    #[test]
+    fn tampered_channel_binding_or_policy_fails_startup() {
+        assert_channel_restore_fails(|record| {
+            record.parent_conversation_id = [0x93u8; 16];
+        });
+        assert_channel_restore_fails(|record| {
+            record.channel_id = [0x94u8; 16];
+        });
+        assert_channel_restore_fails(|record| {
+            record.group_id = [0x95u8; 16];
+        });
+        assert_channel_restore_fails(|record| {
+            record.channel_revision = record.channel_revision.saturating_add(1);
+        });
+    }
+
+    #[test]
+    fn tampered_channel_epoch_membership_or_pending_state_fails_startup() {
+        assert_channel_restore_fails(|record| {
+            record.epoch = record.epoch.saturating_add(1);
+        });
+        assert_channel_restore_fails(|record| {
+            record.next_sequence = 1;
+        });
+        assert_channel_restore_fails(|record| {
+            record.members.pop();
+        });
+        assert_channel_restore_fails(|record| {
+            record.allowed_members.pop();
+        });
+        assert_channel_restore_fails(|record| {
+            record.ready = false;
+        });
+        assert_channel_restore_fails(|record| {
+            record.awaited.push(record.allowed_members[0].clone());
+        });
+        assert_channel_restore_fails(|record| {
+            record.queued[0].conversation_id = [0x96u8; 16];
+        });
+        assert_channel_restore_fails(|record| {
+            record.receipts[0].peers.clear();
+        });
+    }
+
+    #[test]
+    fn changed_channel_members_delete_persisted_channel_group() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let fixture = ready_channel_vault(directory.path(), "policy change deletes group");
+        let mut controller = reopen_vault(&fixture.vault, &fixture.identity).expect("restart");
+        assert!(controller.channel_groups.contains_key(&fixture.group_id));
+
+        controller
+            .set_channel_members(
+                fixture.parent,
+                fixture.channel,
+                vec![fixture.peer.peer_id()],
+            )
+            .expect("channel policy update");
+
+        assert!(!controller.channel_groups.contains_key(&fixture.group_id));
+        assert!(
+            !controller
+                .storage
+                .as_ref()
+                .expect("storage is attached")
+                .mls_group_ids()
+                .expect("encrypted group ids")
+                .contains(&fixture.group_id)
+        );
+        drop(controller);
+
+        let restored = reopen_vault(&fixture.vault, &fixture.identity)
+            .expect("restart after channel policy change");
+        assert!(restored.channel_groups.is_empty());
+        assert!(restored.conversations.contains_key(&fixture.parent));
+    }
+
+    #[test]
+    fn removed_parent_member_deletes_all_channel_groups() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let fixture = ready_channel_vault(directory.path(), "parent removal deletes group");
+        let mut controller = reopen_vault(&fixture.vault, &fixture.identity).expect("restart");
+        assert!(controller.channel_groups.contains_key(&fixture.group_id));
+
+        controller
+            .remove_member(fixture.parent, fixture.peer.peer_id())
+            .expect("remove parent member");
+
+        assert!(!controller.channel_groups.contains_key(&fixture.group_id));
+        assert!(
+            !controller
+                .storage
+                .as_ref()
+                .expect("storage is attached")
+                .mls_group_ids()
+                .expect("encrypted group ids")
+                .contains(&fixture.group_id)
+        );
+    }
+
+    #[test]
+    fn remove_local_conversation_deletes_parent_and_derived_groups() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let fixture = ready_channel_vault(directory.path(), "local removal deletes groups");
+        let mut controller = reopen_vault(&fixture.vault, &fixture.identity).expect("restart");
+
+        controller.remove_local_conversation(fixture.parent);
+
+        assert!(controller.conversations.is_empty());
+        assert!(controller.channel_groups.is_empty());
+        let group_ids = controller
+            .storage
+            .as_ref()
+            .expect("storage is attached")
+            .mls_group_ids()
+            .expect("encrypted group ids");
+        assert!(!group_ids.contains(&fixture.parent));
+        assert!(!group_ids.contains(&fixture.group_id));
+        drop(controller);
+
+        let restored = reopen_vault(&fixture.vault, &fixture.identity)
+            .expect("restart after local conversation removal");
+        assert!(restored.conversations.is_empty());
+        assert!(restored.channel_groups.is_empty());
+    }
+
+    #[test]
+    fn pending_channel_setup_without_application_record_fails_startup() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let (vault, identity) = pending_channel_vault(directory.path());
+        let storage = vault.unlock("phase4-password").expect("unlock vault");
+
+        let error = MessengerController::start_with_control_log(
+            &identity,
+            NetworkConfig::default(),
+            storage,
+        )
+        .expect_err("an incomplete channel group must not be revived");
+        assert!(
+            matches!(error, ChatError::MlsRestore(_)),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn parent_and_channel_labels_on_one_group_fail_startup() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let fixture = ready_channel_vault(directory.path(), "conflicting labels fail startup");
+        {
+            let mut storage = fixture
+                .vault
+                .unlock("phase4-password")
+                .expect("unlock vault");
+            let parent_bytes = storage
+                .load_mls_state(
+                    &fixture.parent,
+                    PERSISTED_CONVERSATION_LABEL,
+                    PERSISTED_CONVERSATION_LABEL.as_bytes(),
+                )
+                .expect("load parent record")
+                .expect("parent record exists");
+            let channel_bytes = storage
+                .load_mls_state(
+                    &fixture.group_id,
+                    PERSISTED_CHANNEL_GROUP_LABEL,
+                    PERSISTED_CHANNEL_GROUP_LABEL.as_bytes(),
+                )
+                .expect("load channel record")
+                .expect("channel record exists");
+            let channel = PersistedChannelGroup::decode(&channel_bytes).expect("decode channel");
+            storage
+                .store_mls_state(
+                    &fixture.group_id,
+                    PERSISTED_CONVERSATION_LABEL,
+                    PERSISTED_CONVERSATION_LABEL.as_bytes(),
+                    channel.epoch,
+                    &parent_bytes,
+                )
+                .expect("store conflicting parent label");
+        }
+
+        let error = reopen_vault(&fixture.vault, &fixture.identity)
+            .expect_err("conflicting labels must fail startup");
+        assert!(
+            matches!(error, ChatError::MlsRestore(_)),
+            "unexpected error: {error}"
+        );
     }
 }

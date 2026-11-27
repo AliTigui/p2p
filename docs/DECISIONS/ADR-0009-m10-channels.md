@@ -1,7 +1,9 @@
 # ADR-0009: Channels as logical partitions inside one MLS group
 
-- Status: Accepted
+- Status: Accepted for Milestone 10; superseded in part by the P1 security remediation for non-default channel text
 - Date: 2026-11-24
+
+P1 later adds a bound derived `MlsChannelGroup` for non-default text/receipts, authenticated persistence/restore for ready groups, and GUI status that separates parent policy/default traffic from derived-group readiness. Parent `CHN1` policy and the default channel still follow this ADR; none of that is a complete cryptographic channel ACL.
 
 ## Context
 Milestone 10 needed separate conversational spaces without creating separate MLS groups, new KeyPackages/Welcomes, or another transport protocol. OpenMLS has one group key schedule per group and no native sub-group construct. The v1 envelope already reserved `MessageKind::Channel` with code `8`, but it had no application codec or controller policy. Creating new MLS groups per channel would multiply group state, epoch management, Welcomes, and delivery bookkeeping, and would not fit the requirement that channels remain logical partitions of one authenticated conversation.
@@ -15,7 +17,7 @@ Reuse the existing signed v1 envelope and MLS application path. Do not add an en
 - The group creator remains the only administrator. Only that authenticated PeerId may create, rename, or change members of a channel. Any local peer and named recipient who are both MLS members and allowed channel members may post text.
 - An empty member list at creation means all current MLS group members. Explicit member lists are validated against current MLS membership; duplicates, empty lists, and more than 64 members are rejected. A group holds at most 16 channels. Names are at most 64 UTF-8 bytes, text at most 2,048 bytes, and the framed application body at most 4,096 bytes.
 - Metadata frames require the next sequential revision (`1` for create, current revision plus one for rename/member changes) and are broadcast as one signed MLS envelope to all group members. Text is sent only to allowed channel members. Receipts remain the existing legacy raw MLS receipt bodies; no channel ID is added to receipts.
-- Channel metadata remains represented by local `ChannelInfo` state and receipt-gated `acknowledged` status. Invalid, unknown, or unauthorized frames produce no delivery receipt and only a static error category in `last_error`.
+- Channel metadata remains represented by local `ChannelInfo` state and receipt-gated policy status (now `policy_acknowledged`, distinct from P1f `ChannelGroupStatus`). Invalid, unknown, or unauthorized frames produce no delivery receipt and only a static error category in `last_error`.
 - Offline queue behavior, one ciphertext copy per disconnected recipient, and `Delivered` only after all expected receipts are unchanged. `send_text` remains the compatibility entry point and sends in the default channel.
 
 ## Consequences

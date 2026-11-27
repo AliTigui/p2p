@@ -10,23 +10,80 @@
 
 use std::fmt;
 
-use libp2p_identity::{PeerId, PublicKey};
+use libp2p_identity::PeerId;
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
 use openmls_rust_crypto::{OpenMlsRustCrypto, RustCrypto};
 use openmls_traits::OpenMlsProvider;
 use openmls_traits::signatures::{Signer, SignerError};
 use openmls_traits::types::SignatureScheme;
-use p2p_identity::{Identity, raw_ed25519_public_bytes_from_protobuf};
+use p2p_identity::{Identity, IdentityRole};
 use p2p_messaging::{
     Conversation, DeliveryState, Envelope, MessageKind, Receipt, ReceiptStatus, ReceivedMessage,
 };
 use p2p_storage::{MlsProviderError, Session, StagedMlsProvider};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 const MAX_GROUP_MESSAGE_BYTES: usize = 1024 * 1024;
+const CHANNEL_GROUP_ID_DOMAIN: &[u8] = b"p2p.mls-channel-group/v1";
+
+/// Derive the independent MLS group ID for one logical channel.
+///
+/// This is an identifier derivation, not key derivation: the resulting bytes
+/// select a separate OpenMLS group whose key schedule, epoch, ratchet state,
+/// membership, and replay state are independent of the parent conversation.
+/// The domain separator prevents a channel group from colliding with a
+/// conversation group or with a future derivation format.
+#[must_use = "a channel group id must be used to create a distinct MLS group"]
+pub fn channel_group_id(conversation_id: [u8; 16], channel_id: [u8; 16]) -> [u8; 16] {
+    let mut digest = Sha256::new();
+    digest.update(CHANNEL_GROUP_ID_DOMAIN);
+    digest.update(conversation_id);
+    digest.update(channel_id);
+    let bytes = digest.finalize();
+    let mut group_id = [0u8; 16];
+    group_id.copy_from_slice(&bytes[..16]);
+    group_id
+}
+
+/// Explicit parent/channel identity for an independent MLS channel group.
+///
+/// The derived group ID is the only MLS group ID this binding authorizes. The
+/// binding does not encode an inverse mapping back to the parent or channel;
+/// callers must supply those values themselves, and P1c must sign them before
+/// the application can claim cryptographic channel ACLs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChannelGroupBinding {
+    parent_conversation_id: [u8; 16],
+    channel_id: [u8; 16],
+    group_id: [u8; 16],
+}
+
+impl ChannelGroupBinding {
+    /// Bind a logical channel to its parent conversation and derived MLS group.
+    pub fn new(parent_conversation_id: [u8; 16], channel_id: [u8; 16]) -> Self {
+        Self {
+            parent_conversation_id,
+            channel_id,
+            group_id: channel_group_id(parent_conversation_id, channel_id),
+        }
+    }
+
+    pub fn parent_conversation_id(self) -> [u8; 16] {
+        self.parent_conversation_id
+    }
+
+    pub fn channel_id(self) -> [u8; 16] {
+        self.channel_id
+    }
+
+    pub fn group_id(self) -> [u8; 16] {
+        self.group_id
+    }
+}
 
 /// Authorized MLS epoch-changing operations used by group management frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +139,8 @@ pub enum GroupError {
     EmptyPlaintext,
     #[error("MLS group id does not match the conversation id")]
     WrongConversation,
+    #[error("MLS channel group does not match its parent conversation and channel binding")]
+    WrongChannelBinding,
     #[error("MLS group epoch does not match the envelope epoch")]
     EpochMismatch { expected: u64, actual: u64 },
     #[error("MLS sender credential does not match the envelope sender")]
@@ -104,14 +163,16 @@ pub enum GroupError {
     Message(#[from] p2p_messaging::MessageError),
 }
 
-/// A signer that uses the vault Ed25519 identity, so the MLS leaf signature key
-/// is the same key that signs the outer envelope.
+/// A signer that uses the certified MLS role key. MLS signatures cover the
+/// exact MLS payload bytes; role separation comes from the independent key.
 #[derive(Clone)]
 struct IdentitySigner(Identity);
 
 impl Signer for IdentitySigner {
     fn sign(&self, payload: &[u8]) -> Result<Vec<u8>, SignerError> {
-        self.0.sign(payload).map_err(|_| SignerError::SigningError)
+        self.0
+            .sign_raw_with_role(IdentityRole::Mls, payload)
+            .map_err(|_| SignerError::SigningError)
     }
 
     fn signature_scheme(&self) -> SignatureScheme {
@@ -130,8 +191,20 @@ impl fmt::Debug for IdentitySigner {
 fn credential(identity: &Identity) -> Result<CredentialWithKey, GroupError> {
     Ok(CredentialWithKey {
         credential: BasicCredential::new(identity.peer_id().to_bytes()).into(),
-        signature_key: identity.ed25519_public_bytes()?.to_vec().into(),
+        signature_key: identity
+            .role_public_bytes(IdentityRole::Mls)?
+            .to_vec()
+            .into(),
     })
+}
+
+/// MLS leaf signature keys are raw 32-byte Ed25519 keys. The expected key is
+/// supplied by the certified identity proof in the signed setup frame, not by
+/// a protobuf transport key that would derive a different PeerId.
+fn expected_mls_key(expected_public_key: &[u8]) -> Result<[u8; 32], GroupError> {
+    expected_public_key
+        .try_into()
+        .map_err(|_| GroupError::SenderMismatch)
 }
 
 fn check_group_message_size(bytes: &[u8]) -> Result<(), GroupError> {
@@ -283,6 +356,79 @@ impl fmt::Debug for MlsKeyPackage {
     }
 }
 
+/// A KeyPackage with an explicit channel binding. The binding is checked when
+/// the package is added to a [`MlsChannelGroup`] and when its Welcome is used
+/// to join; P1c must sign the binding before it is authenticated as setup data.
+#[must_use = "the returned KeyPackage owns secrets required for join"]
+pub struct ChannelKeyPackage {
+    binding: ChannelGroupBinding,
+    inner: MlsKeyPackage,
+}
+
+impl ChannelKeyPackage {
+    pub fn binding(&self) -> ChannelGroupBinding {
+        self.binding
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        self.inner.bytes()
+    }
+
+    /// Wrap a received public KeyPackage with the binding proven by its signed
+    /// setup frame. This value can be added to a group, but it owns no private
+    /// join material and must never be used to join.
+    pub fn from_public_bytes(binding: ChannelGroupBinding, bytes: Vec<u8>) -> Self {
+        Self {
+            binding,
+            inner: MlsKeyPackage {
+                provider: MlsProvider::Memory(Box::default()),
+                bytes,
+            },
+        }
+    }
+}
+
+impl fmt::Debug for ChannelKeyPackage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChannelKeyPackage")
+            .field("binding", &self.binding)
+            .field("bytes_len", &self.inner.bytes.len())
+            .field("provider", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+/// A Welcome with the channel binding of the group that issued it.
+#[must_use = "a Welcome is required to join the bound channel group"]
+pub struct ChannelWelcome {
+    binding: ChannelGroupBinding,
+    bytes: Vec<u8>,
+}
+
+impl ChannelWelcome {
+    pub fn binding(&self) -> ChannelGroupBinding {
+        self.binding
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Wrap a received Welcome whose signed setup frame proved this binding.
+    pub fn from_bytes(binding: ChannelGroupBinding, bytes: Vec<u8>) -> Self {
+        Self { binding, bytes }
+    }
+}
+
+impl fmt::Debug for ChannelWelcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChannelWelcome")
+            .field("binding", &self.binding)
+            .field("bytes_len", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// An OpenMLS group session. The provider variants keep the same group logic
 /// while choosing memory-only or encrypted-vault persistence.
 struct MlsSession {
@@ -344,7 +490,7 @@ impl MlsSession {
                     == Some(identity.peer_id())
             })
             .ok_or(GroupError::WrongLocalIdentity)?;
-        if local_member.signature_key.as_slice() != identity.ed25519_public_bytes()? {
+        if local_member.signature_key.as_slice() != identity.role_public_bytes(IdentityRole::Mls)? {
             return Err(GroupError::WrongLocalIdentity);
         }
         Ok(())
@@ -452,12 +598,7 @@ impl MlsSession {
             .validate(crypto, ProtocolVersion::Mls10)
             .map_err(|_| GroupError::Mls("key package validation failed"))?;
 
-        let expected_public = PublicKey::try_decode_protobuf(expected_public_key)
-            .map_err(|_| GroupError::Mls("expected public key decode failed"))?;
-        if expected_public.to_peer_id() != expected_peer {
-            return Err(GroupError::SenderMismatch);
-        }
-        let expected_raw_key = raw_ed25519_public_bytes_from_protobuf(expected_public_key)?;
+        let expected_raw_key = expected_mls_key(expected_public_key)?;
         let leaf = key_package.leaf_node();
         if leaf.credential().serialized_content() != expected_peer.to_bytes()
             || leaf.signature_key().as_slice() != expected_raw_key
@@ -787,7 +928,7 @@ impl MlsSession {
                 .members()
                 .find(|member| member.index == *leaf)
                 .ok_or(GroupError::SenderMismatch)?;
-            let expected_raw_key = raw_ed25519_public_bytes_from_protobuf(expected_public_key)?;
+            let expected_raw_key = expected_mls_key(expected_public_key)?;
             if member.signature_key != expected_raw_key {
                 return Err(GroupError::SenderMismatch);
             }
@@ -922,7 +1063,7 @@ impl MlsSession {
             .members()
             .find(|member| member.index == *leaf)
             .ok_or(GroupError::SenderMismatch)?;
-        let expected_raw_key = raw_ed25519_public_bytes_from_protobuf(expected_public_key)?;
+        let expected_raw_key = expected_mls_key(expected_public_key)?;
         if member.signature_key != expected_raw_key {
             return Err(GroupError::SenderMismatch);
         }
@@ -1272,11 +1413,10 @@ impl MlsConversation {
     pub fn receive(&mut self, envelope: Envelope) -> Result<DecryptedMessage, GroupError> {
         self.conversation.advance_epoch(self.session.epoch())?;
         self.conversation.verify_envelope(&envelope)?;
-        let decrypted = self.session.decrypt(
-            &envelope.payload,
-            &envelope.sender,
-            &envelope.sender_public_key,
-        )?;
+        let mls_key = envelope.sender_role_public_key(IdentityRole::Mls)?;
+        let decrypted = self
+            .session
+            .decrypt(&envelope.payload, &envelope.sender, &mls_key)?;
         if decrypted.epoch != envelope.epoch {
             return Err(GroupError::EpochMismatch {
                 expected: envelope.epoch,
@@ -1308,5 +1448,314 @@ impl fmt::Debug for MlsConversation {
             .field("conversation", &self.conversation)
             .field("session", &self.session)
             .finish_non_exhaustive()
+    }
+}
+
+/// An MLS group whose every lifecycle operation carries an explicit
+/// parent/channel binding. The wrapped [`MlsConversation`] is private and is
+/// never exposed mutably, so callers cannot substitute a parent group or a
+/// different channel group through this API.
+///
+/// This is a group-layer API boundary, not application-level channel ACLs:
+/// setup frames, envelope routing, persistence labels, and GUI claims remain
+/// legacy until P1c–P1f are implemented.
+pub struct MlsChannelGroup {
+    binding: ChannelGroupBinding,
+    conversation: MlsConversation,
+}
+
+impl MlsChannelGroup {
+    /// Create the independent MLS group for one bound logical channel.
+    pub fn create(identity: &Identity, binding: ChannelGroupBinding) -> Result<Self, GroupError> {
+        let conversation = MlsConversation::create(identity, binding.group_id())?;
+        Self::from_conversation(binding, conversation)
+    }
+
+    /// Vault-backed variant of [`Self::create`].
+    pub fn create_with_storage(
+        identity: &Identity,
+        binding: ChannelGroupBinding,
+        storage: Session,
+    ) -> Result<Self, GroupError> {
+        let conversation =
+            MlsConversation::create_with_storage(identity, binding.group_id(), storage)?;
+        Self::from_conversation(binding, conversation)
+    }
+
+    /// Restore a channel group through encrypted provider state. The caller's
+    /// parent/channel binding selects the group ID; a wrong binding selects a
+    /// different group and fails closed when that state is absent.
+    pub fn load_with_storage(
+        identity: &Identity,
+        binding: ChannelGroupBinding,
+        storage: Session,
+    ) -> Result<Self, GroupError> {
+        let conversation =
+            MlsConversation::load_with_storage(identity, binding.group_id(), storage)?;
+        Self::from_conversation(binding, conversation)
+    }
+
+    /// Generate a KeyPackage declared for this parent/channel binding.
+    pub fn key_package(
+        identity: &Identity,
+        binding: ChannelGroupBinding,
+    ) -> Result<ChannelKeyPackage, GroupError> {
+        Ok(ChannelKeyPackage {
+            binding,
+            inner: MlsConversation::key_package(identity)?,
+        })
+    }
+
+    /// Vault-backed variant of [`Self::key_package`].
+    pub fn key_package_with_storage(
+        identity: &Identity,
+        binding: ChannelGroupBinding,
+        storage: Session,
+    ) -> Result<ChannelKeyPackage, GroupError> {
+        Ok(ChannelKeyPackage {
+            binding,
+            inner: MlsConversation::key_package_with_storage(identity, storage)?,
+        })
+    }
+
+    /// Add a peer whose KeyPackage declares the same binding as this group.
+    pub fn add_member(
+        &mut self,
+        key_package: &ChannelKeyPackage,
+        expected_peer: PeerId,
+        expected_public_key: &[u8],
+    ) -> Result<ChannelWelcome, GroupError> {
+        let (welcome, _commit) =
+            self.add_member_parts(key_package, expected_peer, expected_public_key)?;
+        Ok(welcome)
+    }
+
+    /// Add a peer and return its bound Welcome plus the signed MLS commit.
+    pub fn add_member_parts(
+        &mut self,
+        key_package: &ChannelKeyPackage,
+        expected_peer: PeerId,
+        expected_public_key: &[u8],
+    ) -> Result<(ChannelWelcome, Vec<u8>), GroupError> {
+        self.check_key_package_binding(key_package)?;
+        let (welcome, commit) = self.conversation.add_member_parts(
+            key_package.bytes(),
+            expected_peer,
+            expected_public_key,
+        )?;
+        Ok((
+            ChannelWelcome {
+                binding: self.binding,
+                bytes: welcome,
+            },
+            commit,
+        ))
+    }
+
+    /// Join using a KeyPackage and Welcome that both declare the same binding.
+    pub fn join(
+        identity: &Identity,
+        binding: ChannelGroupBinding,
+        key_package: ChannelKeyPackage,
+        welcome: &ChannelWelcome,
+    ) -> Result<Self, GroupError> {
+        if key_package.binding() != binding || welcome.binding() != binding {
+            return Err(GroupError::WrongChannelBinding);
+        }
+        let conversation = MlsConversation::join(
+            identity,
+            binding.group_id(),
+            key_package.inner,
+            welcome.bytes(),
+        )?;
+        Self::from_conversation(binding, conversation)
+    }
+
+    pub fn binding(&self) -> ChannelGroupBinding {
+        self.binding
+    }
+
+    pub fn parent_conversation_id(&self) -> [u8; 16] {
+        self.binding.parent_conversation_id()
+    }
+
+    pub fn channel_id(&self) -> [u8; 16] {
+        self.binding.channel_id()
+    }
+
+    /// MLS group ID for this channel, not the parent conversation ID.
+    pub fn id(&self) -> [u8; 16] {
+        self.conversation.id()
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.conversation.epoch()
+    }
+
+    pub fn local_peer_id(&self) -> PeerId {
+        self.conversation.local_peer_id()
+    }
+
+    pub fn conversation(&self) -> &Conversation {
+        self.conversation.conversation()
+    }
+
+    pub fn members(&self) -> Result<Vec<PeerId>, GroupError> {
+        self.conversation.members()
+    }
+
+    pub fn remove_member(&mut self, peer: &PeerId) -> Result<Vec<u8>, GroupError> {
+        self.conversation.remove_member(peer)
+    }
+
+    pub fn self_update_commit(&mut self) -> Result<Vec<u8>, GroupError> {
+        self.conversation.self_update_commit()
+    }
+
+    pub fn process_commit(
+        &mut self,
+        commit_bytes: &[u8],
+        expected_sender: &PeerId,
+        expected_public_key: &[u8],
+        operation: GroupOperation,
+        expected_target: Option<PeerId>,
+    ) -> Result<CommitOutcome, GroupError> {
+        self.conversation.process_commit(
+            commit_bytes,
+            expected_sender,
+            expected_public_key,
+            operation,
+            expected_target,
+        )
+    }
+
+    pub fn delivery_state(&self, message_id: &[u8; 16]) -> Option<DeliveryState> {
+        self.conversation.delivery_state(message_id)
+    }
+
+    pub fn next_sequence(&self) -> u64 {
+        self.conversation.next_sequence()
+    }
+
+    pub fn restore_epoch(&mut self, epoch: u64) -> Result<(), GroupError> {
+        self.conversation.restore_epoch(epoch)
+    }
+
+    pub fn restore_sequence(&mut self, sequence: u64) -> Result<(), GroupError> {
+        self.conversation.restore_sequence(sequence)
+    }
+
+    pub fn restore_outgoing(
+        &mut self,
+        message_id: &[u8; 16],
+        state: DeliveryState,
+    ) -> Result<(), GroupError> {
+        self.conversation.restore_outgoing(message_id, state)
+    }
+
+    pub fn mark_queued(&mut self, message_id: &[u8; 16]) -> Result<(), GroupError> {
+        self.conversation.mark_queued(message_id)
+    }
+
+    pub fn mark_sent_to_peer(&mut self, message_id: &[u8; 16]) -> Result<(), GroupError> {
+        self.conversation.mark_sent_to_peer(message_id)
+    }
+
+    pub fn mark_failed(&mut self, message_id: &[u8; 16]) -> Result<(), GroupError> {
+        self.conversation.mark_failed(message_id)
+    }
+
+    pub fn compose(
+        &mut self,
+        identity: &Identity,
+        kind: MessageKind,
+        plaintext: &[u8],
+    ) -> Result<Envelope, GroupError> {
+        self.conversation.compose(identity, kind, plaintext)
+    }
+
+    pub fn receipt(
+        &mut self,
+        identity: &Identity,
+        status: ReceiptStatus,
+        message_id: [u8; 16],
+    ) -> Result<Envelope, GroupError> {
+        self.conversation.receipt(identity, status, message_id)
+    }
+
+    pub fn receive(&mut self, envelope: Envelope) -> Result<DecryptedMessage, GroupError> {
+        self.conversation.receive(envelope)
+    }
+
+    fn from_conversation(
+        binding: ChannelGroupBinding,
+        conversation: MlsConversation,
+    ) -> Result<Self, GroupError> {
+        if conversation.id() != binding.group_id() {
+            return Err(GroupError::WrongChannelBinding);
+        }
+        Ok(Self {
+            binding,
+            conversation,
+        })
+    }
+
+    fn check_key_package_binding(&self, key_package: &ChannelKeyPackage) -> Result<(), GroupError> {
+        if key_package.binding() != self.binding {
+            return Err(GroupError::WrongChannelBinding);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for MlsChannelGroup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MlsChannelGroup")
+            .field("binding", &self.binding)
+            .field("group", &self.conversation)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod post_quantum_evaluation {
+    use super::*;
+    use openmls_traits::{OpenMlsProvider, crypto::OpenMlsCrypto};
+
+    const PINNED_OPENMLS_VERSION: &str = "0.10.0-rc.1";
+    const LOCKFILE: &str = include_str!("../../../Cargo.lock");
+
+    /// This is a version/capability evaluation, not a quantum-resistance
+    /// claim. The pinned OpenMLS release candidate may expose draft PQ suites
+    /// behind a feature; this build neither enables nor advertises them.
+    #[test]
+    fn pinned_openmls_advertises_only_classical_ciphersuites() {
+        let package = LOCKFILE
+            .split("[[package]]")
+            .find(|block| block.contains("name = \"openmls\""))
+            .expect("openmls lockfile entry");
+        assert!(package.contains(&format!("version = \"{PINNED_OPENMLS_VERSION}\"")));
+
+        let provider = OpenMlsRustCrypto::default();
+        let supported = provider.crypto().supported_ciphersuites();
+        assert!(
+            !supported.is_empty(),
+            "provider must advertise a cipher suite"
+        );
+        for suite in supported {
+            assert!(
+                matches!(
+                    suite,
+                    Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519
+                        | Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256
+                        | Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519
+                        | Ciphersuite::MLS_256_DHKEMX448_AES256GCM_SHA512_Ed448
+                        | Ciphersuite::MLS_256_DHKEMP521_AES256GCM_SHA512_P521
+                        | Ciphersuite::MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448
+                        | Ciphersuite::MLS_256_DHKEMP384_AES256GCM_SHA384_P384
+                ),
+                "unexpected non-classical ciphersuite in this build"
+            );
+        }
     }
 }

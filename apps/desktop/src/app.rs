@@ -6,7 +6,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 #[cfg(all(unix, feature = "native"))]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", test))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -17,8 +17,8 @@ use egui::{
     RichText, Stroke, TextEdit, TextStyle, Ui, Visuals, vec2,
 };
 use p2p_chat::{
-    MessengerController, PeerId, QuarantineDeletionPolicy, ReleaseApproval, TransferDirection,
-    parse_address, parse_peer_id,
+    ChannelGroupStatus, MessengerController, PeerId, QuarantineDeletionPolicy, ReleaseApproval,
+    TransferDirection, parse_address, parse_peer_id,
 };
 use p2p_core::AppInfo;
 use p2p_identity::Identity;
@@ -29,8 +29,8 @@ use rfd::FileDialog;
 use zeroize::Zeroize;
 
 use crate::model::{
-    NetworkInfo, NetworkOptions, Theme, UnlockedInfo, VaultOperation, VaultState, next_theme,
-    runtime_banner, security_rows,
+    NetworkInfo, NetworkOptions, Theme, UnlockedInfo, VaultOperation, VaultState, file_picker_hint,
+    file_send_summary, network_settings_details, next_theme, runtime_banner, security_rows,
 };
 
 /// A small Material-inspired token set. These are presentation colors only;
@@ -289,7 +289,6 @@ pub struct MessengerApp {
     network_options: NetworkOptions,
     message_text: String,
     channel_name: String,
-    file_path: String,
     username: String,
     password: String,
     confirm_password: String,
@@ -322,7 +321,6 @@ impl MessengerApp {
             network_options: NetworkOptions::default(),
             message_text: String::new(),
             channel_name: String::new(),
-            file_path: String::new(),
             username: String::new(),
             password: String::new(),
             confirm_password: String::new(),
@@ -376,7 +374,6 @@ impl MessengerApp {
         self.member_peer_id.clear();
         self.message_text.clear();
         self.channel_name.clear();
-        self.file_path.clear();
         let config = self.network_options.to_config()?;
         let storage = session.try_clone().map_err(|error| error.to_string())?;
         self.chat = Some(
@@ -547,10 +544,28 @@ impl MessengerApp {
         }
     }
 
-    fn send_file(&mut self) {
-        let path = PathBuf::from(self.file_path.trim());
-        if path.as_os_str().is_empty() {
-            self.chat_error = Some("Enter a local file path.".to_owned());
+    /// Native builds use the OS file picker so sending a file feels like
+    /// attaching it to a message instead of copying a path into a form. A
+    /// cancellation is silent; only a selected file starts a transfer.
+    #[cfg(feature = "native")]
+    fn attach_file(&mut self) {
+        let Some(path) = FileDialog::new().pick_file() else {
+            return;
+        };
+        self.send_file_path(&path);
+    }
+
+    /// Feature-only builds cannot open a native dialog. They report that
+    /// honestly rather than exposing a path form in the normal chat flow.
+    #[cfg(not(feature = "native"))]
+    fn attach_file(&mut self) {
+        self.chat_error = Some("File picker requires the native build.".to_owned());
+    }
+
+    #[cfg(any(feature = "native", test))]
+    fn send_file_path(&mut self, path: &Path) {
+        if path.as_os_str().is_empty() || !path.is_file() {
+            self.chat_error = Some("Choose an existing file.".to_owned());
             return;
         }
         let Some(peer) = self.chat.as_ref().and_then(|chat| chat.active_peer()) else {
@@ -561,11 +576,8 @@ impl MessengerApp {
             self.chat_error = Some("Network is not running".to_owned());
             return;
         };
-        match chat.send_file(peer, &path) {
-            Ok(_) => {
-                self.file_path.clear();
-                self.chat_error = None;
-            }
+        match chat.send_file(peer, path) {
+            Ok(_) => self.chat_error = None,
             Err(error) => self.chat_error = Some(error.to_string()),
         }
     }
@@ -994,25 +1006,17 @@ impl MessengerApp {
             note(
                 ui,
                 p,
-                "By default no bootstrap peers, DHT servers, or relays are configured. Direct dial requires an address you supply.",
+                "No setup needed: exchange an address with a peer. No relays or discovery by default.",
             );
         });
 
         card(ui, p, |ui| {
-            note(
-                ui,
-                p,
-                "All optional capabilities are off and address lists are empty by default. \
-                 Discovery candidates are advisory only: they are never auto-dialed, trusted, \
-                 or treated as fingerprint-verified contacts. Relay operators can observe IPs, \
-                 timing, and sizes and can deny service; file transfer over a relay is disabled. \
-                 AutoNAT and DCUtR are best effort, not universal NAT traversal. There is no \
-                 Tor/I2P/mixnet, anonymity, or metadata privacy claim. Settings apply when the \
-                 network worker starts: lock and unlock the vault after changing them.",
-            );
-            egui::CollapsingHeader::new("Optional network settings")
+            note(ui, p, "Everything here is optional and off by default.");
+            egui::CollapsingHeader::new("Advanced network settings")
                 .default_open(false)
                 .show(ui, |ui| {
+                    note(ui, p, network_settings_details());
+                    ui.add_space(6.0);
                     ui.checkbox(
                         &mut self.network_options.enable_identify,
                         "Identify (bounded protocol metadata)",
@@ -1134,17 +1138,35 @@ impl MessengerApp {
                     }
 
                     ui.add_space(6.0);
-                    ui.label(RichText::new("CHANNELS IN THIS MLS GROUP").small().weak());
+                    ui.label(
+                        RichText::new("CHANNELS · PARENT POLICY + DERIVED TEXT GROUPS")
+                            .small()
+                            .weak(),
+                    );
                     for channel in &active.channels {
                         let selected = active.active_channel == Some(channel.channel_id);
                         let marker = if selected { "● " } else { "   " };
-                        let policy = if channel.acknowledged {
-                            "policy acknowledged"
+                        let policy = if channel.policy_acknowledged {
+                            "parent policy acknowledged"
                         } else {
-                            "policy awaiting receipts"
+                            "parent policy awaiting receipts"
+                        };
+                        let group = match channel.group_status {
+                            ChannelGroupStatus::DefaultOnParent => {
+                                "default text on parent MLS group".to_owned()
+                            }
+                            ChannelGroupStatus::DerivedReady => {
+                                "derived text group ready".to_owned()
+                            }
+                            ChannelGroupStatus::DerivedSettingUp { awaited } => format!(
+                                "derived setup pending ({awaited} acknowledgement(s) outstanding)"
+                            ),
+                            ChannelGroupStatus::Missing => {
+                                "derived text group not started".to_owned()
+                            }
                         };
                         let label = format!(
-                            "{marker}{} · rev {} · {} allowed · {policy}",
+                            "{marker}{} · rev {} · {} allowed · {policy} · {group}",
                             short(&channel.name, 20),
                             channel.revision,
                             channel.members.len()
@@ -1163,12 +1185,21 @@ impl MessengerApp {
                         self.create_channel();
                     }
                     ui.label(
-                    RichText::new(
-                        "Channel metadata and text are MLS-encrypted application frames in one group. Channel membership is local client policy, not cryptographic access control.",
-                    )
-                    .small()
-                    .weak(),
-                );
+                        RichText::new("Default chat is private to the parent group; restricted channels get a separate group after setup.")
+                            .small()
+                            .weak(),
+                    );
+                    egui::CollapsingHeader::new("Channel security details")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "Channel names, membership, and policy frames stay in signed CHN1 frames on the parent MLS group, readable by every parent member. Default-channel text also uses the parent group. Non-default text and receipts use an independent bound MLS group after setup converges; sending is blocked until then. This is not a complete cryptographic channel ACL.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        });
 
                     if tonal_button_enabled(ui, p, "Refresh my MLS key", idle) {
                         self.update_member_key();
@@ -1192,12 +1223,10 @@ impl MessengerApp {
                         }
                     }
                     ui.label(
-                    RichText::new(
-                        "Group changes are signed MLS commits. They stay pending until every required member acknowledges; messages and further changes are blocked while pending. Only the group admin can add, remove, or refresh keys.",
-                    )
-                    .small()
-                    .weak(),
-                );
+                        RichText::new("Only the admin changes membership. Changes wait for everyone to acknowledge.")
+                            .small()
+                            .weak(),
+                    );
 
                     egui::ScrollArea::vertical()
                         .max_height(180.0)
@@ -1218,13 +1247,22 @@ impl MessengerApp {
                                 ui.label(format!("{sender}: {} [{delivery}]", message.text));
                             }
                         });
-                    ui.add(
-                        TextEdit::singleline(&mut self.message_text)
-                            .hint_text("Type a message for the selected channel"),
-                    );
-                    if filled_button(ui, p, "Send (MLS encrypted)") {
+                    ui.add(TextEdit::singleline(&mut self.message_text).hint_text("Message"));
+                    let (send, attach) = ui
+                        .horizontal(|ui| {
+                            (
+                                filled_button(ui, p, "Send"),
+                                tonal_button(ui, p, "Attach file"),
+                            )
+                        })
+                        .inner;
+                    if send {
                         self.send_message();
                     }
+                    if attach {
+                        self.attach_file();
+                    }
+                    note(ui, p, file_picker_hint());
                 }
                 None => {
                     ui.label("Start or join an MLS conversation before sending messages.");
@@ -1234,7 +1272,7 @@ impl MessengerApp {
 
         ui.add_space(8.0);
         card(ui, p, |ui| {
-            card_title(ui, p, "Encrypted file transfer");
+            card_title(ui, p, "Files");
             if transfers.is_empty() {
                 ui.label("No file transfers in this session.");
             } else {
@@ -1325,16 +1363,16 @@ impl MessengerApp {
                 });
             }
             ui.add_space(8.0);
-            ui.label("Local file path for the active peer (maximum 64 MiB)");
-            ui.add(TextEdit::singleline(&mut self.file_path).hint_text("/path/to/file.txt"));
-            if filled_button(ui, p, "Send encrypted file") {
-                self.send_file();
-            }
-            note(
-                ui,
-                p,
-                "Incoming ciphertext is quarantined. Structural validation supports TXT, PNG, and GIF only; it is not malware detection. Integrity verification is not a scan, and scanning is unavailable without an independent scanner. Release requires a clean scanner result, a validated format, an allowed extension, and explicit per-file approval; released bytes are copied into the encrypted vault, never written as plaintext here. Quarantine ciphertext for a verified transfer is retained by default and is deleted only by an explicit request where policy permits; aborting an incomplete transfer removes its partial ciphertext. Active transfers have an inactivity timeout and can be aborted; release cancellation applies only after verification. Filesystem deletion is not secure erasure. This app configures no scanner or allowed extensions, so no release action appears by default.",
-            );
+            note(ui, p, file_send_summary());
+            egui::CollapsingHeader::new("File safety details")
+                .default_open(false)
+                .show(ui, |ui| {
+                    note(
+                        ui,
+                        p,
+                        "Incoming ciphertext is quarantined. Structural validation supports TXT, PNG, and GIF only; it is not malware detection. Integrity verification is not a scan, and scanning is unavailable without an independent scanner. Release requires a clean scanner result, a validated format, an allowed extension, and explicit per-file approval; released bytes are copied into the encrypted vault, never written as plaintext here. Quarantine ciphertext for a verified transfer is retained by default and is deleted only by an explicit request where policy permits; aborting an incomplete transfer removes its partial ciphertext. Active transfers have an inactivity timeout and can be aborted; release cancellation applies only after verification. Filesystem deletion is not secure erasure. This app configures no scanner or allowed extensions, so no release action appears by default.",
+                    );
+                });
         });
 
         ui.add_space(8.0);
@@ -1386,7 +1424,7 @@ impl MessengerApp {
             note(
                 ui,
                 p,
-                "Joined MLS group state is restored from encrypted vault storage when present; decrypted messages remain memory-only. Pending group operations, receipts, and offline queues are not restored. Receipts advance status only after verified MLS decryption; file chunks are encrypted and integrity-checked, but no malware scanner is configured.",
+                "Restored groups keep their encrypted state. Messages and setup secrets do not survive restart; no malware scanner is configured.",
             );
             ui.add_space(10.0);
             if tonal_button(ui, p, "Lock vault") {
@@ -1590,6 +1628,55 @@ impl eframe::App for MessengerApp {
 mod tests {
     use super::*;
 
+    fn app_without_chat(vault: Vault, receiver: mpsc::Receiver<VaultOutcome>) -> MessengerApp {
+        MessengerApp {
+            info: p2p_core::app_info(),
+            vault,
+            session: None,
+            state: VaultState::Locked,
+            receiver,
+            chat: None,
+            chat_error: None,
+            peer_address: String::new(),
+            contact_peer_id: String::new(),
+            member_peer_id: String::new(),
+            network_options: NetworkOptions::default(),
+            message_text: String::new(),
+            channel_name: String::new(),
+            username: String::new(),
+            password: String::new(),
+            confirm_password: String::new(),
+            form_error: None,
+            theme: Theme::Dark,
+        }
+    }
+
+    fn empty_app() -> (tempfile::TempDir, MessengerApp) {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let vault = Vault::open(directory.path()).expect("vault");
+        let (_sender, receiver) = mpsc::channel();
+        (directory, app_without_chat(vault, receiver))
+    }
+
+    #[test]
+    fn attach_helper_rejects_missing_files_without_network_work() {
+        let (_directory, mut app) = empty_app();
+        app.send_file_path(&PathBuf::from("does-not-exist"));
+        assert_eq!(app.chat_error.as_deref(), Some("Choose an existing file."));
+    }
+
+    #[test]
+    fn attach_helper_fails_closed_without_an_active_conversation() {
+        let (directory, mut app) = empty_app();
+        let path = directory.path().join("note.txt");
+        std::fs::write(&path, b"hello").expect("write local test file");
+        app.send_file_path(&path);
+        assert_eq!(
+            app.chat_error.as_deref(),
+            Some("No joined MLS conversation is active.")
+        );
+    }
+
     #[test]
     fn controller_start_failure_keeps_vault_failed() {
         let directory = tempfile::tempdir().expect("temp dir");
@@ -1616,7 +1703,6 @@ mod tests {
             network_options: NetworkOptions::default(),
             message_text: String::new(),
             channel_name: String::new(),
-            file_path: String::new(),
             username: String::new(),
             password: String::new(),
             confirm_password: String::new(),

@@ -24,8 +24,9 @@ pub use channel::{
     MAX_CHANNEL_NAME_BYTES, MAX_CHANNEL_TEXT_BYTES,
 };
 pub use controller::{
-    ChannelInfo, ChatMessage, ConversationInfo, ConversationStatus, DEFAULT_FILE_TRANSFER_TIMEOUT,
-    MAX_FILE_TRANSFER_TIMEOUT, MessageOrigin, MessengerController, RedialState,
+    ChannelGroupStatus, ChannelInfo, ChatMessage, ConversationInfo, ConversationStatus,
+    DEFAULT_FILE_TRANSFER_TIMEOUT, MAX_FILE_TRANSFER_TIMEOUT, MessageOrigin, MessengerController,
+    RedialState,
 };
 use libp2p::Multiaddr;
 pub use libp2p_identity::PeerId;
@@ -66,6 +67,8 @@ pub enum ChatError {
     FileTransferLimit,
     #[error("file transfer is not tracked for this peer")]
     FileTransferMissing,
+    #[error("offline queue is full; reconnect before sending more")]
+    OfflineQueueFull,
     #[error("no file transfer is currently active for this peer")]
     FileTransferNotActive,
     #[error("file transfer has not completed integrity verification")]
@@ -108,6 +111,8 @@ pub enum ChatError {
     ChannelLimit,
     #[error("peer is not allowed in this channel")]
     NotChannelMember,
+    #[error("channel MLS group is not ready")]
+    ChannelGroupNotReady,
     #[error("channel policy revision conflicts with local state")]
     ChannelRevisionConflict,
     #[error("no pending KeyPackage for this conversation")]

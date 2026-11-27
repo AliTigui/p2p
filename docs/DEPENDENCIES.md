@@ -107,7 +107,7 @@ The network layer does not add developer-operated bootstrap addresses, DHT defau
 
 ### Supply-chain tooling decision (Phase 0)
 
-Phase 0 adds no runtime Cargo dependency to the application. `deny.toml` is a policy file; `scripts/check_diagnostics.py` and `scripts/generate_sbom.py` use only the Python standard library. Fuzz harnesses live in a separate `fuzz/` workspace with its own `Cargo.lock` and `libfuzzer-sys` tool dependency, so they do not alter the native application graph. The SBOM generator reads `cargo metadata --locked` and emits SPDX 2.3 JSON; see `docs/SBOM.md` for scope and determinism details.
+Phase 0 adds no new external runtime Cargo dependency to the application. The later P1a security slice adds an internal `p2p-groups -> sha2` dependency edge for domain-separated channel identifier derivation; `sha2` was already workspace-pinned and used elsewhere. `deny.toml` is a policy file; `scripts/check_diagnostics.py` and `scripts/generate_sbom.py` use only the Python standard library. Fuzz harnesses live in a separate `fuzz/` workspace with its own `Cargo.lock` and `libfuzzer-sys` tool dependency, so they do not alter the native application graph. The SBOM generator reads `cargo metadata --locked` and emits SPDX 2.3 JSON; see `docs/SBOM.md` for scope and determinism details.
 
 ## Feature gates
 
