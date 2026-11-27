@@ -2037,6 +2037,17 @@ impl MessengerController {
         Ok(())
     }
 
+    /// Connect to a PeerId through the configured relay-only route. The user
+    /// supplies only a destination PeerId; the worker builds the circuit from
+    /// configured relays and rejects any direct fallback path.
+    pub fn connect_relayed(&mut self, peer: PeerId) -> Result<(), ChatError> {
+        let address = self.network.relayed_address(peer)?;
+        self.network.dial_relayed(peer)?;
+        self.dialed_addresses.insert(peer, address);
+        self.redial.insert(peer, RedialSlot::Dialing { attempt: 0 });
+        Ok(())
+    }
+
     /// Drop every live connection and suppress automatic redial until the user
     /// supplies a fresh explicit address.
     pub fn disconnect_all(&mut self) -> Result<(), ChatError> {

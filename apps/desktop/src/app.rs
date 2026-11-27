@@ -22,7 +22,7 @@ use p2p_chat::{
 };
 use p2p_core::AppInfo;
 use p2p_identity::Identity;
-use p2p_network::RelayMode;
+use p2p_network::{DialPolicy, RelayMode, TransportPrivacyMode};
 use p2p_storage::{Session, StorageError, Vault};
 #[cfg(feature = "native")]
 use rfd::FileDialog;
@@ -384,11 +384,21 @@ impl MessengerApp {
     }
 
     fn connect_peer(&mut self) {
-        let address = match parse_address(&self.peer_address) {
-            Ok(address) => address,
-            Err(error) => {
-                self.chat_error = Some(error.to_string());
-                return;
+        let relay_only = self.network_options.dial_policy == DialPolicy::RelayOnly;
+        let parsed_peer = if relay_only {
+            parse_peer_id(&self.peer_address).ok()
+        } else {
+            None
+        };
+        let address = if relay_only {
+            None
+        } else {
+            match parse_address(&self.peer_address) {
+                Ok(address) => Some(address),
+                Err(error) => {
+                    self.chat_error = Some(error.to_string());
+                    return;
+                }
             }
         };
         let Some(chat) = self.chat.as_mut() else {
@@ -397,7 +407,20 @@ impl MessengerApp {
         };
         self.chat_error = None;
         self.peer_address.clear();
-        if let Err(error) = chat.connect(address) {
+        let result = if relay_only {
+            match parsed_peer {
+                Some(peer) => chat.connect_relayed(peer),
+                None => {
+                    self.chat_error = Some("Enter a destination Peer ID".to_owned());
+                    return;
+                }
+            }
+        } else if let Some(address) = address {
+            chat.connect(address)
+        } else {
+            return;
+        };
+        if let Err(error) = result {
             self.chat_error = Some(error.to_string());
         }
     }
@@ -965,11 +988,23 @@ impl MessengerApp {
                 }
             }
             ui.add_space(8.0);
-            ui.label("Peer address (must include /p2p/<peer-id>)");
-            ui.add(
-                TextEdit::singleline(&mut self.peer_address)
-                    .hint_text("/ip4/127.0.0.1/tcp/4001/p2p/12D3…"),
-            );
+            if self.network_options.dial_policy == DialPolicy::RelayOnly {
+                ui.label("Destination Peer ID (relay-only route)");
+                ui.add(TextEdit::singleline(&mut self.peer_address).hint_text("12D3Koo…"));
+            } else {
+                ui.label("Peer address (must include /p2p/<peer-id>)");
+                ui.add(
+                    TextEdit::singleline(&mut self.peer_address)
+                        .hint_text("/ip4/127.0.0.1/tcp/4001/p2p/12D3…"),
+                );
+            }
+            if self.network_options.transport_mode == TransportPrivacyMode::TorRequired {
+                note(
+                    ui,
+                    p,
+                    "All dials use the configured SOCKS5 proxy; there is no direct listener or local DNS lookup.",
+                );
+            }
             let (connect, disconnect) = ui
                 .horizontal(|ui| {
                     (
@@ -1017,6 +1052,28 @@ impl MessengerApp {
                 .show(ui, |ui| {
                     note(ui, p, network_settings_details());
                     ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Transport route");
+                        egui::ComboBox::from_id_salt("p2p_messenger_transport_route")
+                            .selected_text(self.network_options.transport_mode.description())
+                            .show_ui(ui, |ui| {
+                                for (mode, label) in [
+                                    (TransportPrivacyMode::Direct, "Direct TCP"),
+                                    (TransportPrivacyMode::TorRequired, "SOCKS5/Tor required"),
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.network_options.transport_mode,
+                                        mode,
+                                        label,
+                                    );
+                                }
+                            });
+                    });
+                    ui.label("SOCKS5 proxy address (IP:port, e.g. 127.0.0.1:9050)");
+                    ui.add(
+                        TextEdit::singleline(&mut self.network_options.socks5_proxy)
+                            .hint_text("127.0.0.1:9050"),
+                    );
                     ui.checkbox(
                         &mut self.network_options.enable_identify,
                         "Identify (bounded protocol metadata)",
@@ -1025,22 +1082,50 @@ impl MessengerApp {
                         &mut self.network_options.enable_ping,
                         "Ping (low frequency)",
                     );
-                    ui.checkbox(
-                        &mut self.network_options.enable_mdns,
-                        "mDNS local discovery (advisory only)",
+                    ui.add_enabled(
+                        self.network_options.transport_mode != TransportPrivacyMode::TorRequired,
+                        egui::Checkbox::new(
+                            &mut self.network_options.enable_mdns,
+                            "mDNS local discovery (advisory only)",
+                        ),
                     );
                     ui.checkbox(
                         &mut self.network_options.enable_kad,
                         "Kademlia discovery (user-supplied bootstrap peers only)",
                     );
-                    ui.checkbox(
-                        &mut self.network_options.enable_autonat,
-                        "AutoNAT best-effort status probe",
+                    ui.add_enabled(
+                        self.network_options.transport_mode != TransportPrivacyMode::TorRequired,
+                        egui::Checkbox::new(
+                            &mut self.network_options.enable_autonat,
+                            "AutoNAT best-effort status probe",
+                        ),
                     );
-                    ui.checkbox(
-                        &mut self.network_options.enable_dcutr,
-                        "DCUtR hole punching when a relayed path exists",
+                    ui.add_enabled(
+                        self.network_options.dial_policy != DialPolicy::RelayOnly
+                            && self.network_options.transport_mode
+                                != TransportPrivacyMode::TorRequired,
+                        egui::Checkbox::new(
+                            &mut self.network_options.enable_dcutr,
+                            "DCUtR hole punching when a relayed path exists",
+                        ),
                     );
+                    ui.horizontal(|ui| {
+                        ui.label("Route policy");
+                        egui::ComboBox::from_id_salt("p2p_messenger_dial_policy")
+                            .selected_text(self.network_options.dial_policy.description())
+                            .show_ui(ui, |ui| {
+                                for (policy, label) in [
+                                    (DialPolicy::DirectAllowed, "Direct allowed"),
+                                    (DialPolicy::RelayOnly, "Relay only"),
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.network_options.dial_policy,
+                                        policy,
+                                        label,
+                                    );
+                                }
+                            });
+                    });
                     ui.horizontal(|ui| {
                         ui.label("Relay mode");
                         egui::ComboBox::from_id_salt("p2p_messenger_relay_mode")
@@ -1066,7 +1151,7 @@ impl MessengerApp {
                         &mut self.network_options.kad_bootstrap_peers,
                     ));
                     ui.label(
-                        "Relay server addresses (client mode only; direct addresses required)",
+                        "Relay server addresses (client mode and relay-only routes; direct addresses required)",
                     );
                     ui.add(TextEdit::multiline(&mut self.network_options.relay_servers));
                 });

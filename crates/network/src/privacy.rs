@@ -16,8 +16,9 @@ pub enum TransportPrivacyMode {
     /// anonymous; peers can observe addresses and timing.
     #[default]
     Direct,
-    /// A hidden route is required. No such transport is implemented here, so
-    /// startup fails closed instead of falling back to direct dialing.
+    /// A user-configured SOCKS5 proxy route is required, typically a local Tor
+    /// SOCKS5 service. No direct dial or listener is used. This does not verify
+    /// that the proxy is Tor or that traffic is anonymous.
     TorRequired,
 }
 
@@ -26,7 +27,33 @@ impl TransportPrivacyMode {
     pub fn description(self) -> &'static str {
         match self {
             Self::Direct => "Direct TCP + Noise (not anonymous)",
-            Self::TorRequired => "Tor required (unavailable; startup refused)",
+            Self::TorRequired => {
+                "SOCKS5/Tor route required (proxy not verified; no direct fallback)"
+            }
+        }
+    }
+}
+
+/// Which route classes the application may use for peer traffic.
+///
+/// This is a local policy, not an observation that a route was obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DialPolicy {
+    /// Direct dials are allowed when the user supplies a direct address.
+    #[default]
+    DirectAllowed,
+    /// Peer traffic must use a relayed path. Direct application dials and
+    /// direct inbound application connections are rejected. The configured
+    /// relay still observes source IP, destination PeerId, timing and sizes.
+    RelayOnly,
+}
+
+impl DialPolicy {
+    /// Honest user-facing description. It does not claim anonymity.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::DirectAllowed => "Direct allowed (not anonymous)",
+            Self::RelayOnly => "Relay only (relay sees IP and timing; not anonymous)",
         }
     }
 }
@@ -174,6 +201,10 @@ pub enum IdentifyEvent {
 pub struct NetworkPrivacyStatus {
     /// Requested mode, not an observed anonymity property.
     pub transport_mode: TransportPrivacyMode,
+    /// Whether a proxy address was configured, not whether the proxy works.
+    pub socks5_proxy_configured: bool,
+    /// Requested route policy, not an observed relayed path.
+    pub dial_policy: DialPolicy,
     pub identify_enabled: bool,
     pub ping_enabled: bool,
     pub mdns_enabled: bool,
@@ -205,6 +236,8 @@ impl Default for NetworkPrivacyStatus {
     fn default() -> Self {
         Self {
             transport_mode: TransportPrivacyMode::Direct,
+            socks5_proxy_configured: false,
+            dial_policy: DialPolicy::DirectAllowed,
             identify_enabled: false,
             ping_enabled: false,
             mdns_enabled: false,
@@ -263,7 +296,27 @@ mod tests {
         assert!(
             TransportPrivacyMode::TorRequired
                 .description()
-                .contains("startup refused")
+                .contains("no direct fallback")
+        );
+    }
+
+    #[test]
+    fn dial_policy_default_is_direct_without_anonymity_claim() {
+        assert_eq!(DialPolicy::default(), DialPolicy::DirectAllowed);
+        assert!(
+            DialPolicy::DirectAllowed
+                .description()
+                .contains("not anonymous")
+        );
+        assert!(
+            DialPolicy::RelayOnly
+                .description()
+                .contains("relay sees IP")
+        );
+        assert!(
+            DialPolicy::RelayOnly
+                .description()
+                .contains("not anonymous")
         );
     }
 
@@ -297,6 +350,8 @@ mod tests {
     fn nat_description_never_claims_connectivity() {
         let mut status = NetworkPrivacyStatus {
             transport_mode: TransportPrivacyMode::Direct,
+            socks5_proxy_configured: false,
+            dial_policy: DialPolicy::DirectAllowed,
             identify_enabled: false,
             ping_enabled: false,
             mdns_enabled: false,

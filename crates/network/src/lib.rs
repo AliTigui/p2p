@@ -14,7 +14,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,12 +45,13 @@ use tokio::sync::mpsc as tokio_mpsc;
 mod pending_admission;
 mod privacy;
 mod protocol;
+mod socks5;
 
 use pending_admission::PerIpPendingTransport;
 
 pub use privacy::{
-    DiscoveryEvent, DiscoverySource, IdentifyEvent, NatEvent, NetworkPrivacyStatus, RelayEvent,
-    RelayMode, TransportPrivacyMode,
+    DialPolicy, DiscoveryEvent, DiscoverySource, IdentifyEvent, NatEvent, NetworkPrivacyStatus,
+    RelayEvent, RelayMode, TransportPrivacyMode,
 };
 pub use protocol::{
     CONTROL_PROTOCOL, FILE_PROTOCOL, MAX_MESSAGE_BYTES, MESSAGE_PROTOCOL, MLS_SETUP_PROTOCOL,
@@ -847,9 +848,16 @@ pub struct NetworkConfig {
     /// Sliding window used by the per-peer request and byte limits.
     pub rate_window: Duration,
 
-    /// Requested transport privacy. `TorRequired` is deliberately unsupported
-    /// and is rejected by `validate_config`; direct fallback is never used.
+    /// Requested transport route. `TorRequired` means all dials go through the
+    /// configured SOCKS5 proxy; startup fails closed without one.
     pub transport_mode: TransportPrivacyMode,
+    /// IP literal and port of a local SOCKS5 proxy. Hostnames are rejected so
+    /// proxy selection cannot trigger a local DNS lookup.
+    pub socks5_proxy: Option<SocketAddr>,
+    /// Route classes allowed for application traffic. `RelayOnly` rejects
+    /// direct dials and direct inbound application connections; it is a local
+    /// policy, not proof that a relay path exists.
+    pub dial_policy: DialPolicy,
     /// Enable privacy-hardened libp2p identify. Disabled by default because it
     /// reveals a protocol list even when listen addresses are hidden.
     pub enable_identify: bool,
@@ -894,6 +902,8 @@ impl Default for NetworkConfig {
             max_request_bytes_per_peer_per_window: 16 * MAX_MESSAGE_BYTES,
             rate_window: Duration::from_secs(1),
             transport_mode: TransportPrivacyMode::Direct,
+            socks5_proxy: None,
+            dial_policy: DialPolicy::DirectAllowed,
             enable_identify: false,
             enable_ping: false,
             enable_mdns: false,
@@ -972,6 +982,8 @@ pub struct Network {
     identify_events: tokio_mpsc::Receiver<IdentifyEvent>,
     state: ConnectionState,
     privacy_status: NetworkPrivacyStatus,
+    dial_policy: DialPolicy,
+    relay_servers: Vec<Multiaddr>,
     pending_addresses: HashMap<Multiaddr, PeerId>,
     next_request_id: AtomicU64,
     next_setup_request_id: AtomicU64,
@@ -999,6 +1011,8 @@ impl Network {
     pub fn start(identity: &Identity, config: NetworkConfig) -> Result<Self, NetworkError> {
         validate_config(&config)?;
         let privacy_status = privacy_status_from_config(&config);
+        let dial_policy = config.dial_policy;
+        let relay_servers = config.relay_servers.clone();
         // libp2p 0.56 uses an older `libp2p-identity` than the identity crate.
         // The protobuf keypair encoding is a stable, version-independent
         // boundary; importing it preserves the exact vault PeerId.
@@ -1054,6 +1068,8 @@ impl Network {
                 identify_events: identify_event_rx,
                 state: ConnectionState::Unknown,
                 privacy_status,
+                dial_policy,
+                relay_servers,
                 pending_addresses: HashMap::new(),
                 next_request_id: AtomicU64::new(1),
                 next_setup_request_id: AtomicU64::new(1),
@@ -1078,13 +1094,55 @@ impl Network {
     /// Queue a dial to a user-supplied address with a known PeerId. An address
     /// already awaiting a dial, connection, or failure is rejected so repeated
     /// button presses or retry loops cannot stack duplicate dials.
+    ///
+    /// Under `DialPolicy::DirectAllowed` this accepts only direct addresses.
+    /// Under `DialPolicy::RelayOnly` it accepts only circuit addresses built
+    /// from a configured relay; direct application dials fail closed.
     pub fn dial(&mut self, address: Multiaddr) -> Result<(), NetworkError> {
-        // Validate before touching the command queue or pending dial map, so
-        // even direct public API callers cannot queue a relay address.
-        validate_direct_peer_address(&address)?;
-        let expected = peer_from_address(&address).ok_or_else(|| {
-            NetworkError::InvalidAddress("address has no /p2p/<peer-id>".to_owned())
+        let expected = match self.dial_policy {
+            DialPolicy::DirectAllowed => {
+                validate_direct_peer_address(&address)?;
+                peer_from_address(&address).ok_or_else(|| {
+                    NetworkError::InvalidAddress("address has no /p2p/<peer-id>".to_owned())
+                })?
+            }
+            DialPolicy::RelayOnly => {
+                if !address
+                    .iter()
+                    .any(|protocol| matches!(protocol, Protocol::P2pCircuit))
+                {
+                    return Err(NetworkError::InvalidConfig(
+                        "relay-only policy rejects direct dials".to_owned(),
+                    ));
+                }
+                validate_relayed_peer_address(&address, &self.relay_servers)?
+            }
+        };
+        self.queue_dial(address, expected)
+    }
+
+    /// Address used to reach a PeerId through the first configured relay. This
+    /// never proves the destination is reachable or that a relay is online.
+    pub fn relayed_address(&self, peer: PeerId) -> Result<Multiaddr, NetworkError> {
+        if self.dial_policy != DialPolicy::RelayOnly {
+            return Err(NetworkError::InvalidConfig(
+                "relayed addresses require relay-only policy".to_owned(),
+            ));
+        }
+        let relay = self.relay_servers.first().ok_or_else(|| {
+            NetworkError::InvalidConfig("relay-only policy requires a configured relay".to_owned())
         })?;
+        Ok(relayed_peer_address(relay, peer))
+    }
+
+    /// Queue a dial through a configured relay to a destination PeerId. This
+    /// avoids asking the user to hand-assemble a circuit multiaddr.
+    pub fn dial_relayed(&mut self, peer: PeerId) -> Result<(), NetworkError> {
+        let address = self.relayed_address(peer)?;
+        self.queue_dial(address, peer)
+    }
+
+    fn queue_dial(&mut self, address: Multiaddr, expected: PeerId) -> Result<(), NetworkError> {
         if self
             .pending_addresses
             .insert(address.clone(), expected)
@@ -1448,9 +1506,74 @@ fn validate_direct_peer_address(address: &Multiaddr) -> Result<(), NetworkError>
     Ok(())
 }
 
+/// Split a libp2p circuit address into its configured relay prefix and the
+/// destination PeerId after `/p2p-circuit`. Exactly one circuit marker and one
+/// destination component are accepted; anything else fails closed.
+fn relay_circuit_parts(address: &Multiaddr) -> Result<(Multiaddr, PeerId), NetworkError> {
+    let protocols: Vec<_> = address.iter().collect();
+    let circuit_positions: Vec<_> = protocols
+        .iter()
+        .enumerate()
+        .filter_map(|(index, protocol)| matches!(protocol, Protocol::P2pCircuit).then_some(index))
+        .collect();
+    if circuit_positions.len() != 1 {
+        return Err(NetworkError::InvalidAddress(
+            "circuit address must contain exactly one /p2p-circuit".to_owned(),
+        ));
+    }
+    let circuit_index = circuit_positions[0];
+    let mut relay = Multiaddr::empty();
+    for protocol in &protocols[..circuit_index] {
+        relay.push(protocol.clone());
+    }
+    validate_direct_peer_address(&relay)?;
+    let destination = &protocols[circuit_index + 1..];
+    match destination {
+        [Protocol::P2p(peer)] => Ok((relay, *peer)),
+        _ => Err(NetworkError::InvalidAddress(
+            "circuit address must end in exactly one destination /p2p/<peer-id>".to_owned(),
+        )),
+    }
+}
+
+/// Validate a relayed dial address against the relays the user configured.
+fn validate_relayed_peer_address(
+    address: &Multiaddr,
+    relay_servers: &[Multiaddr],
+) -> Result<PeerId, NetworkError> {
+    let (relay, destination) = relay_circuit_parts(address)?;
+    if !relay_servers.iter().any(|configured| configured == &relay) {
+        return Err(NetworkError::InvalidAddress(
+            "circuit relay is not in the configured relay address list".to_owned(),
+        ));
+    }
+    Ok(destination)
+}
+
+/// Build `relay + /p2p-circuit + destination` for a configured relay.
+fn relayed_peer_address(relay: &Multiaddr, destination: PeerId) -> Multiaddr {
+    let mut address = relay.clone();
+    address.push(Protocol::P2pCircuit);
+    address.push(Protocol::P2p(destination));
+    address
+}
+
+fn application_route_allowed(
+    peer: PeerId,
+    relayed_peers: &HashMap<PeerId, usize>,
+    policy: DialPolicy,
+) -> bool {
+    match policy {
+        DialPolicy::DirectAllowed => true,
+        DialPolicy::RelayOnly => relayed_peers.get(&peer).copied().unwrap_or(0) > 0,
+    }
+}
+
 fn privacy_status_from_config(config: &NetworkConfig) -> NetworkPrivacyStatus {
     NetworkPrivacyStatus {
         transport_mode: config.transport_mode,
+        socks5_proxy_configured: config.socks5_proxy.is_some(),
+        dial_policy: config.dial_policy,
         identify_enabled: config.enable_identify,
         ping_enabled: config.enable_ping,
         mdns_enabled: config.enable_mdns,
@@ -1472,8 +1595,20 @@ fn privacy_status_from_config(config: &NetworkConfig) -> NetworkPrivacyStatus {
 
 fn validate_config(config: &NetworkConfig) -> Result<(), NetworkError> {
     if config.transport_mode == TransportPrivacyMode::TorRequired {
+        if config.socks5_proxy.is_none() {
+            return Err(NetworkError::InvalidConfig(
+                "SOCKS5/Tor route requires a user-supplied proxy address; direct fallback is disabled"
+                    .to_owned(),
+            ));
+        }
+        if config.enable_mdns || config.enable_autonat || config.enable_dcutr {
+            return Err(NetworkError::InvalidConfig(
+                "SOCKS5/Tor route disables mDNS, AutoNAT and DCUtR".to_owned(),
+            ));
+        }
+    } else if config.socks5_proxy.is_some() {
         return Err(NetworkError::InvalidConfig(
-            "Tor-required transport is unavailable; direct fallback is disabled".to_owned(),
+            "SOCKS5 proxy address requires SOCKS5/Tor route mode".to_owned(),
         ));
     }
     if config.max_total_connections == 0
@@ -1505,6 +1640,18 @@ fn validate_config(config: &NetworkConfig) -> Result<(), NetworkError> {
         return Err(NetworkError::InvalidAddress(
             "relay-client mode requires at least one allowed relayed connection".to_owned(),
         ));
+    }
+    if config.dial_policy == DialPolicy::RelayOnly {
+        if config.relay_mode != RelayMode::Client {
+            return Err(NetworkError::InvalidConfig(
+                "relay-only routing requires relay-client mode".to_owned(),
+            ));
+        }
+        if config.enable_dcutr {
+            return Err(NetworkError::InvalidConfig(
+                "relay-only routing disables DCUtR hole punching".to_owned(),
+            ));
+        }
     }
     for address in &config.kad_bootstrap_peers {
         validate_direct_peer_address(address)?;
@@ -1569,7 +1716,13 @@ fn run_worker(
             }
         };
 
-        if let Err(error) = swarm.listen_on(config.listen_addr.clone()) {
+        // Neither relay-only nor SOCKS5/Tor route mode advertises a direct TCP
+        // listener. Relay clients still create circuit listeners below, and
+        // those reservation dials use the selected transport.
+        if config.transport_mode != TransportPrivacyMode::TorRequired
+            && config.dial_policy != DialPolicy::RelayOnly
+            && let Err(error) = swarm.listen_on(config.listen_addr.clone())
+        {
             let _ = startup.send(Startup::Error(error.to_string()));
             return;
         }
@@ -1605,17 +1758,24 @@ fn run_worker(
                 let mut circuit_address = address.clone();
                 circuit_address.push(Protocol::P2pCircuit);
                 if let Err(error) = swarm.listen_on(circuit_address) {
-                    let _ = error;
                     emit_relay(
                         &relay_events,
                         RelayEvent::Failed {
-                            reason: "relay reservation could not start".to_owned(),
+                            reason: format!(
+                                "relay reservation could not start: {}",
+                                truncate_reason(&error.to_string())
+                            ),
                         },
                     );
                 }
             }
         }
 
+        let relay_peers: BTreeSet<PeerId> = config
+            .relay_servers
+            .iter()
+            .filter_map(peer_from_address)
+            .collect();
         let limits = ConnectionLimits::from_config(&config);
         let mut rate_limiter = RateLimiter::new(&config);
         let mut addresses = Vec::new();
@@ -1673,6 +1833,22 @@ fn run_worker(
                     let Some(event) = event else { break };
                     match event {
                         SwarmEvent::NewListenAddr { address, .. } => {
+                            // libp2p only puts confirmed external addresses in
+                            // relay reservations. An explicitly configured
+                            // relay server confirms each concrete local listen
+                            // address so clients receive a dialable relay
+                            // address without AutoNAT or a public discovery
+                            // service. Wildcard/unspecified addresses are not
+                            // dialable and are not advertised.
+                            if config.relay_mode == RelayMode::Server
+                                && !address.iter().any(|protocol| match protocol {
+                                    Protocol::Ip4(ip) => ip.is_unspecified(),
+                                    Protocol::Ip6(ip) => ip.is_unspecified(),
+                                    _ => false,
+                                })
+                            {
+                                swarm.add_external_address(address.clone());
+                            }
                             if !addresses.contains(&address) {
                                 addresses.push(address);
                             }
@@ -1698,6 +1874,23 @@ fn run_worker(
                             let ip_count = remote_ip
                                 .map(|key| ip_connections.get(&key).copied().unwrap_or(0) + 1);
                             let relayed = endpoint.is_relayed();
+                            // Relay-only accepts direct TCP only to configured
+                            // relays for reservation signalling. Every other
+                            // direct connection is closed before application
+                            // protocols can observe or send traffic.
+                            if config.dial_policy == DialPolicy::RelayOnly
+                                && !relayed
+                                && !relay_peers.contains(&peer_id)
+                            {
+                                rejected_connections.insert(connection_id);
+                                let _ = swarm.close_connection(connection_id);
+                                emit(&events, ConnectionState::Failed {
+                                    peer: Some(peer_id),
+                                    reason: "relay-only policy rejected a direct connection"
+                                        .to_owned(),
+                                });
+                                continue;
+                            }
                             if (relayed && relayed_connections.len() >= config.max_relayed_connections)
                                 || limits.exceeded(total_connections + 1, peer_count, ip_count)
                             {
@@ -1795,13 +1988,15 @@ fn run_worker(
                             });
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Messages(event)) => {
-                            if let Some((peer, bytes)) = denied_request(&event)
-                                && !rate_limiter.allow(
-                                    peer,
-                                    RequestProtocol::Message,
-                                    bytes,
-                                    Instant::now(),
-                                )
+                            if let Some((peer, bytes, route_denied)) =
+                                denied_request(&event, config.dial_policy, &relayed_peers)
+                                && (route_denied
+                                    || !rate_limiter.allow(
+                                        peer,
+                                        RequestProtocol::Message,
+                                        bytes,
+                                        Instant::now(),
+                                    ))
                             {
                                 let raw = next_response_id;
                                 next_response_id = next_response_id.checked_add(1).unwrap_or(1);
@@ -1809,7 +2004,12 @@ fn run_worker(
                                     request_id: None,
                                     response_id: Some(MessageResponseId(raw)),
                                     peer,
-                                    reason: "peer request rate limit exceeded".to_owned(),
+                                    reason: if route_denied {
+                                        "relay-only policy rejected a direct application request"
+                                            .to_owned()
+                                    } else {
+                                        "peer request rate limit exceeded".to_owned()
+                                    },
                                 });
                                 continue;
                             }
@@ -1824,13 +2024,15 @@ fn run_worker(
                             );
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Setup(event)) => {
-                            if let Some((peer, bytes)) = denied_request(&event)
-                                && !rate_limiter.allow(
-                                    peer,
-                                    RequestProtocol::Setup,
-                                    bytes,
-                                    Instant::now(),
-                                )
+                            if let Some((peer, bytes, route_denied)) =
+                                denied_request(&event, config.dial_policy, &relayed_peers)
+                                && (route_denied
+                                    || !rate_limiter.allow(
+                                        peer,
+                                        RequestProtocol::Setup,
+                                        bytes,
+                                        Instant::now(),
+                                    ))
                             {
                                 let raw = next_setup_response_id;
                                 next_setup_response_id =
@@ -1839,7 +2041,12 @@ fn run_worker(
                                     request_id: None,
                                     response_id: Some(SetupResponseId(raw)),
                                     peer,
-                                    reason: "peer request rate limit exceeded".to_owned(),
+                                    reason: if route_denied {
+                                        "relay-only policy rejected a direct application request"
+                                            .to_owned()
+                                    } else {
+                                        "peer request rate limit exceeded".to_owned()
+                                    },
                                 });
                                 continue;
                             }
@@ -1854,13 +2061,15 @@ fn run_worker(
                             );
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Files(event)) => {
-                            if let Some((peer, bytes)) = denied_request(&event)
-                                && !rate_limiter.allow(
-                                    peer,
-                                    RequestProtocol::File,
-                                    bytes,
-                                    Instant::now(),
-                                )
+                            if let Some((peer, bytes, route_denied)) =
+                                denied_request(&event, config.dial_policy, &relayed_peers)
+                                && (route_denied
+                                    || !rate_limiter.allow(
+                                        peer,
+                                        RequestProtocol::File,
+                                        bytes,
+                                        Instant::now(),
+                                    ))
                             {
                                 let raw = next_file_response_id;
                                 next_file_response_id =
@@ -1869,7 +2078,12 @@ fn run_worker(
                                     request_id: None,
                                     response_id: Some(FileResponseId(raw)),
                                     peer,
-                                    reason: "peer request rate limit exceeded".to_owned(),
+                                    reason: if route_denied {
+                                        "relay-only policy rejected a direct application request"
+                                            .to_owned()
+                                    } else {
+                                        "peer request rate limit exceeded".to_owned()
+                                    },
                                 });
                                 continue;
                             }
@@ -1885,13 +2099,15 @@ fn run_worker(
                             );
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Control(event)) => {
-                            if let Some((peer, bytes)) = denied_request(&event)
-                                && !rate_limiter.allow(
-                                    peer,
-                                    RequestProtocol::Control,
-                                    bytes,
-                                    Instant::now(),
-                                )
+                            if let Some((peer, bytes, route_denied)) =
+                                denied_request(&event, config.dial_policy, &relayed_peers)
+                                && (route_denied
+                                    || !rate_limiter.allow(
+                                        peer,
+                                        RequestProtocol::Control,
+                                        bytes,
+                                        Instant::now(),
+                                    ))
                             {
                                 let raw = next_control_response_id;
                                 next_control_response_id =
@@ -1900,7 +2116,12 @@ fn run_worker(
                                     request_id: None,
                                     response_id: Some(ControlResponseId(raw)),
                                     peer,
-                                    reason: "peer request rate limit exceeded".to_owned(),
+                                    reason: if route_denied {
+                                        "relay-only policy rejected a direct application request"
+                                            .to_owned()
+                                    } else {
+                                        "peer request rate limit exceeded".to_owned()
+                                    },
                                 });
                                 continue;
                             }
@@ -1999,10 +2220,34 @@ fn run_worker(
                         SwarmEvent::Behaviour(BehaviourEvent::RelayClient(event)) => match event {
                             relay::client::Event::ReservationReqAccepted {
                                 relay_peer_id, ..
-                            } => emit_relay(
-                                &relay_events,
-                                RelayEvent::ReservationAccepted { relay: relay_peer_id },
-                            ),
+                            } => {
+                                emit_relay(
+                                    &relay_events,
+                                    RelayEvent::ReservationAccepted { relay: relay_peer_id },
+                                );
+                                // A circuit listener only exists after the relay
+                                // confirms the reservation. Advertise that
+                                // address as observed state; never replace it
+                                // with a direct listener under relay-only mode.
+                                if let Some(relay_address) = config
+                                    .relay_servers
+                                    .iter()
+                                    .find(|address| peer_from_address(address) == Some(relay_peer_id))
+                                {
+                                    let mut circuit_address = relay_address.clone();
+                                    circuit_address.push(Protocol::P2pCircuit);
+                                    circuit_address.push(Protocol::P2p(*swarm.local_peer_id()));
+                                    if !addresses.contains(&circuit_address) {
+                                        addresses.push(circuit_address);
+                                        emit(
+                                            &events,
+                                            ConnectionState::Listening {
+                                                addresses: addresses.clone(),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
                             relay::client::Event::OutboundCircuitEstablished {
                                 relay_peer_id, ..
                             } => emit_relay(
@@ -2090,6 +2335,15 @@ fn run_worker(
                                 });
                                 continue;
                             }
+                            if !application_route_allowed(peer, &relayed_peers, config.dial_policy) {
+                                emit_message(&message_events, MessageEvent::Failed {
+                                    request_id: Some(id),
+                                    response_id: None,
+                                    peer,
+                                    reason: "relay-only policy requires a relayed path".to_owned(),
+                                });
+                                continue;
+                            }
                             let swarm_id =
                                 swarm.behaviour_mut().messages.send_request(&peer, bytes);
                             outbound_ids.insert(id, swarm_id);
@@ -2137,6 +2391,15 @@ fn run_worker(
                                 });
                                 continue;
                             }
+                            if !application_route_allowed(peer, &relayed_peers, config.dial_policy) {
+                                emit_setup(&setup_events, SetupEvent::Failed {
+                                    request_id: Some(id),
+                                    response_id: None,
+                                    peer,
+                                    reason: "relay-only policy requires a relayed path".to_owned(),
+                                });
+                                continue;
+                            }
                             let swarm_id =
                                 swarm.behaviour_mut().setup.send_request(&peer, bytes);
                             setup_outbound_ids.insert(id, swarm_id);
@@ -2181,6 +2444,15 @@ fn run_worker(
                                     response_id: None,
                                     peer,
                                     reason: "peer is not connected".to_owned(),
+                                });
+                                continue;
+                            }
+                            if !application_route_allowed(peer, &relayed_peers, config.dial_policy) {
+                                emit_file(&file_events, FileEvent::Failed {
+                                    request_id: Some(id),
+                                    response_id: None,
+                                    peer,
+                                    reason: "relay-only policy requires a relayed path".to_owned(),
                                 });
                                 continue;
                             }
@@ -2246,6 +2518,15 @@ fn run_worker(
                                     response_id: None,
                                     peer,
                                     reason: "peer is not connected".to_owned(),
+                                });
+                                continue;
+                            }
+                            if !application_route_allowed(peer, &relayed_peers, config.dial_policy) {
+                                emit_control(&control_events, ControlEvent::Failed {
+                                    request_id: Some(id),
+                                    response_id: None,
+                                    peer,
+                                    reason: "relay-only policy requires a relayed path".to_owned(),
                                 });
                                 continue;
                             }
@@ -2362,7 +2643,7 @@ fn build_swarm(
             .with_agent_version("p2p-messenger".to_owned())
             .with_interval(Duration::from_secs(60 * 60))
             .with_push_listen_addr_updates(false)
-            .with_hide_listen_addrs(true)
+            .with_hide_listen_addrs(config.relay_mode != RelayMode::Server)
     });
     let ping_config = ping::Config::default()
         .with_interval(Duration::from_secs(60))
@@ -2372,19 +2653,39 @@ fn build_swarm(
     // transport emits an inbound connection. Wrap the upgraded TCP transport
     // so a single source IP cannot occupy the whole pre-authentication budget
     // with stalled sockets before Noise authentication.
-    let noise = libp2p::noise::Config::new(keypair).map_err(|error| error.to_string())?;
+    let noise_direct = libp2p::noise::Config::new(keypair).map_err(|error| error.to_string())?;
     let direct_transport = PerIpPendingTransport::new(
         libp2p::tcp::tokio::Transport::new(Default::default())
             .upgrade(libp2p::core::upgrade::Version::V1Lazy)
-            .authenticate(noise)
+            .authenticate(noise_direct)
             .multiplex(libp2p::yamux::Config::default())
             .map(|(peer, connection), _| (peer, StreamMuxerBox::new(connection))),
         config.max_connections_per_ip,
-    );
+    )
+    .boxed();
+
+    let transport: libp2p::core::transport::Boxed<(PeerId, StreamMuxerBox)> =
+        if config.transport_mode == TransportPrivacyMode::TorRequired {
+            // Fail closed on a missing proxy in `validate_config`; never build
+            // a direct TCP fallback transport in SOCKS5/Tor route mode.
+            let proxy = config
+                .socks5_proxy
+                .ok_or_else(|| "SOCKS5/Tor route requires a proxy address".to_owned())?;
+            let noise_proxy =
+                libp2p::noise::Config::new(keypair).map_err(|error| error.to_string())?;
+            socks5::Socks5OnlyTransport::new(proxy)
+                .upgrade(libp2p::core::upgrade::Version::V1Lazy)
+                .authenticate(noise_proxy)
+                .multiplex(libp2p::yamux::Config::default())
+                .map(|(peer, connection), _| (peer, StreamMuxerBox::new(connection)))
+                .boxed()
+        } else {
+            direct_transport
+        };
 
     let swarm = SwarmBuilder::with_existing_identity(keypair.clone())
         .with_tokio()
-        .with_other_transport(move |_| direct_transport)
+        .with_other_transport(move |_| transport)
         // `with_other_transport` is infallible for a ready-made transport.
         // Matching `Infallible` avoids an unreachable `Display` call that
         // newer Clippy versions reject under `-D warnings`.
@@ -2440,7 +2741,18 @@ fn build_swarm(
                 .then_some(relay_client)
                 .into(),
             relay_server: (config.relay_mode == RelayMode::Server)
-                .then(|| relay::Behaviour::new(key.public().to_peer_id(), relay_config))
+                .then(|| {
+                    let mut behaviour =
+                        relay::Behaviour::new(key.public().to_peer_id(), relay_config);
+                    // A user who explicitly enables RelayMode::Server is asking
+                    // this node to relay. libp2p's automatic status keeps the
+                    // HOP protocol disabled until it observes a confirmed
+                    // external address, which prevents a local/on-LAN relay
+                    // from accepting reservations at all. Explicit opt-in is
+                    // enough here; the capability remains off by default.
+                    behaviour.set_status(Some(relay::Status::Enable));
+                    behaviour
+                })
                 .into(),
             autonat: config
                 .enable_autonat
@@ -2898,13 +3210,24 @@ fn inbound_failure_reason(error: &request_response::InboundFailure) -> &'static 
     }
 }
 
-fn denied_request(event: &request_response::Event<Vec<u8>, Vec<u8>>) -> Option<(PeerId, usize)> {
+/// Inbound application request denied by the selected route policy. The
+/// boolean marks a relay-only policy rejection; rate-limit rejection is decided
+/// separately by the caller.
+fn denied_request(
+    event: &request_response::Event<Vec<u8>, Vec<u8>>,
+    policy: DialPolicy,
+    relayed_peers: &HashMap<PeerId, usize>,
+) -> Option<(PeerId, usize, bool)> {
     match event {
         request_response::Event::Message {
             peer,
             message: request_response::Message::Request { request, .. },
             ..
-        } => Some((*peer, request.len())),
+        } => Some((
+            *peer,
+            request.len(),
+            !application_route_allowed(*peer, relayed_peers, policy),
+        )),
         _ => None,
     }
 }
@@ -3010,6 +3333,7 @@ mod tests {
         assert!(!config.enable_dcutr);
         assert!(config.kad_bootstrap_peers.is_empty());
         assert!(config.relay_servers.is_empty());
+        assert!(config.socks5_proxy.is_none());
         assert_eq!(config.relay_mode, RelayMode::Off);
         assert_eq!(config.max_relayed_connections, 4);
     }
@@ -3151,6 +3475,175 @@ mod tests {
             })
             .is_ok()
         );
+    }
+
+    #[test]
+    fn socks5_route_requires_a_proxy_and_disables_direct_discovery() {
+        let proxy = "127.0.0.1:9050".parse().expect("proxy address");
+        let base = NetworkConfig {
+            transport_mode: TransportPrivacyMode::TorRequired,
+            socks5_proxy: Some(proxy),
+            ..NetworkConfig::default()
+        };
+        assert!(validate_config(&base).is_ok());
+        assert!(
+            privacy_status_from_config(&base).socks5_proxy_configured,
+            "configured proxy must be reported without claiming it works"
+        );
+        assert!(matches!(
+            validate_config(&NetworkConfig {
+                enable_mdns: true,
+                ..base.clone()
+            }),
+            Err(NetworkError::InvalidConfig(reason))
+                if reason.contains("mDNS")
+        ));
+        assert!(matches!(
+            validate_config(&NetworkConfig {
+                enable_autonat: true,
+                ..base.clone()
+            }),
+            Err(NetworkError::InvalidConfig(reason))
+                if reason.contains("AutoNAT")
+        ));
+        assert!(matches!(
+            validate_config(&NetworkConfig {
+                transport_mode: TransportPrivacyMode::Direct,
+                ..base
+            }),
+            Err(NetworkError::InvalidConfig(reason))
+                if reason.contains("requires SOCKS5/Tor route mode")
+        ));
+    }
+
+    fn relay_only_config(relay: Multiaddr) -> NetworkConfig {
+        NetworkConfig {
+            dial_policy: DialPolicy::RelayOnly,
+            relay_mode: RelayMode::Client,
+            relay_servers: vec![relay],
+            ..NetworkConfig::default()
+        }
+    }
+
+    #[test]
+    fn relay_only_config_fails_closed_on_conflicting_policy() {
+        let peer = generated_peer_id();
+        let relay =
+            Multiaddr::from_str(&format!("/ip4/127.0.0.1/tcp/4001/p2p/{peer}")).expect("relay");
+
+        assert!(validate_config(&relay_only_config(relay.clone())).is_ok());
+        assert!(matches!(
+            validate_config(&NetworkConfig {
+                dial_policy: DialPolicy::RelayOnly,
+                relay_mode: RelayMode::Off,
+                relay_servers: vec![relay.clone()],
+                ..NetworkConfig::default()
+            }),
+            Err(NetworkError::InvalidConfig(reason))
+                if reason.contains("relay-client mode")
+        ));
+        assert!(matches!(
+            validate_config(&NetworkConfig {
+                enable_dcutr: true,
+                ..relay_only_config(relay)
+            }),
+            Err(NetworkError::InvalidConfig(reason))
+                if reason.contains("DCUtR")
+        ));
+    }
+
+    #[test]
+    fn circuit_address_validation_rejects_unconfigured_or_malformed_paths() {
+        let relay_peer = generated_peer_id();
+        let destination = generated_peer_id();
+        let relay = Multiaddr::from_str(&format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_peer}"))
+            .expect("relay address");
+        let circuit = relayed_peer_address(&relay, destination);
+        assert_eq!(
+            validate_relayed_peer_address(&circuit, std::slice::from_ref(&relay))
+                .expect("destination"),
+            destination
+        );
+
+        let other_relay = Multiaddr::from_str(&format!(
+            "/ip4/127.0.0.1/tcp/4002/p2p/{}",
+            generated_peer_id()
+        ))
+        .expect("other relay");
+        assert!(validate_relayed_peer_address(&circuit, &[other_relay]).is_err());
+
+        let mut doubled = circuit.clone();
+        doubled.push(Protocol::P2pCircuit);
+        doubled.push(Protocol::P2p(destination));
+        assert!(validate_relayed_peer_address(&doubled, std::slice::from_ref(&relay)).is_err());
+
+        let mut extra_suffix = circuit.clone();
+        extra_suffix.push(Protocol::P2p(generated_peer_id()));
+        assert!(
+            validate_relayed_peer_address(&extra_suffix, std::slice::from_ref(&relay)).is_err()
+        );
+
+        let mut destination_missing = relay.clone();
+        destination_missing.push(Protocol::P2pCircuit);
+        assert!(validate_relayed_peer_address(&destination_missing, &[relay]).is_err());
+    }
+
+    #[test]
+    fn relay_only_dial_rejects_direct_paths_and_queues_configured_circuits() {
+        let relay_peer = generated_peer_id();
+        let destination = generated_peer_id();
+        let relay = Multiaddr::from_str(&format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_peer}"))
+            .expect("relay address");
+        let (mut network, _events, mut commands) = network_with_test_channels();
+        network.dial_policy = DialPolicy::RelayOnly;
+        network.relay_servers = vec![relay.clone()];
+
+        let direct = Multiaddr::from_str(&format!("/ip4/127.0.0.1/tcp/4002/p2p/{destination}"))
+            .expect("direct destination");
+        assert!(matches!(
+            network.dial(direct),
+            Err(NetworkError::InvalidConfig(reason))
+                if reason.contains("rejects direct dials")
+        ));
+        assert!(network.pending_addresses.is_empty());
+        assert!(matches!(
+            commands.try_recv(),
+            Err(tokio_mpsc::error::TryRecvError::Empty)
+        ));
+
+        network
+            .dial_relayed(destination)
+            .expect("relayed dial queued");
+        assert_eq!(network.pending_addresses.len(), 1);
+        match commands.try_recv() {
+            Ok(Command::Dial { address, expected }) => {
+                assert_eq!(expected, destination);
+                assert_eq!(address, relayed_peer_address(&relay, destination));
+            }
+            _ => panic!("expected a queued relayed dial"),
+        }
+    }
+
+    #[test]
+    fn application_route_requires_observed_relay_under_relay_only_policy() {
+        let peer = generated_peer_id();
+        let empty = HashMap::new();
+        let relayed = HashMap::from([(peer, 1usize)]);
+        assert!(application_route_allowed(
+            peer,
+            &empty,
+            DialPolicy::DirectAllowed
+        ));
+        assert!(!application_route_allowed(
+            peer,
+            &empty,
+            DialPolicy::RelayOnly
+        ));
+        assert!(application_route_allowed(
+            peer,
+            &relayed,
+            DialPolicy::RelayOnly
+        ));
     }
 
     #[test]
@@ -3401,6 +3894,8 @@ mod tests {
             identify_events: identify_rx,
             state: ConnectionState::Unknown,
             privacy_status: NetworkPrivacyStatus::default(),
+            dial_policy: DialPolicy::DirectAllowed,
+            relay_servers: Vec::new(),
             pending_addresses: HashMap::new(),
             next_request_id: AtomicU64::new(1),
             next_setup_request_id: AtomicU64::new(1),

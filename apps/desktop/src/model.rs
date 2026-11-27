@@ -1,9 +1,14 @@
 //! UI state and pure helpers. This module has no GUI-toolkit dependency so it
 //! can be unit-tested on any host, including machines without display libraries.
 
+use std::net::SocketAddr;
+use std::str::FromStr;
+
 use p2p_chat::{ChannelGroupStatus, ConversationInfo, parse_address};
 use p2p_core::AppInfo;
-use p2p_network::{NetworkConfig, NetworkPrivacyStatus, RelayMode, TransportPrivacyMode};
+use p2p_network::{
+    DialPolicy, NetworkConfig, NetworkPrivacyStatus, RelayMode, TransportPrivacyMode,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Theme {
@@ -60,11 +65,14 @@ pub enum VaultState {
 /// default. These are local configuration values, not observed capabilities.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkOptions {
+    pub transport_mode: TransportPrivacyMode,
+    pub socks5_proxy: String,
     pub enable_identify: bool,
     pub enable_ping: bool,
     pub enable_mdns: bool,
     pub enable_kad: bool,
     pub kad_bootstrap_peers: String,
+    pub dial_policy: DialPolicy,
     pub relay_mode: RelayMode,
     pub relay_servers: String,
     pub enable_autonat: bool,
@@ -74,11 +82,14 @@ pub struct NetworkOptions {
 impl Default for NetworkOptions {
     fn default() -> Self {
         Self {
+            transport_mode: TransportPrivacyMode::Direct,
+            socks5_proxy: String::new(),
             enable_identify: false,
             enable_ping: false,
             enable_mdns: false,
             enable_kad: false,
             kad_bootstrap_peers: String::new(),
+            dial_policy: DialPolicy::DirectAllowed,
             relay_mode: RelayMode::Off,
             relay_servers: String::new(),
             enable_autonat: false,
@@ -107,6 +118,29 @@ impl NetworkOptions {
             .collect::<Result<_, _>>()
             .map_err(|error| format!("Invalid relay server address: {error}"))?;
 
+        let socks5_proxy = if self.socks5_proxy.trim().is_empty() {
+            None
+        } else {
+            Some(SocketAddr::from_str(self.socks5_proxy.trim()).map_err(|_| {
+                "SOCKS5 proxy must be an IP address and port, not a hostname".to_owned()
+            })?)
+        };
+
+        if self.transport_mode == TransportPrivacyMode::TorRequired && socks5_proxy.is_none() {
+            return Err(
+                "SOCKS5/Tor route requires a proxy IP address and port; direct fallback is disabled"
+                    .to_owned(),
+            );
+        }
+        if self.transport_mode != TransportPrivacyMode::TorRequired && socks5_proxy.is_some() {
+            return Err("SOCKS5 proxy requires SOCKS5/Tor route mode".to_owned());
+        }
+        if self.transport_mode == TransportPrivacyMode::TorRequired
+            && (self.enable_mdns || self.enable_autonat || self.enable_dcutr)
+        {
+            return Err("SOCKS5/Tor route disables mDNS, AutoNAT and DCUtR".to_owned());
+        }
+
         if self.enable_kad && kad_bootstrap_peers.is_empty() {
             return Err(
                 "Kademlia requires at least one user-supplied bootstrap address".to_owned(),
@@ -123,11 +157,17 @@ impl NetworkOptions {
         if self.relay_mode != RelayMode::Client && !relay_servers.is_empty() {
             return Err("Relay server addresses require relay-client mode".to_owned());
         }
+        if self.dial_policy == DialPolicy::RelayOnly && self.relay_mode != RelayMode::Client {
+            return Err("Relay-only routing requires relay-client mode".to_owned());
+        }
+        if self.dial_policy == DialPolicy::RelayOnly && self.enable_dcutr {
+            return Err("Relay-only routing disables DCUtR hole punching".to_owned());
+        }
 
         Ok(NetworkConfig {
-            // The GUI never offers Tor-required mode. Direct is explicit so a
-            // future config default cannot silently introduce a fallback path.
-            transport_mode: TransportPrivacyMode::Direct,
+            transport_mode: self.transport_mode,
+            socks5_proxy,
+            dial_policy: self.dial_policy,
             enable_identify: self.enable_identify,
             enable_ping: self.enable_ping,
             enable_mdns: self.enable_mdns,
@@ -171,7 +211,7 @@ pub fn file_send_summary() -> &'static str {
 /// Detailed network wording is opt-in so the default screen stays calm. All
 /// values remain off/empty unless the user changes them explicitly.
 pub fn network_settings_details() -> &'static str {
-    "Optional capabilities are off and address lists are empty by default. Discovery candidates are advisory only: never auto-dialed, trusted, or fingerprint-verified. Relay operators can observe IPs, timing, and sizes and can deny service; file transfer over a relay is disabled. AutoNAT and DCUtR are best effort, not universal NAT traversal. There is no Tor/I2P/mixnet, anonymity, or metadata privacy claim. Settings apply when the network worker starts: lock and unlock the vault after changing them."
+    "Optional capabilities are off and address lists are empty by default. Discovery candidates are advisory only: never auto-dialed, trusted, or fingerprint-verified. Relay-only routing avoids direct peer connections, but relay operators still see IPs, timing, and sizes and can deny service; file transfer over a relay is disabled. A SOCKS5/Tor route requires a local proxy address and removes direct listeners and DNS lookups from this app; the proxy itself is not verified, and timing correlation remains possible. AutoNAT, mDNS and DCUtR are disabled with SOCKS5/Tor routes. There is no Tor/I2P/mixnet, anonymity, or metadata privacy claim. Settings apply when the network worker starts: lock and unlock the vault after changing them."
 }
 
 fn channel_group_label(status: ChannelGroupStatus) -> String {
@@ -439,6 +479,18 @@ pub fn security_rows(
             value: privacy.transport_mode.description().to_owned(),
         },
         StatusRow {
+            label: "SOCKS5 proxy",
+            value: if privacy.socks5_proxy_configured {
+                "Configured (proxy identity and reachability not verified)".to_owned()
+            } else {
+                "Not configured".to_owned()
+            },
+        },
+        StatusRow {
+            label: "Route policy",
+            value: privacy.dial_policy.description().to_owned(),
+        },
+        StatusRow {
             label: "Bootstrap services",
             value: bootstrap_services,
         },
@@ -471,7 +523,7 @@ pub fn security_rows(
         },
         StatusRow {
             label: "Anonymity",
-            value: "No Tor/I2P/mixnet; peers and relays can observe IP, timing, and size metadata"
+            value: "No Tor/I2P/mixnet; a configured SOCKS5 proxy may hide IP from a direct peer, but proxy identity and reachability are not established, and peers or relays can observe timing and size metadata"
                 .to_owned(),
         },
     ]
@@ -541,7 +593,7 @@ mod tests {
         let network = network_info(1);
         let rows = security_rows(&VaultState::Unlocked(info.clone()), Some(&network), None);
 
-        assert_eq!(rows.len(), 25);
+        assert_eq!(rows.len(), 27);
         assert!(
             rows.iter()
                 .any(|row| row.label == "Fingerprint" && row.value == info.fingerprint)
@@ -626,7 +678,7 @@ mod tests {
             active_channel: Some([9u8; 16]),
         };
         let rows = security_rows(&VaultState::Unlocked(unlocked_info()), None, Some(&group));
-        assert_eq!(rows.len(), 25);
+        assert_eq!(rows.len(), 27);
         let control = rows
             .iter()
             .find(|row| row.label == "Group control")
@@ -896,6 +948,8 @@ mod tests {
         assert!(config.relay_servers.is_empty());
         assert_eq!(config.relay_mode, RelayMode::Off);
         assert_eq!(config.transport_mode, TransportPrivacyMode::Direct);
+        assert!(config.socks5_proxy.is_none());
+        assert_eq!(config.dial_policy, DialPolicy::DirectAllowed);
     }
 
     #[test]
@@ -927,6 +981,92 @@ mod tests {
             ..NetworkOptions::default()
         };
         assert!(circuit.to_config().is_err());
+    }
+
+    #[test]
+    fn network_options_socks5_route_requires_an_ip_literal_proxy() {
+        let valid = NetworkOptions {
+            transport_mode: TransportPrivacyMode::TorRequired,
+            socks5_proxy: "127.0.0.1:9050".to_owned(),
+            ..NetworkOptions::default()
+        };
+        let config = valid.to_config().expect("valid proxy route");
+        assert_eq!(config.transport_mode, TransportPrivacyMode::TorRequired);
+        assert_eq!(
+            config.socks5_proxy,
+            Some("127.0.0.1:9050".parse().expect("proxy socket addr"))
+        );
+
+        assert!(
+            NetworkOptions {
+                transport_mode: TransportPrivacyMode::TorRequired,
+                ..NetworkOptions::default()
+            }
+            .to_config()
+            .is_err()
+        );
+        assert!(
+            NetworkOptions {
+                transport_mode: TransportPrivacyMode::TorRequired,
+                socks5_proxy: "localhost:9050".to_owned(),
+                ..NetworkOptions::default()
+            }
+            .to_config()
+            .is_err()
+        );
+        assert!(
+            NetworkOptions {
+                transport_mode: TransportPrivacyMode::TorRequired,
+                socks5_proxy: "127.0.0.1:9050".to_owned(),
+                enable_mdns: true,
+                ..NetworkOptions::default()
+            }
+            .to_config()
+            .is_err()
+        );
+        assert!(
+            NetworkOptions {
+                socks5_proxy: "127.0.0.1:9050".to_owned(),
+                ..NetworkOptions::default()
+            }
+            .to_config()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn network_options_relay_only_rejects_direct_and_conflicting_settings() {
+        let address = direct_address();
+        let valid = NetworkOptions {
+            dial_policy: DialPolicy::RelayOnly,
+            relay_mode: RelayMode::Client,
+            relay_servers: address.clone(),
+            ..NetworkOptions::default()
+        };
+        let config = valid.to_config().expect("valid relay-only config");
+        assert_eq!(config.dial_policy, DialPolicy::RelayOnly);
+        assert_eq!(config.relay_servers.len(), 1);
+
+        assert!(
+            NetworkOptions {
+                dial_policy: DialPolicy::RelayOnly,
+                relay_servers: address,
+                ..NetworkOptions::default()
+            }
+            .to_config()
+            .is_err()
+        );
+        assert!(
+            NetworkOptions {
+                dial_policy: DialPolicy::RelayOnly,
+                relay_mode: RelayMode::Client,
+                relay_servers: direct_address(),
+                enable_dcutr: true,
+                ..NetworkOptions::default()
+            }
+            .to_config()
+            .is_err()
+        );
     }
 
     #[test]
@@ -981,7 +1121,7 @@ mod tests {
             ..NetworkPrivacyStatus::default()
         };
         let rows = security_rows(&VaultState::Unlocked(unlocked_info()), Some(&network), None);
-        assert_eq!(rows.len(), 25);
+        assert_eq!(rows.len(), 27);
         let value = |label: &'static str| {
             rows.iter()
                 .find(|row| row.label == label)
@@ -991,6 +1131,9 @@ mod tests {
         };
         assert!(value("Transport mode").contains("Direct TCP + Noise"));
         assert!(value("Transport mode").contains("not anonymous"));
+        assert_eq!(value("SOCKS5 proxy"), "Not configured");
+        assert!(value("Route policy").contains("Direct allowed"));
+        assert!(value("Route policy").contains("not anonymous"));
         assert!(value("Bootstrap services").contains("1 user-supplied"));
         assert!(value("Optional capabilities").contains("identify on"));
         assert!(value("Optional capabilities").contains("ping off"));

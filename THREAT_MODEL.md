@@ -32,9 +32,9 @@ This model states attacker capabilities separately from properties the code curr
 - **Capabilities:** Observe source/destination IP, packet sizes, timing, connection duration, and frequency.
 - **Assumptions:** No access to endpoint memory or Noise keys.
 - **Scenarios:** Link a stable PeerId to activity; infer conversation timing and message-size classes.
-- **Expected defenses:** Noise hides payloads; no plaintext headers; direct mode is labelled non-anonymous.
-- **Tests:** Direct-connect wire tests; address validation tests; GUI anonymity status row.
-- **Residual risk:** Full metadata linkability remains. No padding, mixnet, or anonymity route exists.
+- **Expected defenses:** Noise hides payloads; no plaintext headers; direct mode is labelled non-anonymous. Q1 relay-only routing avoids the destination peer's direct IP view under explicit configuration, Q2 pads MLS plaintext to fixed buckets, and Q5 routes outbound dials through a configured SOCKS5 proxy with no direct listener/fallback.
+- **Tests:** Direct-connect wire tests; address validation tests; relay-only circuit/routing tests; MLS padding boundary and hostile-input tests; SOCKS5 fake-proxy domain-forwarding tests; GUI anonymity/configured-route status rows.
+- **Residual risk:** Full metadata linkability remains. Q2 padding is coarse and hides neither timing, direction, volume, nor outer-frame sizes; Q1 relays and Q5 proxies still observe metadata. No verified anonymity, mixnet, onion, I2P, proxy identity, or Tor claim exists.
 
 ### Attacker B — Malicious network peer
 

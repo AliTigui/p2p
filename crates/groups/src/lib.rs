@@ -137,6 +137,10 @@ pub enum GroupError {
     TooLarge { len: usize, max: usize },
     #[error("MLS application plaintext cannot be empty")]
     EmptyPlaintext,
+    #[error("MLS application plaintext is {len} bytes (maximum {max})")]
+    PlaintextTooLarge { len: usize, max: usize },
+    #[error("MLS application padding is malformed")]
+    InvalidPadding,
     #[error("MLS group id does not match the conversation id")]
     WrongConversation,
     #[error("MLS channel group does not match its parent conversation and channel binding")]
@@ -205,6 +209,69 @@ fn expected_mls_key(expected_public_key: &[u8]) -> Result<[u8; 32], GroupError> 
     expected_public_key
         .try_into()
         .map_err(|_| GroupError::SenderMismatch)
+}
+
+/// Application plaintexts are padded inside the MLS ciphertext so observers
+/// see fixed-size buckets instead of exact frame lengths. This is a coarse
+/// length-hiding measure only: it does not hide timing, direction, or volume.
+const PADDING_TAG: u8 = 1;
+const PADDING_HEADER_LEN: usize = 5;
+const PADDING_BUCKETS: [usize; 15] = [
+    64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768, 65_536, 131_072, 262_144,
+    524_288, 786_432,
+];
+const MAX_PADDED_PLAINTEXT: usize = PADDING_BUCKETS[PADDING_BUCKETS.len() - 1] - PADDING_HEADER_LEN;
+
+fn pad_application_plaintext(plaintext: &[u8]) -> Result<Vec<u8>, GroupError> {
+    if plaintext.is_empty() {
+        return Err(GroupError::EmptyPlaintext);
+    }
+    let needed = plaintext.len().saturating_add(PADDING_HEADER_LEN);
+    let bucket = PADDING_BUCKETS
+        .iter()
+        .copied()
+        .find(|bucket| *bucket >= needed)
+        .ok_or(GroupError::PlaintextTooLarge {
+            len: plaintext.len(),
+            max: MAX_PADDED_PLAINTEXT,
+        })?;
+    let original_len =
+        u32::try_from(plaintext.len()).map_err(|_| GroupError::PlaintextTooLarge {
+            len: plaintext.len(),
+            max: MAX_PADDED_PLAINTEXT,
+        })?;
+    let mut padded = vec![0u8; bucket];
+    padded[0] = PADDING_TAG;
+    padded[1..PADDING_HEADER_LEN].copy_from_slice(&original_len.to_le_bytes());
+    padded[PADDING_HEADER_LEN..PADDING_HEADER_LEN + plaintext.len()].copy_from_slice(plaintext);
+    Ok(padded)
+}
+
+fn strip_application_padding(padded: &[u8]) -> Result<Zeroizing<Vec<u8>>, GroupError> {
+    if !PADDING_BUCKETS.contains(&padded.len())
+        || padded.first().copied() != Some(PADDING_TAG)
+        || padded.len() <= PADDING_HEADER_LEN
+    {
+        return Err(GroupError::InvalidPadding);
+    }
+    let original_len = u32::from_le_bytes(
+        padded[1..PADDING_HEADER_LEN]
+            .try_into()
+            .map_err(|_| GroupError::InvalidPadding)?,
+    ) as usize;
+    if original_len == 0
+        || PADDING_HEADER_LEN
+            .checked_add(original_len)
+            .is_none_or(|end| end > padded.len())
+        || padded[PADDING_HEADER_LEN + original_len..]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
+        return Err(GroupError::InvalidPadding);
+    }
+    Ok(Zeroizing::new(
+        padded[PADDING_HEADER_LEN..PADDING_HEADER_LEN + original_len].to_vec(),
+    ))
 }
 
 fn check_group_message_size(bytes: &[u8]) -> Result<(), GroupError> {
@@ -843,10 +910,11 @@ impl MlsSession {
         if plaintext.is_empty() {
             return Err(GroupError::EmptyPlaintext);
         }
+        let padded = pad_application_plaintext(plaintext)?;
         let signer = IdentitySigner(self.identity.clone());
         let created = with_provider!(self, |provider, group| {
             group
-                .create_message(provider, &signer, plaintext)
+                .create_message(provider, &signer, &padded)
                 .map_err(|_| GroupError::Mls("application encryption failed"))
         });
         let message = match created {
@@ -934,9 +1002,10 @@ impl MlsSession {
             }
             match processed.into_content() {
                 ProcessedMessageContent::ApplicationMessage(application) => {
+                    let padded = Zeroizing::new(application.into_bytes());
                     Ok(DecryptedApplication {
                         epoch,
-                        plaintext: Zeroizing::new(application.into_bytes()),
+                        plaintext: strip_application_padding(&padded)?,
                     })
                 }
                 _ => Err(GroupError::Mls("expected an MLS application message")),
@@ -1757,5 +1826,85 @@ mod post_quantum_evaluation {
                 "unexpected non-classical ciphersuite in this build"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod padding_tests {
+    use super::*;
+
+    #[test]
+    fn application_plaintext_is_padded_to_a_fixed_bucket() {
+        let padded =
+            pad_application_plaintext(b"short").expect("short plaintext fits the smallest bucket");
+        assert_eq!(padded.len(), PADDING_BUCKETS[0]);
+        assert_eq!(padded[0], PADDING_TAG);
+        assert!(
+            padded[PADDING_HEADER_LEN + 5..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert_eq!(
+            strip_application_padding(&padded)
+                .expect("valid padding")
+                .as_slice(),
+            b"short"
+        );
+
+        let exact = vec![7u8; PADDING_BUCKETS[0] - PADDING_HEADER_LEN];
+        assert_eq!(
+            pad_application_plaintext(&exact).expect("exact fit").len(),
+            PADDING_BUCKETS[0]
+        );
+        let one_over = vec![7u8; PADDING_BUCKETS[0] - PADDING_HEADER_LEN + 1];
+        assert_eq!(
+            pad_application_plaintext(&one_over)
+                .expect("next bucket")
+                .len(),
+            PADDING_BUCKETS[1]
+        );
+    }
+
+    #[test]
+    fn hostile_padding_is_rejected_before_returning_plaintext() {
+        let valid = pad_application_plaintext(b"payload").expect("valid padding");
+        assert!(strip_application_padding(&[]).is_err());
+        assert!(strip_application_padding(&vec![0u8; PADDING_BUCKETS[0]]).is_err());
+        assert!(strip_application_padding(&vec![PADDING_TAG; PADDING_BUCKETS[0]]).is_err());
+
+        let mut wrong_length = valid.clone();
+        wrong_length[1..PADDING_HEADER_LEN].copy_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            strip_application_padding(&wrong_length),
+            Err(GroupError::InvalidPadding)
+        ));
+
+        let mut extended_length = valid.clone();
+        let claimed = (valid.len() - PADDING_HEADER_LEN + 1) as u32;
+        extended_length[1..PADDING_HEADER_LEN].copy_from_slice(&claimed.to_le_bytes());
+        assert!(matches!(
+            strip_application_padding(&extended_length),
+            Err(GroupError::InvalidPadding)
+        ));
+
+        let mut dirty_tail = valid.clone();
+        *dirty_tail.last_mut().expect("non-empty bucket") = 1;
+        assert!(matches!(
+            strip_application_padding(&dirty_tail),
+            Err(GroupError::InvalidPadding)
+        ));
+    }
+
+    #[test]
+    fn oversized_plaintext_fails_closed_before_mls_encryption() {
+        let oversized = vec![1u8; MAX_PADDED_PLAINTEXT + 1];
+        assert!(matches!(
+            pad_application_plaintext(&oversized),
+            Err(GroupError::PlaintextTooLarge { .. })
+        ));
+        assert!(matches!(
+            pad_application_plaintext(&[]),
+            Err(GroupError::EmptyPlaintext)
+        ));
     }
 }

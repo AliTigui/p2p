@@ -37,7 +37,7 @@ cargo +1.100.0 test -p p2p-groups --test channel_group_lifecycle --locked
 cargo +1.100.0 test -p p2p-chat --lib --locked
 ```
 
-The first command is the adversarial proof for the P1a primitive; the second proves the P1b bound lifecycle API; the third covers P1c channel-scope round trips, tampering/substitution rejection, controller scope binding, excluded-parent-member rejection, the P1d controller tests for injected ciphertext, derived-group receipts, and rejection of non-default text on the parent group, and the P1e restart tests for bound receipts, queued ciphertext, tampered/incomplete records, and lifecycle deletion. These tests prove cryptographic exclusion and authenticated channel-group restore for non-default controller text, not parent policy metadata confidentiality. P1f adds GUI model tests for default parent-group status, derived readiness, derived setup state, and absence of a complete-ACL claim; the final P14 GUI-feature run passed **20 tests, 0 failures**.
+The first command is the adversarial proof for the P1a primitive; the second proves the P1b bound lifecycle API; the third covers P1c channel-scope round trips, tampering/substitution rejection, controller scope binding, excluded-parent-member rejection, the P1d controller tests for injected ciphertext, derived-group receipts, and rejection of non-default text on the parent group, and the P1e restart tests for bound receipts, queued ciphertext, tampered/incomplete records, and lifecycle deletion. These tests prove cryptographic exclusion and authenticated channel-group restore for non-default controller text, not parent policy metadata confidentiality. P1f adds GUI model tests for default parent-group status, derived readiness, derived setup state, and absence of a complete-ACL claim; the final post-Q GUI-feature run passed **22 tests, 0 failures**.
 
 Targeted P2/P3/P4 adversarial gates:
 
@@ -110,7 +110,7 @@ When modifying a codec or state machine, add a test for each applicable case:
 - captured restricted-channel ciphertext injected into an excluded parent member, a locally created group with the same derived channel ID, post-update channel ciphertext, an allowed controller whose receipt must use the derived group, and non-default text injected into the parent group;
 - duplicate request with a different transaction ID, exact signed-frame replay, stale acknowledgement, out-of-order operations;
 - durable control-log cases: an exact authenticated terminal frame must not be re-applied after restart, while an idempotent `KeyPackageRequest`/`GroupJoinRequest` retry must stay idempotent after restart;
-- older database restored while keeping the current anchor and anchor bit flip must fail unlock (both tested); a missing anchor after a nonempty log and a broken chain (non-contiguous sequence or mismatched `chain_hash`, blind index, or record AEAD) must fail `verify_control_log` — these are source-backed fail-closed checks, but no dedicated missing-anchor or broken-chain test is recorded in the final 207-test run;
+- older database restored while keeping the current anchor and anchor bit flip must fail unlock (both tested); a missing anchor after a nonempty log and a broken chain (non-contiguous sequence or mismatched `chain_hash`, blind index, or record AEAD) must fail `verify_control_log` — these are source-backed fail-closed checks, but no dedicated missing-anchor or broken-chain test is recorded in the original 207-test run or its later reruns;
 - replayed message after reload where a load path exists;
 - file chunk tampering, missing manifest, oversized file, unsupported/mismatched format, scanner failure, no scanner;
 - invalid bootstrap/relay address, `/p2p-circuit` in a direct address, missing `/p2p/<peer-id>` suffix;
@@ -123,15 +123,15 @@ When modifying a codec or state machine, add a test for each applicable case:
 
 ## 4. Network privacy tests
 
-Local tests cover codec bounds, configuration defaults, address validation, status snapshots, and direct loopback transport only.
+Local tests cover codec bounds, configuration defaults, address validation, status snapshots, direct loopback transport, relay-only policy, MLS padding, and SOCKS5 route behavior. Q1 adds adversarial validation of relay-only conflicts, circuit address shape/destination, direct-dial rejection, queued relayed dials, and observed-path application gating; `crates/network/tests/relay_only.rs` starts a real local relay and proves circuit-only listeners, reservations, a relay-observed circuit, and relayed alice/bob connectivity. Q2 adds MLS padding boundary and hostile-padding tests. Q5 adds SOCKS5 target conversion, unsupported-target failure, no-listener/no-direct-dial proofs, and a fake-proxy test proving that `example.onion` reaches the proxy as a domain CONNECT target rather than through a local lookup.
 
-The following require external hardware or a controlled volunteer relay and are therefore documented as pending, not claimed:
+The following require external hardware, a real proxy/Tor service, or a controlled volunteer relay and are therefore documented as pending, not claimed:
 
 1. Two machines on the same LAN using manual addresses and optional mDNS.
 2. Two machines behind separate NATs with a user-operated relay and optional AutoNAT/DCUtR.
 3. A three-node relay harness that records raw relay-side bytes, searches for signed Offer/file-key sentinels, and attempts ciphertext tampering.
-4. Packet capture proving no direct TCP fallback in a future fail-closed privacy mode.
-5. DNS and IPv6 leak tests for a future Tor-required mode.
+4. Packet capture proving no direct TCP fallback against a real proxy/Tor service; the local proof is a fake proxy plus source-level transport selection and no-listener tests.
+5. DNS, IPv6, and relay-reservation leak tests with a real SOCKS5/Tor proxy; proxy identity and reachability remain unverified.
 
 ## 5. Fuzz smoke tests
 
@@ -139,7 +139,7 @@ The following require external hardware or a controlled volunteer relay and are 
 
 A dependency-free deterministic smoke test still flips one bit at every offset of a signed `P2P1` envelope and asserts that any successfully parsed mutation fails signature verification; it also asserts that every truncated prefix is rejected. This is a regression guard, not proof of parser correctness.
 
-Not covered by these targets: internal transport codec state machines, backup/vault import formats (no such formats exist yet), and a long sanitizer-enabled corpus-building campaign. Treat fuzzing as a bounded smoke control; CI is green, but a longer coverage-guided campaign is still required before making a broader fuzzing claim.
+Not covered by these targets: internal transport codec state machines, backup/vault import formats (no such formats exist yet), and a long sanitizer-enabled corpus-building campaign. Treat fuzzing as a bounded smoke control; historical CI was green for earlier baselines, but it is not evidence for this uncommitted work, and a longer coverage-guided campaign is still required before making a broader fuzzing claim.
 
 ## 6. Dependency and supply-chain checks
 
@@ -152,7 +152,7 @@ cargo audit --file fuzz/Cargo.lock
 cargo deny --locked --manifest-path fuzz/Cargo.toml check
 ```
 
-`deny.toml` defines advisory, license, bans, and source policy. A `security.yml` workflow runs these gates on pushes and pull requests. Locally installed `cargo-audit 0.23.0` and `cargo-deny 0.22.1` execute the same checks. After aligning `deny.toml` with cargo-deny 0.22, declaring the fuzz workspace license, moving to libp2p 0.57.1/libp2p-request-response 0.30.0, and moving to the OpenMLS 0.10.0-rc.1 provider stack, **all four local commands pass**: `cargo audit` reports zero vulnerabilities with five non-failing unmaintained warnings, and `cargo deny` ends with `advisories ok, bans ok, licenses ok, sources ok` for both lockfiles. The unmaintained warnings are `paste`, `proc-macro-error2`, `zbus_names`, `zvariant`, and `zvariant_derive`; they remain documented residual risk. GitHub Security gates run `45690333396` passed all four jobs on 2026-11-25.
+`deny.toml` defines advisory, license, bans, and source policy. A `security.yml` workflow runs these gates on pushes and pull requests. Locally installed `cargo-audit 0.23.0` and `cargo-deny 0.22.1` execute the same checks. After aligning `deny.toml` with cargo-deny 0.22, declaring the fuzz workspace license, moving to libp2p 0.57.1/libp2p-request-response 0.30.0, moving to the OpenMLS 0.10.0-rc.1 provider stack, and adding the pinned SOCKS5/tokio-util dependencies with refreshed root/fuzz lockfiles, **all four local commands pass**: `cargo audit` reports zero vulnerabilities with five non-failing unmaintained warnings, and `cargo deny` ends with `advisories ok, bans ok, licenses ok, sources ok` for both lockfiles. The unmaintained warnings are `paste`, `proc-macro-error2`, `zbus_names`, `zvariant`, and `zvariant_derive`; they remain documented residual risk. GitHub Security gates run `45690333396` passed all four jobs on 2026-11-25.
 
 ### Workflow action pinning
 
@@ -207,22 +207,22 @@ Checksum sidecars use bare filenames; verification must run from `dist/`. Checks
 
 ## 8. Final recorded local gates (2026-11-27)
 
-These are local-only results for the final uncommitted P0–P14 code state. They do not claim CI, release, commit, push, PR, review, merge, user/manual, external, two-machine, visual-GUI, or production verification. Historical 207/257/285-test results remain in `PROJECT_STATUS.md` and are not evidence for this workstream.
+These are local-only results for the final uncommitted P0–P14 code state plus the Q1/Q2/Q5 privacy follow-up. They do not claim CI, release, commit, push, PR, review, merge, user/manual, external, two-machine, visual-GUI, or production verification. Historical 207/257/285/339-test results remain in `PROJECT_STATUS.md` and are not evidence for the SOCKS5, relay-only, or padding changes. Documentation-only reconciliation after the final gates changed no Rust source or lockfile; `git diff --check` was re-run and passed, so the recorded code/build/test results remain valid for the final code state.
 
 | Gate | Command | Result |
 |---|---|---|
 | Format | `cargo +1.100.0 fmt --all -- --check` | Passed. |
 | Diff hygiene | `git diff --check` | Passed. |
-| Diagnostics | `python3 scripts/check_diagnostics.py` | Passed; 62 Rust sources checked. |
+| Diagnostics | `python3 scripts/check_diagnostics.py` | Passed; 64 Rust sources checked. |
 | Workspace check | `cargo +1.100.0 check --locked --workspace --all-targets` | Passed. |
 | Workspace clippy | `cargo +1.100.0 clippy --locked --workspace --all-targets -- -D warnings` | Passed; two pre-existing advisory manifest warnings remain non-fatal (`p2p-core` in `p2p-crypto`, `zeroize` in `p2p-security`). |
-| Workspace tests | `cargo +1.100.0 test --workspace --locked -- --test-threads=1` | **339 passed, 0 failed**, 0 doc-tests: chat 86 (66 unit + 20 integration), core 4, crypto 8, desktop 17, files 20, groups 19 (1 unit + 6 lifecycle + 3 isolation + 9 MLS integration), identity 61 (58 unit + 3 integration), messaging 20 (17 unit + 3 integration), network 44 (33 unit + 11 integration), security 11, storage 49 (12 unit + 28 vault + 9 provider integration). |
-| GUI feature | `cargo +1.100.0 check --locked -p p2p-desktop --features gui`, matching clippy, and `cargo +1.100.0 test -p p2p-desktop --features gui --locked -- --test-threads=1` | Passed; **20 tests, 0 failures**. |
+| Workspace tests | `cargo +1.100.0 test --workspace --locked -- --test-threads=1` | **358 passed, 0 failed** across 37 suites, 0 doc-tests: chat 86 (66 unit + 20 integration), core 4, crypto 8, desktop 19, files 20, groups 22 (4 unit + 6 lifecycle + 3 isolation + 9 MLS integration), identity 61 (58 unit + 3 integration), messaging 20 (17 unit + 3 integration), network 58 (46 unit + 12 integration), security 11, storage 49 (12 unit + 28 vault + 9 provider integration). |
+| GUI feature | `cargo +1.100.0 check --locked -p p2p-desktop --features gui`, matching clippy, and `cargo +1.100.0 test -p p2p-desktop --features gui --locked -- --test-threads=1` | Passed; **22 tests, 0 failures**. |
 | Native feature | `cargo +1.100.0 check --locked -p p2p-desktop --features native`, matching clippy, and `cargo +1.100.0 build --locked -p p2p-desktop --features native` | Passed; no visual inspection claimed. |
-| Fuzz locked build | `cargo +1.100.0 check/clippy/build --locked --manifest-path fuzz/Cargo.toml` | Passed. |
-| Fuzz smoke | Six `cargo fuzz run` targets, 1000 plain-libFuzzer inputs each | All six completed without crashes; not coverage-instrumented and not a long campaign. |
+| Fuzz locked build | `cargo +1.100.0 check/clippy --locked --manifest-path fuzz/Cargo.toml --all-targets` and `cargo +1.100.0 build --release --locked --manifest-path fuzz/Cargo.toml --bins` | Passed. |
+| Fuzz smoke | Six release fuzz binaries, 1000 plain-libFuzzer inputs each | All six completed without crashes; not coverage-instrumented and not a long campaign. |
 | Root advisories | `cargo audit --file Cargo.lock`; `cargo deny --locked --manifest-path Cargo.toml check` | Zero vulnerabilities with five allowed unmaintained warnings; `advisories ok, bans ok, licenses ok, sources ok`. |
-| Fuzz advisories | `cargo audit --file fuzz/Cargo.lock`; `cargo deny --locked --manifest-path fuzz/Cargo.toml check` | Zero vulnerabilities with two allowed unmaintained warnings; `advisories ok, bans ok, licenses ok, sources ok` after the one-line locked metadata refresh. |
-| SBOM | Two `python3 scripts/generate_sbom.py` runs per graph, compared with `cmp` | Root and fuzz documents regenerated byte-for-byte, 479 packages each. |
+| Fuzz advisories | `cargo audit --file fuzz/Cargo.lock`; `cargo deny --locked --manifest-path fuzz/Cargo.toml check` | Zero vulnerabilities with two allowed unmaintained warnings; `advisories ok, bans ok, licenses ok, sources ok` after the SOCKS5 dependency and lock refresh. |
+| SBOM | Two `python3 scripts/generate_sbom.py` runs per graph, compared with `cmp` | Root and fuzz documents regenerated byte-for-byte, 480 packages each; root lock SHA-256 `03e4451bab061e6c08950669c66a91ffbc0d368fb27691d10cc654132bf90ba0`, fuzz lock SHA-256 `fc1c7a4e7f644e06686cf6d0cff1437985219062034bc581aba71e5ccf3312fb`. |
 
 The aggregate workspace and GUI test runs are authoritative; targeted commands above are retained for diagnosis. No result in this section establishes availability, anonymity, full rollback resistance, distributed-flood capacity, signed release identity, reproducibility, or production readiness.
