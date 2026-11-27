@@ -26,6 +26,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "fuzz_v3_envelope"
+path = "fuzz_targets/fuzz_v3_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_setup"
 path = "fuzz_targets/fuzz_setup.rs"
 test = false

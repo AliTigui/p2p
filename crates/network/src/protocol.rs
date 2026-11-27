@@ -21,7 +21,11 @@ pub const MESSAGE_PROTOCOL: &str = "/p2p-messenger/message/1";
 /// MLS setup protocol for exchanging signed KeyPackage and Welcome frames.
 /// It is a separate, explicitly versioned protocol; unknown versions are
 /// rejected by multistream-select rather than negotiated by "highest wins".
-pub const MLS_SETUP_PROTOCOL: &str = "/p2p-messenger/mls-setup/1";
+pub const MLS_SETUP_PROTOCOL: &str = "/p2p-messenger/mls-setup/2";
+
+/// Legacy setup protocol. It is deliberately not registered; an old peer
+/// cannot negotiate a downgraded setup frame with this build.
+pub const LEGACY_MLS_SETUP_PROTOCOL: &str = "/p2p-messenger/mls-setup/1";
 
 /// Encrypted file-transfer protocol. It is separate from messaging and setup
 /// so a peer can decline file transfer without affecting chat delivery.

@@ -12,6 +12,8 @@ p2p-identity.workspace = true
 p2p-storage.workspace = true
 libp2p-identity.workspace = true
 getrandom.workspace = true
+hmac.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

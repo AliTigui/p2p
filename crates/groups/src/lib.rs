@@ -17,18 +17,58 @@ use openmls_rust_crypto::{OpenMlsRustCrypto, RustCrypto};
 use openmls_traits::OpenMlsProvider;
 use openmls_traits::signatures::{Signer, SignerError};
 use openmls_traits::types::SignatureScheme;
+use p2p_crypto::{CryptoError, NONCE_LEN, TAG_LEN, decrypt_bytes, encrypt_bytes};
 use p2p_identity::{Identity, IdentityRole};
 use p2p_messaging::{
-    Conversation, DeliveryState, Envelope, MessageKind, Receipt, ReceiptStatus, ReceivedMessage,
+    Conversation, DeliveryState, Envelope, EnvelopeV3, MessageError, MessageKind, Receipt,
+    ReceiptStatus, ReceivedMessage, V3_MAC_LEN, V3InnerFrame,
 };
 use p2p_storage::{MlsProviderError, Session, StagedMlsProvider};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+/// Library-supported hybrid KEM suite from the pinned draft OpenMLS feature.
+/// This combines ML-KEM768 with X25519 inside the KEM; it is not a claim of
+/// full post-quantum security because identity signatures remain Ed25519 and
+/// the Noise transport remains classical.
+pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519;
+pub const CIPHERSUITE_ID: u16 = 0x004F;
+
+/// Fail closed when a setup frame advertises any suite other than the fixed
+/// hybrid suite compiled into this build.
+pub fn is_supported_ciphersuite_id(id: u16) -> bool {
+    id == CIPHERSUITE_ID && Ciphersuite::try_from(id).ok() == Some(CIPHERSUITE)
+}
 const MAX_GROUP_MESSAGE_BYTES: usize = 1024 * 1024;
 const CHANNEL_GROUP_ID_DOMAIN: &[u8] = b"p2p.mls-channel-group/v1";
+const V3_ROUTE_TAG_DOMAIN: &[u8] = b"p2p-messenger/v3-route-tag";
+const V3_MAC_LABEL: &str = "p2p-messenger/envelope-v3/mac";
+const V3_BODY_LABEL: &str = "p2p-messenger/envelope-v3/body";
+const V3_BODY_AAD_DOMAIN: &[u8] = b"p2p-messenger/v3-wrapped-mls-body";
+
+fn v3_body_aad(route_tag: &[u8; 32], wrapped_len: usize) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(V3_BODY_AAD_DOMAIN.len() + 40);
+    aad.extend_from_slice(V3_BODY_AAD_DOMAIN);
+    aad.extend_from_slice(route_tag);
+    aad.extend_from_slice(&(wrapped_len as u64).to_le_bytes());
+    aad
+}
+
+/// Derive the outer v3 routing tag for one MLS group epoch. This is a
+/// local/transport selection hint, not a secret, not a proof, and not a
+/// privacy-preserving unlinkability mechanism.
+#[must_use = "a route tag must be checked against the local group epoch"]
+pub fn v3_route_tag(group_id: [u8; 16], epoch: u64) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(V3_ROUTE_TAG_DOMAIN);
+    digest.update(group_id);
+    digest.update(epoch.to_le_bytes());
+    let bytes = digest.finalize();
+    let mut tag = [0u8; 32];
+    tag.copy_from_slice(&bytes);
+    tag
+}
 
 /// Derive the independent MLS group ID for one logical channel.
 ///
@@ -165,6 +205,8 @@ pub enum GroupError {
     Identity(#[from] p2p_identity::IdentityError),
     #[error(transparent)]
     Message(#[from] p2p_messaging::MessageError),
+    #[error(transparent)]
+    Crypto(#[from] CryptoError),
 }
 
 /// A signer that uses the certified MLS role key. MLS signatures cover the
@@ -1029,6 +1071,111 @@ impl MlsSession {
         }
     }
 
+    /// Derive a purpose-separated key from the current MLS epoch. The exporter
+    /// context binds the key to this group ID and epoch; no application-defined
+    /// primitive is used.
+    fn export_v3_key(&self, label: &str) -> Result<Zeroizing<[u8; V3_MAC_LEN]>, GroupError> {
+        let mut context = Vec::with_capacity(24);
+        context.extend_from_slice(&self.conversation_id);
+        context.extend_from_slice(&self.epoch().to_le_bytes());
+        let exported = match &self.provider {
+            MlsProvider::Memory(provider) => {
+                self.group
+                    .export_secret(provider.as_ref().crypto(), label, &context, V3_MAC_LEN)
+            }
+            MlsProvider::Vault(provider) => {
+                self.group
+                    .export_secret(provider.crypto(), label, &context, V3_MAC_LEN)
+            }
+        }
+        .map_err(|_| GroupError::Mls("MLS exporter failed"))?;
+        let bytes: [u8; V3_MAC_LEN] = exported
+            .as_ref()
+            .try_into()
+            .map_err(|_| GroupError::Mls("MLS exporter returned an invalid key length"))?;
+        Ok(Zeroizing::new(bytes))
+    }
+
+    /// MLS-decrypt a v3 body without any outer identity proof. The sender is
+    /// recovered from the MLS leaf credential after authenticated decryption;
+    /// no third party holding only wire bytes can verify or learn it.
+    fn decrypt_v3(
+        &mut self,
+        ciphertext: &[u8],
+    ) -> Result<(PeerId, Zeroizing<Vec<u8>>), GroupError> {
+        check_group_message_size(ciphertext)?;
+        let local_epoch = self.epoch();
+        let message = MlsMessageIn::tls_deserialize_exact(ciphertext)
+            .map_err(|_| GroupError::Mls("application message decoding failed"))?;
+        let protocol_message = message
+            .try_into_protocol_message()
+            .map_err(|_| GroupError::Mls("message was not a protocol message"))?;
+        let processed = match with_provider!(self, |provider, group| {
+            group
+                .process_message(provider, protocol_message)
+                .map_err(|_| GroupError::Mls("application decryption failed"))
+        }) {
+            Ok(processed) => processed,
+            Err(error) => {
+                self.provider.discard();
+                return Err(error);
+            }
+        };
+
+        let validated = (|| {
+            if processed.group_id().as_slice() != self.conversation_id {
+                return Err(GroupError::WrongConversation);
+            }
+            let epoch = processed.epoch().as_u64();
+            if epoch != local_epoch {
+                return Err(GroupError::EpochMismatch {
+                    expected: local_epoch,
+                    actual: epoch,
+                });
+            }
+            let sender = PeerId::from_bytes(processed.credential().serialized_content())
+                .map_err(|_| GroupError::SenderMismatch)?;
+            if processed.credential().credential_type() != CredentialType::Basic {
+                return Err(GroupError::SenderMismatch);
+            }
+            let leaf = match processed.sender() {
+                Sender::Member(leaf) => leaf,
+                _ => return Err(GroupError::SenderMismatch),
+            };
+            let member = self
+                .group
+                .members()
+                .find(|member| member.index == *leaf)
+                .ok_or(GroupError::SenderMismatch)?;
+            if member.credential.serialized_content() != sender.to_bytes() {
+                return Err(GroupError::SenderMismatch);
+            }
+            match processed.into_content() {
+                ProcessedMessageContent::ApplicationMessage(application) => {
+                    let padded = Zeroizing::new(application.into_bytes());
+                    Ok((sender, strip_application_padding(&padded)?))
+                }
+                _ => Err(GroupError::Mls("expected an MLS application message")),
+            }
+        })();
+        match validated {
+            Ok(value) => {
+                if let Err(error) = self
+                    .provider
+                    .persist_group(&self.conversation_id, self.epoch())
+                {
+                    self.provider.discard();
+                    return Err(error);
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                self.provider.discard();
+                Err(error)
+            }
+        }
+    }
+
     fn process_commit(
         &mut self,
         commit_bytes: &[u8],
@@ -1501,6 +1648,95 @@ impl MlsConversation {
         })
     }
 
+    /// Compose a v3 envelope whose stable metadata is inside the MLS body.
+    /// The returned message ID is local state for receipts and delivery; it is
+    /// not present in the exported wire bytes.
+    pub fn compose_v3(
+        &mut self,
+        identity: &Identity,
+        kind: MessageKind,
+        plaintext: &[u8],
+    ) -> Result<(EnvelopeV3, [u8; 16]), GroupError> {
+        self.check_identity(identity)?;
+        let inner = self
+            .conversation
+            .prepare_v3_inner(identity, kind, plaintext)?;
+        let inner_bytes = inner.to_bytes()?;
+        let ciphertext = self.session.encrypt(&inner_bytes)?;
+        let mac_key = self.session.export_v3_key(V3_MAC_LABEL)?;
+        let body_key = self.session.export_v3_key(V3_BODY_LABEL)?;
+        let route_tag = v3_route_tag(self.id(), self.session.epoch());
+        let wrapped_len = ciphertext.len().saturating_add(NONCE_LEN + TAG_LEN);
+        let wrapped = encrypt_bytes(
+            &body_key,
+            &ciphertext,
+            &v3_body_aad(&route_tag, wrapped_len),
+        )?;
+        let envelope = EnvelopeV3::new(route_tag, wrapped, &mac_key)?;
+        self.conversation.record_outgoing_v3(&inner)?;
+        self.conversation.advance_epoch(self.session.epoch())?;
+        Ok((envelope, inner.message_id))
+    }
+
+    /// Compose an MLS-encrypted v3 receipt. Delivery state still changes only
+    /// when the peer's receipt is received, MAC-verified, and MLS-decrypted.
+    pub fn receipt_v3(
+        &mut self,
+        identity: &Identity,
+        status: ReceiptStatus,
+        message_id: [u8; 16],
+    ) -> Result<(EnvelopeV3, [u8; 16]), GroupError> {
+        let body = Receipt::new(status, message_id).to_bytes();
+        self.compose_v3(identity, MessageKind::Receipt, &body)
+    }
+
+    /// Verify the group route and exporter MAC, MLS-decrypt the body, bind the
+    /// inner sender to the MLS leaf, then apply replay/receipt policy.
+    pub fn receive_v3(&mut self, envelope: EnvelopeV3) -> Result<DecryptedMessage, GroupError> {
+        self.conversation.advance_epoch(self.session.epoch())?;
+        let expected_route = v3_route_tag(self.id(), self.epoch());
+        if envelope.route_tag != expected_route {
+            return Err(MessageError::BadRouteTag.into());
+        }
+        let mac_key = self.session.export_v3_key(V3_MAC_LABEL)?;
+        envelope.verify_mac(&mac_key)?;
+        let body_key = self.session.export_v3_key(V3_BODY_LABEL)?;
+        let mls_ciphertext = decrypt_bytes(
+            &body_key,
+            &envelope.body,
+            &v3_body_aad(&envelope.route_tag, envelope.body.len()),
+        )?;
+        let (mls_sender, plaintext) = self.session.decrypt_v3(&mls_ciphertext)?;
+        let inner = V3InnerFrame::from_bytes(&plaintext)?;
+        if inner.sender != mls_sender {
+            return Err(GroupError::SenderMismatch);
+        }
+        if inner.conversation_id != self.id() {
+            return Err(GroupError::WrongConversation);
+        }
+        let application_body = Zeroizing::new(inner.body.clone());
+        let metadata = self.conversation.receive_v3(inner)?;
+        Ok(DecryptedMessage {
+            metadata,
+            plaintext: application_body,
+        })
+    }
+
+    /// Validate a locally persisted queued v3 frame against this group's
+    /// current route and exporter key. The queue record itself is authenticated
+    /// vault ciphertext; this check prevents a stale or foreign frame from
+    /// being replayed after restart. Legacy v2 queue bytes are rejected.
+    pub fn verify_queued_v3(&self, bytes: &[u8]) -> Result<(), GroupError> {
+        let envelope = EnvelopeV3::from_bytes(bytes)?;
+        let expected_route = v3_route_tag(self.id(), self.epoch());
+        if envelope.route_tag != expected_route {
+            return Err(MessageError::BadRouteTag.into());
+        }
+        let mac_key = self.session.export_v3_key(V3_MAC_LABEL)?;
+        envelope.verify_mac(&mac_key)?;
+        Ok(())
+    }
+
     fn check_identity(&self, identity: &Identity) -> Result<(), GroupError> {
         if identity.peer_id() != self.session.identity.peer_id()
             || self.session.conversation_id != self.conversation.id()
@@ -1756,6 +1992,32 @@ impl MlsChannelGroup {
         self.conversation.receive(envelope)
     }
 
+    pub fn compose_v3(
+        &mut self,
+        identity: &Identity,
+        kind: MessageKind,
+        plaintext: &[u8],
+    ) -> Result<(EnvelopeV3, [u8; 16]), GroupError> {
+        self.conversation.compose_v3(identity, kind, plaintext)
+    }
+
+    pub fn receipt_v3(
+        &mut self,
+        identity: &Identity,
+        status: ReceiptStatus,
+        message_id: [u8; 16],
+    ) -> Result<(EnvelopeV3, [u8; 16]), GroupError> {
+        self.conversation.receipt_v3(identity, status, message_id)
+    }
+
+    pub fn receive_v3(&mut self, envelope: EnvelopeV3) -> Result<DecryptedMessage, GroupError> {
+        self.conversation.receive_v3(envelope)
+    }
+
+    pub fn verify_queued_v3(&self, bytes: &[u8]) -> Result<(), GroupError> {
+        self.conversation.verify_queued_v3(bytes)
+    }
+
     fn from_conversation(
         binding: ChannelGroupBinding,
         conversation: MlsConversation,
@@ -1794,11 +2056,10 @@ mod post_quantum_evaluation {
     const PINNED_OPENMLS_VERSION: &str = "0.10.0-rc.1";
     const LOCKFILE: &str = include_str!("../../../Cargo.lock");
 
-    /// This is a version/capability evaluation, not a quantum-resistance
-    /// claim. The pinned OpenMLS release candidate may expose draft PQ suites
-    /// behind a feature; this build neither enables nor advertises them.
+    /// Capability check only: the pinned provider must support the enabled
+    /// hybrid KEM suite. This is not a quantum-resistance or migration claim.
     #[test]
-    fn pinned_openmls_advertises_only_classical_ciphersuites() {
+    fn pinned_openmls_advertises_the_enabled_hybrid_ciphersuite() {
         let package = LOCKFILE
             .split("[[package]]")
             .find(|block| block.contains("name = \"openmls\""))
@@ -1808,24 +2069,198 @@ mod post_quantum_evaluation {
         let provider = OpenMlsRustCrypto::default();
         let supported = provider.crypto().supported_ciphersuites();
         assert!(
-            !supported.is_empty(),
-            "provider must advertise a cipher suite"
+            supported.contains(&CIPHERSUITE),
+            "pinned RustCrypto provider does not support the hybrid suite"
         );
-        for suite in supported {
-            assert!(
-                matches!(
-                    suite,
-                    Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519
-                        | Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256
-                        | Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519
-                        | Ciphersuite::MLS_256_DHKEMX448_AES256GCM_SHA512_Ed448
-                        | Ciphersuite::MLS_256_DHKEMP521_AES256GCM_SHA512_P521
-                        | Ciphersuite::MLS_256_DHKEMX448_CHACHA20POLY1305_SHA512_Ed448
-                        | Ciphersuite::MLS_256_DHKEMP384_AES256GCM_SHA384_P384
-                ),
-                "unexpected non-classical ciphersuite in this build"
-            );
-        }
+        assert_eq!(u16::from(CIPHERSUITE), CIPHERSUITE_ID);
+        assert_eq!(
+            Ciphersuite::try_from(CIPHERSUITE_ID).expect("known hybrid suite"),
+            CIPHERSUITE
+        );
+    }
+
+    #[test]
+    fn hybrid_key_packages_and_welcomes_round_trip() {
+        let alice = Identity::generate().expect("alice");
+        let bob = Identity::generate().expect("bob");
+        let conversation_id = [52u8; 16];
+        let mut creator = MlsConversation::create(&alice, conversation_id).expect("creator group");
+        let key_package = MlsConversation::key_package(&bob).expect("hybrid key package");
+
+        assert!(
+            key_package.bytes().len() > 256,
+            "hybrid KEM key package should be larger than the classical form"
+        );
+        let welcome = creator
+            .add_member(
+                key_package.bytes(),
+                bob.peer_id(),
+                &bob.role_public_bytes(IdentityRole::Mls)
+                    .expect("bob mls key"),
+            )
+            .expect("hybrid welcome");
+        assert!(
+            welcome.len() > 512,
+            "hybrid KEM welcome should be larger than the classical form"
+        );
+
+        let mut joined = MlsConversation::join(&bob, conversation_id, key_package, &welcome)
+            .expect("join hybrid group");
+        assert_eq!(joined.epoch(), creator.epoch());
+        assert_eq!(
+            creator.members().expect("members"),
+            joined.members().expect("members")
+        );
+
+        let ciphertext = creator
+            .compose(&alice, MessageKind::Text, b"hybrid payload")
+            .expect("compose hybrid");
+        let decoded =
+            Envelope::from_bytes(&ciphertext.to_bytes().expect("encoded")).expect("decode");
+        let plaintext = joined.receive(decoded).expect("receive hybrid");
+        assert_eq!(plaintext.plaintext.as_slice(), b"hybrid payload");
+    }
+}
+
+#[cfg(test)]
+mod v3_wire_tests {
+    use super::*;
+
+    fn pair(conversation_id: [u8; 16]) -> (Identity, MlsConversation, MlsConversation) {
+        let alice = Identity::generate().expect("alice");
+        let bob = Identity::generate().expect("bob");
+        let mut creator = MlsConversation::create(&alice, conversation_id).expect("creator");
+        let key_package = MlsConversation::key_package(&bob).expect("key package");
+        let bob_key = bob
+            .role_public_bytes(IdentityRole::Mls)
+            .expect("bob MLS key");
+        let welcome = creator
+            .add_member(key_package.bytes(), bob.peer_id(), &bob_key)
+            .expect("welcome");
+        let joiner =
+            MlsConversation::join(&bob, conversation_id, key_package, &welcome).expect("join");
+        (alice, creator, joiner)
+    }
+
+    #[test]
+    fn v3_round_trip_hides_stable_metadata_from_third_parties() {
+        let (alice, mut sender, mut receiver) = pair([61u8; 16]);
+        let secret = b"SECRET_V3_APPLICATION_BODY";
+        let (envelope, message_id) = sender
+            .compose_v3(&alice, MessageKind::Text, secret)
+            .expect("compose v3");
+        let wire = envelope.to_bytes().expect("encoded v3");
+
+        assert_eq!(
+            envelope.route_tag,
+            v3_route_tag(sender.id(), sender.epoch())
+        );
+        assert!(!wire.windows(16).any(|w| w == sender.id()));
+        assert!(!wire.windows(16).any(|w| w == message_id));
+        assert!(
+            !wire
+                .windows(alice.peer_id().to_bytes().len())
+                .any(|w| w == alice.peer_id().to_bytes())
+        );
+        assert!(!wire.windows(secret.len()).any(|w| w == secret));
+        assert_eq!(&wire[..4], p2p_messaging::V3_MAGIC);
+
+        let decoded = EnvelopeV3::from_bytes(&wire).expect("decode v3");
+        let received = receiver.receive_v3(decoded).expect("receive v3");
+        assert_eq!(received.plaintext.as_slice(), secret);
+        assert_eq!(received.metadata.message_id, message_id);
+        assert_eq!(received.metadata.sender, alice.peer_id());
+        assert_eq!(received.metadata.kind, MessageKind::Text);
+        assert_eq!(received.metadata.sender_sequence, 1);
+        assert!(!format!("{received:?}").contains("SECRET_V3"));
+    }
+
+    #[test]
+    fn v3_rejects_tampering_wrong_route_legacy_wire_and_foreign_groups() {
+        let (alice, mut sender, mut receiver) = pair([62u8; 16]);
+        let (envelope, _) = sender
+            .compose_v3(&alice, MessageKind::Text, b"authenticated body")
+            .expect("compose v3");
+        let wire = envelope.to_bytes().expect("encoded v3");
+
+        sender.verify_queued_v3(&wire).expect("local queue check");
+
+        let mut body_tampered = envelope.clone();
+        body_tampered.body[0] ^= 0x01;
+        assert!(matches!(
+            receiver.receive_v3(body_tampered),
+            Err(GroupError::Message(MessageError::BadMac))
+        ));
+
+        let mut wrong_route = envelope.clone();
+        wrong_route.route_tag[0] ^= 0x01;
+        assert!(matches!(
+            receiver.receive_v3(wrong_route),
+            Err(GroupError::Message(MessageError::BadRouteTag))
+        ));
+
+        let legacy = sender
+            .compose(&alice, MessageKind::Text, b"legacy v2")
+            .expect("legacy compose");
+        let legacy_bytes = legacy.to_bytes().expect("legacy bytes");
+        assert!(EnvelopeV3::from_bytes(&legacy_bytes).is_err());
+        assert!(sender.verify_queued_v3(&legacy_bytes).is_err());
+
+        let (_other_alice, mut foreign, _foreign_peer) = pair([63u8; 16]);
+        assert!(matches!(
+            foreign.receive_v3(envelope),
+            Err(GroupError::Message(MessageError::BadRouteTag))
+        ));
+    }
+
+    #[test]
+    fn v3_replay_and_sequence_regression_fail_after_decryption() {
+        let (alice, mut sender, mut receiver) = pair([64u8; 16]);
+        let (first, _) = sender
+            .compose_v3(&alice, MessageKind::Text, b"first")
+            .expect("first");
+        let (second, _) = sender
+            .compose_v3(&alice, MessageKind::Text, b"second")
+            .expect("second");
+        let first_bytes = first.to_bytes().expect("first bytes");
+        let second_bytes = second.to_bytes().expect("second bytes");
+
+        receiver
+            .receive_v3(EnvelopeV3::from_bytes(&second_bytes).expect("decode second"))
+            .expect("receive second");
+        // MLS ratchet state rejects an already-processed ciphertext; the
+        // conversation layer independently rejects replay and regression for
+        // freshly encrypted frames (covered in p2p-messaging tests).
+        let replay = receiver
+            .receive_v3(EnvelopeV3::from_bytes(&second_bytes).expect("decode replay"))
+            .expect_err("an exact v3 replay must fail closed");
+        assert!(
+            matches!(replay, GroupError::Mls(_) | GroupError::Message(_)),
+            "unexpected replay error: {replay:?}"
+        );
+        let regression = receiver
+            .receive_v3(EnvelopeV3::from_bytes(&first_bytes).expect("decode first"))
+            .expect_err("an older v3 frame must fail closed");
+        assert!(
+            matches!(regression, GroupError::Mls(_) | GroupError::Message(_)),
+            "unexpected regression error: {regression:?}"
+        );
+    }
+
+    #[test]
+    fn v3_route_tag_and_exporter_keys_are_epoch_bound() {
+        let (_alice, sender, _receiver) = pair([65u8; 16]);
+        let epoch = sender.epoch();
+        let tag = v3_route_tag(sender.id(), epoch);
+        assert_ne!(tag, v3_route_tag(sender.id(), epoch + 1));
+        assert_ne!(tag, v3_route_tag([0xff; 16], epoch));
+
+        let mac = sender.session.export_v3_key(V3_MAC_LABEL).expect("mac key");
+        let body = sender
+            .session
+            .export_v3_key(V3_BODY_LABEL)
+            .expect("body key");
+        assert_ne!(mac.as_slice(), body.as_slice());
     }
 }
 

@@ -10,7 +10,7 @@
 use std::fmt;
 
 use libp2p_identity::PeerId;
-use p2p_groups::GroupOperation;
+use p2p_groups::{CIPHERSUITE_ID, GroupOperation, is_supported_ciphersuite_id};
 use p2p_identity::{
     Identity, IdentityError, IdentityRole, MAX_IDENTITY_PROOF_BYTES, certified_role_public_key,
     unix_time_seconds, verify_application_signature,
@@ -20,9 +20,9 @@ use crate::ChatError;
 
 /// Fixed frame magic. Unknown magic is rejected, never negotiated.
 pub const SETUP_MAGIC: [u8; 4] = *b"MLS1";
-/// Setup frame version implemented by this build. Version 1 frames carried no
-/// transaction ID and are rejected rather than ambiguously accepted.
-pub const SETUP_VERSION: u16 = 3;
+/// Setup frame version implemented by this build. Versions 1–3 predate the
+/// signed hybrid-suite identifier and are rejected rather than downgraded.
+pub const SETUP_VERSION: u16 = 4;
 /// Length of the random, signed transaction ID carried by every setup frame.
 pub const TRANSACTION_ID_LEN: usize = 16;
 /// A fresh random identifier shared by every frame of one setup operation.
@@ -597,6 +597,9 @@ pub struct SetupEnvelope {
     pub sender: PeerId,
     pub sender_public_key: Vec<u8>,
     pub identity_proof: Vec<u8>,
+    /// Signed MLS ciphersuite code point. This build accepts only the hybrid
+    /// ML-KEM768/X25519 suite; legacy and unknown suites fail closed.
+    pub ciphersuite_id: u16,
     pub message: SetupMessage,
     signature: [u8; SIGNATURE_LEN],
 }
@@ -604,12 +607,21 @@ pub struct SetupEnvelope {
 impl SetupEnvelope {
     /// Sign a new setup frame with the local vault identity.
     pub fn new(identity: &Identity, message: SetupMessage) -> Result<Self, ChatError> {
+        Self::new_with_ciphersuite(identity, message, CIPHERSUITE_ID)
+    }
+
+    fn new_with_ciphersuite(
+        identity: &Identity,
+        message: SetupMessage,
+        ciphersuite_id: u16,
+    ) -> Result<Self, ChatError> {
         let mut envelope = Self {
             sender: identity.peer_id(),
             sender_public_key: identity
                 .role_public_bytes(IdentityRole::Application)?
                 .to_vec(),
             identity_proof: identity.proof().to_bytes(),
+            ciphersuite_id,
             message,
             signature: [0; SIGNATURE_LEN],
         };
@@ -632,14 +644,15 @@ impl SetupEnvelope {
             return Err(ChatError::InvalidSetup("wrong frame magic"));
         }
         let version = reader.u16()?;
-        if version == 1 {
+        if version < 4 {
             return Err(ChatError::InvalidSetup(
-                "unsupported setup frame version 1; transaction IDs are required",
+                "unsupported legacy setup frame version 1-3; hybrid suite binding is required",
             ));
         }
         if version != SETUP_VERSION {
             return Err(ChatError::InvalidSetup("unsupported setup frame version"));
         }
+        let ciphersuite_id = reader.u16()?;
         let transaction_id = reader.fixed::<TRANSACTION_ID_LEN>()?;
         let code = reader.u8()?;
         let conversation_id = reader.fixed::<16>()?;
@@ -657,6 +670,7 @@ impl SetupEnvelope {
             sender,
             sender_public_key,
             identity_proof,
+            ciphersuite_id,
             message,
             signature,
         };
@@ -742,6 +756,7 @@ impl SetupEnvelope {
         let mut bytes = Vec::with_capacity(self.message.payload()?.len() + 128);
         bytes.extend_from_slice(&SETUP_MAGIC);
         bytes.extend_from_slice(&SETUP_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&self.ciphersuite_id.to_le_bytes());
         bytes.extend_from_slice(self.message.transaction_id());
         bytes.push(self.message.code());
         bytes.extend_from_slice(self.message.conversation_id());
@@ -755,6 +770,9 @@ impl SetupEnvelope {
     fn check_sizes(&self) -> Result<(), ChatError> {
         if SETUP_MAGIC != *b"MLS1" {
             return Err(ChatError::InvalidSetup("wrong frame magic"));
+        }
+        if !is_supported_ciphersuite_id(self.ciphersuite_id) {
+            return Err(ChatError::InvalidSetup("unsupported MLS ciphersuite"));
         }
         if self.sender_public_key.len() != 32 {
             return Err(ChatError::InvalidSetup("invalid sender public key length"));
@@ -777,6 +795,7 @@ impl fmt::Debug for SetupEnvelope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SetupEnvelope")
             .field("version", &SETUP_VERSION)
+            .field("ciphersuite_id", &self.ciphersuite_id)
             .field("sender", &self.sender.to_string())
             .field("public_key_len", &self.sender_public_key.len())
             .field("identity_proof_len", &self.identity_proof.len())
@@ -1427,16 +1446,19 @@ mod tests {
         .expect("signed ack");
         let mut bytes = envelope.to_bytes().expect("encoded ack");
 
-        // magic || version || transaction id: the ID is in the signed header.
+        // magic || version || ciphersuite || transaction id: the suite and ID
+        // are in the signed header.
         assert_eq!(&bytes[..4], &SETUP_MAGIC);
         assert_eq!(&bytes[4..6], &SETUP_VERSION.to_le_bytes());
-        assert_eq!(&bytes[6..6 + TRANSACTION_ID_LEN], &transaction_id);
+        assert_eq!(&bytes[6..8], &CIPHERSUITE_ID.to_le_bytes());
+        assert_eq!(&bytes[8..8 + TRANSACTION_ID_LEN], &transaction_id);
 
         let decoded = SetupEnvelope::from_bytes(&bytes).expect("decoded ack");
+        assert_eq!(decoded.ciphersuite_id, CIPHERSUITE_ID);
         assert_eq!(decoded.message.transaction_id(), &transaction_id);
         decoded.verify(&identity.peer_id()).expect("valid ack");
 
-        bytes[6] ^= 1;
+        bytes[8] ^= 1;
         let tampered = SetupEnvelope::from_bytes(&bytes).expect("decoded tampered ack");
         assert_ne!(tampered.message.transaction_id(), &transaction_id);
         assert!(matches!(
@@ -1465,9 +1487,22 @@ mod tests {
         assert!(v1_error.to_string().contains("unsupported"));
         assert!(v1_error.to_string().contains("version 1"));
 
-        let mut future = bytes;
+        for legacy in [1u16, 2, 3] {
+            let mut old = bytes.clone();
+            old[4..6].copy_from_slice(&legacy.to_le_bytes());
+            let error = SetupEnvelope::from_bytes(&old).expect_err("legacy frame is rejected");
+            assert!(error.to_string().contains("version"));
+        }
+
+        let mut future = bytes.clone();
         future[4..6].copy_from_slice(&(SETUP_VERSION + 1).to_le_bytes());
         assert!(SetupEnvelope::from_bytes(&future).is_err());
+
+        // Unknown suites fail before any KeyPackage or Welcome reaches OpenMLS.
+        let mut wrong_suite = bytes;
+        wrong_suite[6..8].copy_from_slice(&0x0013u16.to_le_bytes());
+        assert!(SetupEnvelope::from_bytes(&wrong_suite).is_err());
+        assert!(SetupEnvelope::new_with_ciphersuite(&identity, message(), 0x0013).is_err());
     }
 
     #[test]

@@ -1,17 +1,29 @@
-# Wire and Application Protocol (v1)
+# Wire and Application Protocol
 
-Status: **Milestones 5–10 and 13 implemented and tested** for two- and three-member MLS group lifecycles. Canonical envelope encoding, signature verification, replay checks, MLS ciphertext, encrypted receipts, receipt-driven delivery transitions, ciphertext-only persistence, the signed MLS setup and group-control exchange, the application controller, the GUI send/receive path, four bounded request-response protocols over the Noise-authenticated connection (the fourth is M13's opaque control protocol), the in-memory offline send queue with reconnect-triggered retry, bounded redial/backoff, duplicate-dial rejection, connection admission limits including a relayed-connection cap, per-peer request/byte budgets, admin-only Add/Remove/Update with pending acknowledgement state, group-wide delivery receipts, bounded `CHN1` parent-group channel policy plus P1d signed derived MLS groups for non-default channel text/receipts, encrypted chunked file transfer with ciphertext-only quarantine, narrow TXT/PNG/GIF structural validation, an in-memory scanner/policy/approval release gate, an encrypted attachment store, a native-only OS save flow, explicit deletion policies, and opt-in user-configured discovery/relay/NAT/identify plumbing are implemented and tested locally. A post-M13 schema-v4 local control-frame digest log with a vault anchor now preserves only already authenticated setup/group-control decisions across restart, with **no wire-format change**. P2 changed the canonical envelope/setup/file frames to role-specific v2/v3/v2 and rejects legacy frames; P5 rejects `TorRequired` before worker start without direct fallback; P7 uses the native OS file picker and keeps file-over-relay disabled; P8 caps the ciphertext queue; P9 records classical-only OpenMLS support; P10 records signed-envelope authorship/metadata without a deniability claim; P11 tests portable encrypted bundles; P12 records local supply-chain gates; P13 bounds hostile peer requests. Read-receipt UI, GUI/directory role delegation (P6 is a local primitive only), a complete channel ACL covering parent policy/default traffic, setup-material and decrypted-message persistence, general format/MIME parsing, a configured real scanner, strong anonymity, universal NAT traversal, and a dedicated relay-safe file-key/transport design are **not implemented or claimed**; P1e adds authenticated persistence/restore for ready derived channel groups; the desktop app configures no malware scanner and no optional network feature by default, so file status never claims a scan result.
+Status: **Historical milestones 5–10 and 13 were implemented and tested locally** for two- and three-member MLS group lifecycles. Historical milestone work included canonical signed-envelope encoding, signature verification, replay checks, MLS ciphertext, encrypted receipts, receipt-driven delivery transitions, ciphertext-only persistence, the signed MLS setup and group-control exchange, the application controller, the GUI send/receive path, four bounded request-response protocols over the Noise-authenticated connection (the fourth is M13's opaque control protocol), the in-memory offline send queue with reconnect-triggered retry, bounded redial/backoff, duplicate-dial rejection, connection admission limits including a relayed-connection cap, per-peer request/byte budgets, admin-only Add/Remove/Update with pending acknowledgement state, group-wide delivery receipts, bounded `CHN1` parent-group channel policy plus P1d signed derived MLS groups for non-default channel text/receipts, encrypted chunked file transfer with ciphertext-only quarantine, narrow TXT/PNG/GIF structural validation, an in-memory scanner/policy/approval release gate, an encrypted attachment store, a native-only OS save flow, explicit deletion policies, and opt-in user-configured discovery/relay/NAT/identify plumbing. A post-M13 schema-v4 local control-frame digest log with a vault anchor now preserves only already authenticated setup/group-control decisions across restart; it introduced **no wire-format change at the time** (the later Q3 application-wire change is separate). P2 historically changed the canonical envelope/setup/file frames to role-specific v2/v3/v2 and rejected legacy frames; current production application messages instead use `P2P3` EnvelopeV3 and reject v1/v2 application envelopes. P5 rejects `TorRequired` before worker start without direct fallback; P7 uses the native OS file picker and keeps file-over-relay disabled; P8 caps the ciphertext queue; P9 historically recorded classical-only OpenMLS support and is superseded by the pinned hybrid MLS suite; P10 historically recorded signed-v2-envelope authorship/metadata and is superseded by v3's bounded wire-level deniability; P11 tests portable encrypted bundles; P12 records local supply-chain gates; P13 bounds hostile peer requests. Q3 message-metadata reduction and Q4 bounded wire-level deniability are implemented locally/uncommitted; they are not design-only and are not full deniability or anonymity. Read-receipt UI, GUI/directory role delegation (P6 is a local primitive only), a complete channel ACL covering parent policy/default traffic, setup-material and decrypted-message persistence, general format/MIME parsing, a configured real scanner, strong anonymity, full deniability, universal NAT traversal, and a dedicated relay-safe file-key/transport design are **not implemented or claimed**; P1e adds authenticated persistence/restore for ready derived channel groups; the desktop app configures no malware scanner and no optional network feature by default, so file status never claims a scan result.
+
+## Current production wire (supersedes historical milestone notes)
+
+- Production application messages use `P2P3` `EnvelopeV3` (version 3) inside `/p2p-messenger/message/1`; the path keeps its v1 transport name, but the application body is v3. The legacy `P2P1`/v2 `Envelope` section below is retained only as a legacy/compatibility/test codec. Production rejects v1/v2 application envelopes; no silent downgrade or highest-version negotiation is performed.
+- The v3 outer layout is `V3_MAGIC` (`P2P3`, 4 bytes), `version` (u16 = 3), `route tag` (32 bytes = SHA-256 domain separator || group ID || epoch), `nonce` (fresh random bytes), `wrapped body length` (u32), wrapped MLS body, and an HMAC-SHA256 tag (32 bytes). The outer frame carries no sender, conversation ID, epoch, message ID, sequence, timestamp, kind, certificate proof, role key, or long-term signature.
+- The inner `V3InnerFrame` (`V3_INNER_MAGIC` `P2I1`/version, conversation ID, message ID, sender `PeerId`, sequence, `created_at`, kind, body) is inside MLS plaintext, not on the wire in clear. The MLS ciphertext is additionally AEAD-wrapped with XChaCha20-Poly1305 under a purpose-separated MLS exporter key; the outer HMAC uses a separate purpose-separated exporter key. This is library-backed composition, not a custom primitive.
+- The route tag is a local routing hint only: it is not secret, not a proof, and not an unlinkability mechanism. A receiver resolves exactly one local parent or derived group by route tag; zero or ambiguous matches fail closed, and a wrong route tag is rejected as `BadRouteTag`.
+- Setup is negotiated as `/p2p-messenger/mls-setup/2` with signed `MLS1` version 4 frames: `ciphersuite_id` occupies bytes 6..8 and the random transaction ID bytes 8..24. Only suite `0x004F` is accepted; v1–v3 setup frames and unknown suites (for example `0x0013`) are rejected. `/p2p-messenger/mls-setup/1` is legacy and deliberately not registered.
+- The MLS suite is `MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519` (`0x004F`), enabled by the pinned OpenMLS draft feature on `openmls_rust_crypto`/`openmls_traits`; `0x004D` X-Wing is declared but unsupported by the pinned provider and is rejected. Ed25519 signatures and libp2p `Noise_XX_25519_ChaChaPoly_SHA256` remain classical, so this is not a post-quantum or quantum-resistance claim, and no custom crypto is used.
+- Q3 v3 metadata reduction and Q4 bounded wire-level deniability are implemented locally/uncommitted. v3 wire bytes have no third-party-verifiable long-term application authorship proof; recipients and current group members with MLS state can still attribute a message. Neither full deniability nor anonymity is claimed.
+- `TorRequired` with a SOCKS5 proxy remains configured policy only: proxy identity, reachability, and real Tor behaviour are unverified. A relay or proxy can still observe IP, timing, direction, volume, coarse frame length, and route-tag linkability within an epoch.
+- New dependencies for this composition are `hmac`/`sha2` in `p2p-messaging`, `p2p-crypto` in `p2p-groups`, and PQ transitive packages in the lockfiles; none adds an application-defined primitive.
 
 ## 1. Transport negotiation
 
 Four protocols are negotiated with libp2p multistream-select over the existing authenticated Noise + Yamux connection using `libp2p-request-response 0.30.0`:
 
-- `/p2p-messenger/message/1` — signed MLS ciphertext envelopes and encrypted receipts.
-- `/p2p-messenger/mls-setup/1` — signed KeyPackage, Welcome, WelcomeAck, and group-control frames (commit/Welcome/acknowledgement).
+- `/p2p-messenger/message/1` — `P2P3` EnvelopeV3 MLS-ciphertext envelopes and encrypted receipts; the path name remains v1, but the application body is v3 (section 2).
+- `/p2p-messenger/mls-setup/2` — signed v4 KeyPackage, Welcome, WelcomeAck, and group-control frames (commit/Welcome/acknowledgement); `/p2p-messenger/mls-setup/1` is legacy and not registered.
 - `/p2p-messenger/file/1` — signed, encrypted file offer/chunk/manifest frames (section 10).
 - `/p2p-messenger/control/1` — M13's bounded opaque control frames; transport observations only (section 11).
 
-Peers register all four protocols as `Full` (inbound and outbound). Unknown protocol names are rejected; protocol version `1` is fixed, and a future version must be added explicitly rather than selected by "highest wins". Message streams are capped at 8 concurrent requests; setup, file, and control streams at 4 each. A 10-second timeout covers connection and request operations. Established connections are additionally capped globally, per authenticated PeerId, and per observed IP, with a separate cap for relayed connections; inbound application requests are capped per peer with a shared sliding request-count and byte budget before the application decoder sees them. Control frames carry no presence, capability, receipt, delivery, trust, or safety meaning.
+Peers register all four protocols as `Full` (inbound and outbound). Unknown protocol names are rejected; the transport path versions are fixed (`message/1`, `mls-setup/2`, `file/1`, `control/1`), and a future version must be added explicitly rather than selected by "highest wins". Message streams are capped at 8 concurrent requests; setup, file, and control streams at 4 each. A 10-second timeout covers connection and request operations. Established connections are additionally capped globally, per authenticated PeerId, and per observed IP, with a separate cap for relayed connections; inbound application requests are capped per peer with a shared sliding request-count and byte budget before the application decoder sees them. Control frames carry no presence, capability, receipt, delivery, trust, or safety meaning.
 
 The request and response of every protocol use a bounded frame: `u32 big-endian length || opaque bytes`. Empty frames and frames larger than 1 MiB are rejected before the body is read. The transport does not verify signatures, decrypt MLS data, or decide delivery/setup/transfer state; the application must decode and verify before calling any state transition.
 
@@ -34,9 +46,9 @@ The request and response of every protocol use a bounded frame: `u32 big-endian 
 - `ControlEvent::SentToPeer`, `RequestReceived`, `ResponseReceived`, and `Failed` report only transport observations. The controller drains them; it never turns a control frame into presence, capability, receipt, delivery, trust, or safety state.
 - M13 additionally exposes `poll_discovery_event`, `poll_relay_event`, `poll_nat_event`, `poll_identify_event`, and `privacy_status()`. These update a bounded `NetworkPrivacyStatus` only; discovery candidates are advisory and never auto-dialed or promoted to contacts.
 
-### MLS setup and group-control frame (v2, implemented)
+### MLS setup and group-control frame (v4, current; v1–v3 rejected)
 
-Setup frames use fixed magic `MLS1`, a `u16` version (`3`), a 16-byte random transaction ID, a `u8` message code, the 16-byte conversation ID, the sender's certified identity proof, body, and a 64-byte Ed25519 signature. All multi-byte length fields are little-endian. The signature covers every preceding field, including the transaction ID, and is made by the certified `Application` role key from the encrypted identity bundle. Versions 1 and 2 are explicitly rejected; there is no ambiguous legacy acceptance. A frame is accepted only when the proof binds that Application key to the same device as the certified `Transport` key whose PeerId is Noise-authenticated, and the declared PeerId equals that authenticated transport peer.
+Setup frames use fixed magic `MLS1`, a `u16` version (`4`), a `u16` ciphersuite ID at bytes 6..8, a 16-byte random transaction ID at bytes 8..24, a `u8` message code, the 16-byte conversation ID, the sender's certified identity proof, body, and a 64-byte Ed25519 signature. All multi-byte length fields are little-endian. The signature covers every preceding field, including the signed ciphersuite ID and transaction ID, and is made by the certified `Application` role key from the encrypted identity bundle; MLS leaf credentials use the separate certified `Mls` role. Versions 1–3 are explicitly rejected, as are unknown ciphersuites (for example `0x0013`); only `0x004F` is accepted. `/p2p-messenger/mls-setup/1` is legacy and not registered, so there is no ambiguous legacy acceptance. A frame is accepted only when the proof binds that Application key to the same device as the certified `Transport` key whose PeerId is Noise-authenticated, and the declared PeerId equals that authenticated transport peer.
 
 | Code | Message | Body |
 |---|---|---|
@@ -72,7 +84,44 @@ The controller flow is:
 
 A bounded 512-entry in-memory digest replay cache still rejects exact authenticated setup/group-control frame replays; it stores only peer IDs and SHA-256 digests, never frame bodies. Group commits keep their existing bounded commit-bytes cache. In addition, when the controller is started with a vault `Session` (`MessengerController::start_with_control_log`), schema v4 records the SHA-256 digest of each already authenticated signed setup/group-control frame in a bounded (4,096-record, fail-closed) encrypted chain with a separate AEAD-protected anchor. `KeyPackageRequest` and `GroupJoinRequest` repeats are idempotent and cannot displace a different transaction's provider; Welcomes, responses, commits, and all acknowledgements are non-repeatable, so their exact replays are rejected even after restart. Request correlation, signed transaction IDs, pending-KeyPackage and pending-operation ownership, membership checks, and terminal-state guards reject late, stale, and unexpected frames. Neither the in-memory cache nor the durable digest log is a general replay-proof protocol: the log is local vault state, does not restore the MLS session or pending setup/group state, and cannot detect restoration of the whole vault including the anchor.
 
-## 2. Envelope (v2, implemented)
+## 2. Envelope (production v3; legacy v2 compatibility/test only)
+
+### Production `P2P3` EnvelopeV3 (Q3/Q4, implemented locally/uncommitted)
+
+Wire layout:
+
+```
+V3_MAGIC "P2P3" (4 bytes) | version u16 = 3 | route_tag [u8; 32]
+| nonce [u8; 16] (fresh random)
+| wrapped_body_len u32 | wrapped MLS body
+| HMAC-SHA256 tag [u8; 32]
+```
+
+The route tag is `SHA-256(domain separator || group ID || epoch)` and is a local routing hint only (not secret, not a proof, not unlinkability). The outer frame carries no sender, conversation ID, epoch, message ID, sequence, timestamp, kind, certificate proof, role key, or long-term signature. Receivers resolve exactly one local parent or derived group by route tag; zero or ambiguous matches fail closed, and a wrong route tag is `BadRouteTag`.
+
+The protected inner frame is inside MLS plaintext:
+
+```
+struct V3InnerFrame {
+  magic: [u8; 4],        // V3_INNER_MAGIC = "P2I1"
+  version: u8,           // 1
+  conversation_id: [u8; 16],
+  message_id: [u8; 16],
+  sender: PeerId,
+  sender_sequence: u64,
+  created_at: i64,       // sender hint, untrusted, display-only
+  kind: MessageKind,     // Text | Reply | Receipt | Pin | Unpin | Policy | File | Channel
+  body: Vec<u8>,
+}
+```
+
+`MlsConversation::compose_v3` builds the inner frame, MLS-encrypts it, wraps that MLS ciphertext with XChaCha20-Poly1305 under a purpose-separated MLS exporter key, and authenticates the outer header and wrapped body with an HMAC-SHA256 tag under a separate purpose-separated exporter key. This is library-backed composition, not a custom primitive. `MlsConversation::receive_v3` checks the route, verifies the exporter MAC, unwraps the MLS ciphertext, MLS-decrypts the inner frame, binds the inner sender to the MLS leaf credential and the conversation/epoch to local state, and only then applies replay and receipt policy. Total envelope ≤ 1 MiB and wrapped body ≤ 1 MiB − 1024 bytes; wrong magic/version, zero or oversized bodies, truncated fields, and trailing bytes fail closed.
+
+Because the v2 identity proof and long-term application signature are absent from the v3 wire, the bytes are not third-party-verifiable long-term application authorship proof. A recipient or current group member with MLS state can still attribute a message; a past member, outside observer, or party without that epoch's MLS state cannot. This is bounded deniability, not full deniability, anonymity, or metadata confidentiality. Production rejects v1/v2 application envelopes.
+
+### Legacy `P2P1`/v2 `Envelope` (compatibility/test only; not accepted in production)
+
+The following codec is retained only for compatibility documentation and adversarial authorship tests. Its transferable-signature properties describe the legacy frame, not the production v3 wire.
 
 ```
 struct Envelope {
@@ -92,22 +141,20 @@ struct Envelope {
 }
 ```
 
-The identity proof is included because a PeerId is a multihash and cannot independently verify an Ed25519 signature. The proof binds the `Application` signing key and the `Transport` PeerId to one device certificate chain; the signature covers every field, and receivers derive the expected key from that proof rather than from a self-asserted field. A valid signature proves control of the certified key, not that the person is the intended contact; fingerprints are compared out of band. Version 1 frames are rejected rather than negotiated.
+In this legacy format the identity proof is included because a PeerId is a multihash and cannot independently verify an Ed25519 signature. The proof binds the `Application` signing key and the `Transport` PeerId to one device certificate chain; the signature covers every field, and receivers derive the expected key from that proof rather than from a self-asserted field. That signature is transferable authorship evidence, which production v3 deliberately removes. A valid legacy signature proves control of the certified key, not that the person is the intended contact; fingerprints are compared out of band. Legacy version 1 frames were rejected rather than negotiated.
 
-Encoding is canonical little-endian length-prefixed binary. Limits: total envelope ≤ 1 MiB, payload ≤ 1 MiB − 1024 bytes, sender public key ≤ 256 bytes, PeerId bytes ≤ 128 bytes. Unknown versions, wrong magic, bad kind codes, truncated fields, trailing bytes, and oversized fields are rejected without panics.
-
-`crates/messaging` does not interpret the payload as plaintext. `MlsConversation::compose` creates the MLS application message first and places only its TLS-serialized ciphertext in `Envelope.payload`. `MlsConversation::receive` verifies the outer envelope, decrypts with OpenMLS, checks that the MLS credential/member signature key match the envelope sender, and only then records receive/receipt state.
+Legacy encoding is canonical little-endian length-prefixed binary. Limits: total envelope ≤ 1 MiB, payload ≤ 1 MiB − 1024 bytes, sender public key ≤ 256 bytes, PeerId bytes ≤ 128 bytes. Unknown versions, wrong magic, bad kind codes, truncated fields, trailing bytes, and oversized fields are rejected without panics. The legacy `MlsConversation::compose` placed only TLS-serialized MLS ciphertext in `Envelope.payload`; legacy `receive` verified the outer signature before MLS decryption and sender binding.
 
 ## 3. MLS group setup, management, and message encryption (implemented)
 
-Every conversation, including 1:1, is an MLS group using ciphersuite `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` and OpenMLS 0.10.0-rc.1. The RC line is pinned for the patched RustCrypto stack; no production-stability claim is made.
+Every conversation, including 1:1, is an MLS group using the pinned hybrid ciphersuite `MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519` (`0x004F`) and OpenMLS 0.10.0-rc.1, enabled by the pinned draft feature on `openmls_rust_crypto`/`openmls_traits`. The sibling `0x004D` X-Wing suite is declared but unsupported by the pinned provider and is rejected. The RC line is pinned for the patched RustCrypto stack; no production-stability claim is made. MLS signatures remain Ed25519 and the libp2p Noise transport remains `Noise_XX_25519_ChaChaPoly_SHA256`; this is not a post-quantum or quantum-resistance claim, and no custom crypto is used.
 
 1. The creator calls `MlsConversation::new`; the MLS `GroupId` is the 16-byte conversation ID.
 2. A joining peer calls `MlsConversation::key_package`. The returned `MlsKeyPackage` owns the in-memory OpenMLS provider holding the private key material required to decrypt the Welcome; encoded bytes alone are not enough.
 3. The creator calls `add_member(key_package.bytes(), expected_peer, expected_public_key)`. The KeyPackage is decoded and validated, its BasicCredential must contain the expected PeerId bytes, and its leaf signature key must equal the raw Ed25519 key derived from the expected protobuf public key. The public key must derive the expected PeerId.
 4. `add_member` commits the Add and returns a Welcome. The joining peer calls `MlsConversation::join` with the original `MlsKeyPackage` and that Welcome.
-5. `compose` creates an MLS application message and signs an envelope carrying its ciphertext. `receipt` uses the same path for an encrypted `Receipt` body.
-6. `receive` verifies the outer signature, conversation binding, and epoch before OpenMLS decryption. It checks the processed MLS group ID, epoch, BasicCredential peer bytes, member set, and member signature key against the envelope sender. Decrypted plaintext is held in a `Zeroizing` buffer and is never persisted.
+5. `compose_v3` creates the `V3InnerFrame`, MLS-encrypts it, wraps that MLS ciphertext with an exporter-derived XChaCha20-Poly1305 key, and authenticates the outer `EnvelopeV3` with a separate exporter-derived HMAC key. `receipt_v3` uses the same path for an encrypted `Receipt` body.
+6. `receive_v3` checks the route tag and exporter MAC before unwrapping the MLS ciphertext, then MLS-decrypts the inner frame. It checks the processed MLS group ID, epoch, BasicCredential peer bytes, member set, and inner sender; conversation and epoch come from the protected inner frame and MLS state, not from the outer wire. Decrypted plaintext is held in a `Zeroizing` buffer and is never persisted.
 
 The wire setup exchange in section 1 drives these same API calls through `MessengerController`. The controller retains the pending `MlsKeyPackage` until `join`, keeps all conversations and decrypted text in memory, and renders only observed status. It composes text only for a conversation whose verified status is `Joined`.
 
@@ -129,7 +176,7 @@ Text-style application bytes, the receipt body codec, and `CHN1` channel text/po
 
 ### Channel application frames (M10, implemented)
 
-`MessageKind::Channel` uses the same signed v2 envelope and MLS application path as text. M10 itself added no envelope version, setup code, transport protocol, or per-channel MLS group; P2 later changed the canonical envelope to v2 in place, and P1d added a signed, bound derived MLS group for non-default text. M13's fourth transport protocol is an unrelated opaque control channel and is not used for channel text. After OpenMLS decryption and sender binding, `p2p-chat` strictly decodes a `CHN1` plaintext body:
+`MessageKind::Channel` uses the same production EnvelopeV3/MLS application path as text; the signed-v2-envelope wording in earlier milestone notes is historical. M10 itself added no envelope version, setup code, transport protocol, or per-channel MLS group; P2 later changed the legacy canonical envelope to v2 in place (superseded by v3), and P1d added a signed, bound derived MLS group for non-default text. M13's fourth transport protocol is an unrelated opaque control channel and is not used for channel text. After OpenMLS decryption and sender binding, `p2p-chat` strictly decodes a `CHN1` plaintext body:
 
 | Field | Meaning |
 |---|---|
@@ -139,12 +186,12 @@ Text-style application bytes, the receipt body codec, and `CHN1` channel text/po
 | channel_id | 16-byte channel identifier inside authenticated application content |
 | body | length-prefixed text, or name/member set for policy frames |
 
-Limits are 4,096 bytes per frame, 2,048 bytes of text, 64 bytes for a name, 64 members, and 16 channels per group. Peer IDs, names, member counts, lengths, and trailing bytes are strictly validated. The default channel ID is `[0; 16]` with name `general`; it exists in every joined conversation, and its membership follows the MLS group. The admin alone may create/rename/set members; explicit member lists must already be MLS group members, while an empty create list means all current members. Any local peer and named recipient who are both MLS and channel members may post text, which is sent only to allowed channel recipients. Channel metadata is broadcast to all group members, remains receipt-gated for local `acknowledged` status, and is not replayed to later joiners. Receipts remain legacy raw MLS receipt bodies; `channel_id` is not added to them. Channel membership is local application policy, not cryptographic access control, because every group member holds the MLS group keys.
+Limits are 4,096 bytes per frame, 2,048 bytes of text, 64 bytes for a name, 64 members, and 16 channels per group. Peer IDs, names, member counts, lengths, and trailing bytes are strictly validated. The default channel ID is `[0; 16]` with name `general`; it exists in every joined conversation, and its membership follows the MLS group. The admin alone may create/rename/set members; explicit member lists must already be MLS group members, while an empty create list means all current members. Any local peer and named recipient who are both MLS and channel members may post text, which is sent only to allowed channel recipients. Channel metadata is broadcast to all group members, remains receipt-gated for local `acknowledged` status, and is not replayed to later joiners. Receipts are MLS-encrypted inside `V3InnerFrame` with `MessageKind::Receipt`; `channel_id` is not added to them. Channel membership is local application policy, not cryptographic access control, because every group member holds the MLS group keys.
 
 ## 5. Receipt semantics (implemented state machine)
 
-- `Composed` — accepted by the local runtime and signed; nothing sent yet.
-- `Queued` — accepted by the offline queue when the peer is observed as disconnected. The queue stores the signed MLS ciphertext envelope only, encrypted in the vault when a session is attached; plaintext display text is memory-only and never persisted by `p2p-chat`.
+- `Composed` — accepted by the local runtime as a v3 envelope; nothing sent yet.
+- `Queued` — accepted by the offline queue when the peer is observed as disconnected. The queue stores ciphertext-only `EnvelopeV3` bytes, encrypted in the vault when a session is attached; plaintext display text is memory-only and never persisted by `p2p-chat`. Stale or foreign v3 queue bytes are revalidated against the current route and exporter MAC before retry.
 - `SentToPeer` — handed to an encrypted transport stream; **not** proof of delivery.
 - `Delivered` — explicit MLS-encrypted `ReceiptStatus::Delivered` received for the exact message ID.
 - `Read` — explicit MLS-encrypted `ReceiptStatus::Read` received for the exact message ID.
@@ -154,7 +201,7 @@ The UI must never collapse `SentToPeer` into `Delivered`. Receipts for unknown m
 
 ### Offline queue retry (implemented)
 
-For a multi-member conversation, `p2p-chat` composes and signs the envelope once and sends that same envelope to every current member. When a recipient is observed as disconnected, the message is marked `Queued` and only its ciphertext bytes are stored in one per-recipient queue entry; other connected recipients receive the frame immediately. With a vault session that entry is encrypted and restored after restart; without one it stays in memory and is lost on restart or lock. Repeated polls while disconnected do not retry. `poll` retries a recipient's queue only after consuming an observed `ConnectionState::Connected` event that includes that recipient and only while the cached network state still shows it connected. A retry reuses the original envelope and message ID, moves that recipient's pending receipt from `Queued` to `SentToPeer`, and requires a separate verified MLS receipt from every expected recipient before the local message becomes `Delivered`. Restore never creates `Delivered`.
+For a multi-member conversation, `p2p-chat` composes the v3 envelope once and sends that same envelope to every current member. When a recipient is observed as disconnected, the message is marked `Queued` and only its ciphertext bytes are stored in one per-recipient queue entry; other connected recipients receive the frame immediately. With a vault session that entry is encrypted and restored after restart; without one it stays in memory and is lost on restart or lock. Repeated polls while disconnected do not retry. `poll` retries a recipient's queue only after consuming an observed `ConnectionState::Connected` event that includes that recipient and only while the cached network state still shows it connected. A retry reuses the original envelope and message ID, moves that recipient's pending receipt from `Queued` to `SentToPeer`, and requires a separate verified MLS receipt from every expected recipient before the local message becomes `Delivered`. Restore never creates `Delivered`.
 
 ### Automatic redial (implemented)
 
@@ -162,12 +209,12 @@ For a multi-member conversation, `p2p-chat` composes and signs the envelope once
 
 ## 6. Replay and ordering (implemented)
 
-- A bounded in-memory cache rejects duplicate `(conversation_id, sender, message_id)` triples; it remains the replay boundary for message envelopes.
-- A strict per-sender high-water mark rejects repeated or regressed `sender_sequence`.
-- Envelopes for a different conversation, a different epoch, or a failed signature are rejected before replay state is touched.
-- `created_at` is display-only and never used for ordering.
-- Incoming envelopes are sorted by `(epoch, sender_sequence, message_id)` after verification.
-- OpenMLS validates the group epoch and MLS authentication on the encrypted body. The outer envelope epoch is compared with both the local conversation epoch and the decrypted MLS epoch.
+- A bounded in-memory cache rejects duplicate `(conversation_id, sender, message_id)` triples recovered from `V3InnerFrame`; it remains the replay boundary for message envelopes.
+- A strict per-sender high-water mark rejects repeated or regressed `sender_sequence` after inner-frame recovery.
+- Frames with a wrong route tag, failed outer MAC, different conversation, or different epoch are rejected before replay state is touched; the sender is recovered only after MLS decryption.
+- `created_at` is recovered from the inner frame, is display-only, and is never used for ordering.
+- Incoming frames are sorted by `(epoch, sender_sequence, message_id)` after route/MAC/MLS verification and inner-frame recovery.
+- OpenMLS validates the group epoch and MLS authentication on the wrapped/decrypted body. The recovered inner epoch is bound to the local conversation and MLS epoch; the v3 outer frame has no epoch field.
 - Setup/group-control frames use their own two-layer boundary: the bounded in-memory digest cache plus the schema-v4 durable digest log described in section 1. Idempotent request retries remain allowed; terminal frames and acknowledgements do not.
 - These local records add no new envelope code, setup code, or wire format, and they do not restore MLS group/ratchet/pending KeyPackage/channel state.
 
@@ -187,7 +234,7 @@ Implemented in M10: logical channels are application frames in one MLS group as 
 
 ## 8. Error handling (implemented locally)
 
-Typed `MessageError` variants include: `UnsupportedVersion`, `BadProtocol`, `TooLarge`, `Truncated`, `TrailingBytes`, `BadKind`, `BadSignature`, `BadPeerId`, `NotEd25519`, `Replay`, `SequenceRegression`, `UnknownMessage`, `WrongConversation`, `EpochMismatch`, `SequenceExhausted`, `InvalidReceipt`, `InvalidStateTransition`, `MissingConversationId`, `WrongLocalIdentity`, `ReplayCacheFull`, `Randomness`, `Identity`, and `Storage`.
+Typed `MessageError` variants include: `UnsupportedVersion`, `BadProtocol`, `TooLarge`, `Truncated`, `TrailingBytes`, `BadKind`, `BadSignature`, `BadPeerId`, `NotEd25519`, `BadRouteTag`, `BadMac`, `BadV3Inner`, `Replay`, `SequenceRegression`, `UnknownMessage`, `WrongConversation`, `EpochMismatch`, `SequenceExhausted`, `InvalidReceipt`, `InvalidStateTransition`, `MissingConversationId`, `WrongLocalIdentity`, `ReplayCacheFull`, `Randomness`, `Identity`, and `Storage`. The controller reports `UnknownMessageRoute` when a route tag matches zero or multiple local groups.
 
 `GroupError` reports static MLS categories such as group setup failure, oversized group messages, sender credential mismatch, and epoch mismatch. `ChatError` reports static application categories such as unexpected sender, not admin, not a group member, group operation pending/rejected, invalid group target, pending KeyPackage missing, conversation not ready, invalid peer ID, invalid channel frame, channel not found/already exists/limit reached, not a channel member, and channel revision conflict. No key material, plaintext, KeyPackage/Welcome/commit bytes, or OpenMLS debug output is retained in errors. Wire failures use `NetworkError`, `MessageEvent::Failed`, or `SetupEvent::Failed` with static, non-secret reason categories. No error text is parsed for control flow.
 
@@ -237,5 +284,6 @@ Optional network behaviours are off/empty by default and applied only when the n
 - Relay client/server modes require user-supplied direct relay addresses. User addresses must end in `/p2p/<peer-id>` and must not contain `/p2p-circuit`. Relay reservations, circuits, and relayed connections are counted from real events and bounded; file transfer is refused on relayed paths.
 - AutoNAT reports `Unknown`, `Private`, or a best-effort observed `Public` status; DCUtR reports hole-punch outcomes. Neither guarantees NAT traversal.
 - Identify hides listen addresses, pushes no address updates, and bounds protocol/agent strings before they reach events or diagnostics; it remains off by default. Ping is low-frequency liveness only.
+- `TransportPrivacyMode::TorRequired` selects a user-configured local SOCKS5 proxy with no direct fallback; this is configured route policy only. Proxy identity, reachability, and real Tor behaviour are unverified, and the mode must not be presented as an anonymity claim.
 
-There is no complete cryptographic channel ACL for policy/default traffic, anonymity protocol, Tor/I2P/mixnet, universal NAT traversal, or end-to-end file-key exchange over relays in this protocol version. Non-default text has a locally tested derived-group boundary with authenticated restart continuity for ready groups, and the GUI reports it separately from parent policy/default traffic without claiming a complete ACL. Two-machine LAN/NAT/relay verification remains external work.
+There is no complete cryptographic channel ACL for policy/default traffic, anonymity protocol, verified Tor/I2P/mixnet, full deniability, universal NAT traversal, or end-to-end file-key exchange over relays in this protocol version. A relay or proxy still observes IP, timing, direction, volume, coarse frame length, and route-tag linkability within an epoch. Non-default text has a locally tested derived-group boundary with authenticated restart continuity for ready groups, and the GUI reports it separately from parent policy/default traffic without claiming a complete ACL. Two-machine LAN/NAT/relay verification remains external work.

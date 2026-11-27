@@ -37,7 +37,7 @@ cargo +1.100.0 test -p p2p-groups --test channel_group_lifecycle --locked
 cargo +1.100.0 test -p p2p-chat --lib --locked
 ```
 
-The first command is the adversarial proof for the P1a primitive; the second proves the P1b bound lifecycle API; the third covers P1c channel-scope round trips, tampering/substitution rejection, controller scope binding, excluded-parent-member rejection, the P1d controller tests for injected ciphertext, derived-group receipts, and rejection of non-default text on the parent group, and the P1e restart tests for bound receipts, queued ciphertext, tampered/incomplete records, and lifecycle deletion. These tests prove cryptographic exclusion and authenticated channel-group restore for non-default controller text, not parent policy metadata confidentiality. P1f adds GUI model tests for default parent-group status, derived readiness, derived setup state, and absence of a complete-ACL claim; the final post-Q GUI-feature run passed **22 tests, 0 failures**.
+The first command is the adversarial proof for the P1a primitive; the second proves the P1b bound lifecycle API; the third covers P1c channel-scope round trips, tampering/substitution rejection, controller scope binding, excluded-parent-member rejection, the P1d controller tests for injected ciphertext, derived-group receipts, and rejection of non-default text on the parent group, and the P1e restart tests for bound receipts, queued ciphertext, tampered/incomplete records, and lifecycle deletion. These tests prove cryptographic exclusion and authenticated channel-group restore for non-default controller text, not parent policy metadata confidentiality. P1f adds GUI model tests for default parent-group status, derived readiness, derived setup state, and absence of a complete-ACL claim; the post-v3 GUI-feature run passed **22 tests, 0 failures**, and the exact command and result are recorded in the final local gate table below.
 
 Targeted P2/P3/P4 adversarial gates:
 
@@ -63,7 +63,20 @@ cargo +1.100.0 test -p p2p-identity --test identity_flow --locked -- --test-thre
 cargo +1.100.0 test -p p2p-desktop --features gui --locked -- --test-threads=1
 ```
 
-These cover P5 fail-closed `TorRequired`, P6 delegation conflicts/expiry/wrong-role/redacted `Debug`, P7 outbound/inbound relay-policy symmetry and native-picker copy, P8 queue-full rejection before composing, P9 classical-only OpenMLS evidence, P10 transferable authorship and clear metadata, P11 independent devices plus portable bundle restore, and P13 oversized requests on every protocol. P12 uses the separate audit/deny/fuzz/SBOM commands in sections 5 and 6. The final serialized workspace run remains the authoritative aggregate gate.
+These cover P5 fail-closed `TorRequired`, P6 delegation conflicts/expiry/wrong-role/redacted `Debug`, P7 outbound/inbound relay-policy symmetry and native-picker copy, P8 queue-full rejection before composing, the historical pre-v3 P9 classical-only OpenMLS and P10 clear-metadata evidence (superseded locally by the hybrid suite and v3 wire below), P11 independent devices plus portable bundle restore, and P13 oversized requests on every protocol. P12 uses the separate audit/deny/fuzz/SBOM commands in sections 5 and 6. The serialized workspace run is the authoritative aggregate gate; its post-v3 result is recorded in the final local gate table below.
+
+### Q3/Q4 targeted adversarial gates (post-v3, local, uncommitted)
+
+```bash
+cargo +1.100.0 test -p p2p-messaging -p p2p-groups --offline -- --test-threads=1
+cargo +1.100.0 test -p p2p-chat --lib --offline -- --test-threads=1
+cargo +1.100.0 test -p p2p-chat --test controller --offline -- --test-threads=1
+cargo +1.100.0 test -p p2p-desktop --features gui --offline -- --test-threads=1
+```
+
+Messaging (`v3` wire): `v3_wire_has_no_stable_sender_or_message_metadata`, `v3_mac_rejects_body_nonce_route_tag_and_version_tampering`, `v3_inner_frame_round_trips_and_rejects_tampering`, `every_v3_prefix_is_rejected_without_panics`, `v3_inner_replay_and_sequence_regression_are_rejected_after_decryption`, `v3_outgoing_sequence_is_consumed_only_after_a_successful_compose`. Groups: `pinned_openmls_advertises_the_enabled_hybrid_ciphersuite`, `hybrid_key_packages_and_welcomes_round_trip`, `v3_round_trip_hides_stable_metadata_from_third_parties`, `v3_rejects_tampering_wrong_route_legacy_wire_and_foreign_groups`, `v3_replay_and_sequence_regression_fail_after_decryption`, `v3_route_tag_and_exporter_keys_are_epoch_bound`. `signed_envelope_exposes_transferable_authorship_and_clear_metadata` is retained only as the historical v2 compatibility test; production rejects v1/v2 application envelopes. Chat/controller tests cover v3 queued frames/receipts and restore-sequence consistency; GUI tests cover 30 status rows and honest hybrid/v3/deniability/proxy wording.
+
+These gates exercise the EnvelopeV3 route tag, nonce, wrapped MLS body, and HMAC-SHA256 tag; stable metadata inside the MLS-protected inner frame; the additional XChaCha20-Poly1305 wrap under a purpose-separated exporter key; the local-only epoch-bound route tag `SHA-256(domain separator, group ID, epoch)` with fail-closed zero/ambiguous route and `BadRouteTag` on mismatch; and setup v4 signed ciphersuite ID (bytes 6..8), transaction ID (bytes 8..24), and `/p2p-messenger/mls-setup/2`, rejecting legacy versions 1–3 and unknown suites. Q4 is bounded wire-level deniability, not delegated application keys: no third-party-verifiable long-term-key authorship proof, but group members with MLS state can still attribute. The hybrid suite `MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519` (`0x004F`) is enabled via the pinned OpenMLS draft feature; `0x004D` is unsupported and signatures/Noise remain classical, so no full-PQ or custom-primitive claim is made. Targeted results are recorded in `SECURITY_MILESTONE_REPORTS.md`; final post-v3 aggregate workspace/GUI/audit/deny/fuzz/SBOM results are recorded in the final local gate table below and in `PROJECT_STATUS.md`.
 
 Fuzz targets:
 
@@ -72,7 +85,7 @@ cargo check --manifest-path fuzz/Cargo.toml
 cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 cd fuzz
 cargo fuzz build
-for target in fuzz_envelope fuzz_setup fuzz_file fuzz_channel fuzz_identity_export fuzz_contact_uri; do
+for target in fuzz_envelope fuzz_v3_envelope fuzz_setup fuzz_file fuzz_channel fuzz_identity_export fuzz_contact_uri; do
   cargo fuzz run "$target" -- -max_total_time=30 -max_len=8192 -timeout=5 -rss_limit_mb=2048
 done
 ```
@@ -86,7 +99,7 @@ done
 | MLS group isolation | `cargo test --locked -p p2p-groups` | 1:1 and three-member setup, Add/Remove/Update, epoch exclusion, stale-epoch rejection |
 | Channel-group primitive | `cargo test --locked -p p2p-groups --test channel_isolation` | Domain-separated ID derivation; excluded parent member cannot decrypt captured ciphertext; locally created same-ID group is not an oracle; channel update does not grant parent access |
 | Bound channel lifecycle | `cargo test --locked -p p2p-groups --test channel_group_lifecycle` | Explicit parent/channel binding; wrong-parent and wrong-channel KeyPackage/Welcome rejection; Add/Update/Remove commits; wrong-sender commit rejection; parent ciphertext rejection |
-| Setup/group control | `cargo test --locked -p p2p-chat` | Signed `MLS1` frames, peer/sender binding, acknowledgement state, strict parsers, signed v2 transaction binding, stale/cross-transaction rejection, bounded 512-entry digest cache, exact request/response replay suppression, durable control-log rejection of exact authenticated terminal replays after restart, idempotent request retry after restart (two controller restart regressions) |
+| Setup/group control | `cargo test --locked -p p2p-chat` | Signed `MLS1` frames, peer/sender binding, acknowledgement state, strict parsers, signed v4 transaction/ciphersuite binding with legacy-version rejection, stale/cross-transaction rejection, bounded 512-entry digest cache, exact request/response replay suppression, durable control-log rejection of exact authenticated terminal replays after restart, idempotent request retry after restart (two controller restart regressions) |
 | Channel policy and routing | `cargo test --locked -p p2p-chat` | Bounded `CHN1` frames, admin-only policy changes, revision checks, parent policy receipts, readiness-gated non-default text, derived-group ciphertext/receipts, exclusion of non-members, and rejection of misplaced frames |
 | Direct network | `cargo test --locked -p p2p-network` | Zero-bootstrap loopback connect, PeerId authentication, duplicate dial rejection, public `dial` circuit rejection before queueing, address validation |
 | Network resilience | `cargo test --locked -p p2p-network` | Pre-authentication global and per-IP socket caps, stalled-socket and extra-per-IP rejection before Noise, established connection caps, aggregate and per-protocol request/byte budgets, denied-request non-charging, expired rate-limiter entry cleanup, malformed/oversized frame handling, peerless-failure state preservation |
@@ -98,7 +111,7 @@ done
 | Storage security | `cargo test --locked -p p2p-storage` | Wrong password, password change, DB/WAL/SHM plaintext scans, symlink refusal on Unix, schema v4 `control_log`/`control_state`, durable idempotent requests and non-repeatable terminal frames across reopen, chain/blind-index/anchor verification on unlock, older-DB-with-current-anchor rollback detection, anchor bit-flip detection, full-log fail-closed behavior, and dedicated/legacy MLS key-version handling |
 | GUI model | `cargo test --locked -p p2p-desktop --features gui` | Honest status rows, address validation, no fake connection state |
 | Diagnostic guard | `python3 scripts/check_diagnostics.py` | Unmarked raw output macros, derived `Debug` on protected types, secret-named types/fields, self-tests for fail-closed behavior |
-| Fuzz smoke | `cargo fuzz run` in `fuzz/` and `cargo clippy --manifest-path fuzz/Cargo.toml` | Canonical codec decoding, signature verification, redacted `Debug`, canonical re-encoding, hostile identity export and contact text |
+| Fuzz smoke | `cargo fuzz run` in `fuzz/` and `cargo clippy --manifest-path fuzz/Cargo.toml` | Canonical legacy/v3 codec decoding, signature/MAC verification, redacted `Debug`, canonical re-encoding, hostile identity export and contact text |
 | SBOM generation | `python3 scripts/generate_sbom.py` | Locked package graph, SPDX identifiers, license normalization, relative paths, dangling-relationship rejection, byte-identical regeneration |
 
 ## 3. Adversarial tests to preserve
@@ -119,7 +132,7 @@ When modifying a codec or state machine, add a test for each applicable case:
 - a saturated protocol bucket that must not consume another protocol's reserved capacity, and a per-protocol denial that must not charge the aggregate request budget;
 - saturated control/setup/file traffic that must not consume the message reservation, a per-protocol denial that must not charge the aggregate budget, and an aggregate ceiling that must still apply;
 - relay observation injection that must not create a contact, verified peer, capability, receipt, or delivery claim;
-- arbitrary bytes reaching the envelope, setup, file, channel, identity-export, and contact/fingerprint parsers without panic, with verified frames re-encoding canonically.
+- arbitrary bytes reaching the legacy envelope, production v3 outer/inner envelope, setup, file, channel, identity-export, and contact/fingerprint parsers without panic, with successfully parsed frames re-encoding canonically.
 
 ## 4. Network privacy tests
 
@@ -135,9 +148,9 @@ The following require external hardware, a real proxy/Tor service, or a controll
 
 ## 5. Fuzz smoke tests
 
-`fuzz/` contains six real libFuzzer targets: `P2P1` envelopes, `MLS1` setup and group-control frames, `CHN1` channel frames, signed file frames, encrypted identity envelopes, and contact URI/fingerprint text. The security workflow builds them with nightly `cargo-fuzz` and runs each for a bounded 30 seconds. Locally, all six binaries also completed plain-libFuzzer 1000-input smoke runs without crashes; those local runs were not coverage-instrumented, so they do not constitute a long campaign.
+`fuzz/` contains seven real libFuzzer targets: legacy `P2P1` envelopes, production `P2P3` v3 envelopes and inner frames, `MLS1` setup and group-control frames, `CHN1` channel frames, signed file frames, encrypted identity envelopes, and contact URI/fingerprint text. The security workflow builds them with nightly `cargo-fuzz` and runs each for a bounded 30 seconds. Locally, all seven binaries also completed plain-libFuzzer 1000-input smoke runs without crashes; those local runs were not coverage-instrumented, so they do not constitute a long campaign.
 
-A dependency-free deterministic smoke test still flips one bit at every offset of a signed `P2P1` envelope and asserts that any successfully parsed mutation fails signature verification; it also asserts that every truncated prefix is rejected. This is a regression guard, not proof of parser correctness.
+A dependency-free deterministic smoke test still flips one bit at every offset of a signed legacy v2 `P2P1` envelope and asserts that any successfully parsed mutation fails signature verification; it also asserts that every truncated prefix is rejected. A v3-specific unit test rejects every truncated prefix of an `EnvelopeV3`, and the new `fuzz_v3_envelope` target parses arbitrary v3 outer and inner bytes and checks canonical re-encoding. These are regression/smoke guards, not proof of parser correctness.
 
 Not covered by these targets: internal transport codec state machines, backup/vault import formats (no such formats exist yet), and a long sanitizer-enabled corpus-building campaign. Treat fuzzing as a bounded smoke control; historical CI was green for earlier baselines, but it is not evidence for this uncommitted work, and a longer coverage-guided campaign is still required before making a broader fuzzing claim.
 
@@ -205,9 +218,31 @@ Checksum sidecars use bare filenames; verification must run from `dist/`. Checks
 - Absence of a plaintext sentinel in one database snapshot is not proof for every platform or future schema.
 - Absence of local detection after restoring the entire vault directory including `control.anchor` is not evidence of rollback resistance; it only shows that no external anchor exists. An external anchor would be an optional, future, user-controlled design, not a current control.
 
-## 8. Final recorded local gates (2026-11-27)
+## 8. Final post-v3 local gates (2026-11-27, uncommitted)
 
-These are local-only results for the final uncommitted P0–P14 code state plus the Q1/Q2/Q5 privacy follow-up. They do not claim CI, release, commit, push, PR, review, merge, user/manual, external, two-machine, visual-GUI, or production verification. Historical 207/257/285/339-test results remain in `PROJECT_STATUS.md` and are not evidence for the SOCKS5, relay-only, or padding changes. Documentation-only reconciliation after the final gates changed no Rust source or lockfile; `git diff --check` was re-run and passed, so the recorded code/build/test results remain valid for the final code state.
+All commands below were run locally from the repository root with Rust 1.100.0 and `--offline` where supported. They are evidence for the exact final uncommitted source state only; no CI, release, commit, push, PR, review, merge, user/manual, external, two-machine, visual-GUI, or production-readiness claim follows.
+
+| Gate | Command | Final post-v3 result |
+|---|---|---|
+| Formatting | `cargo +1.100.0 fmt --all -- --check`; `cargo +1.100.0 fmt --manifest-path fuzz/Cargo.toml -- --check` | Passed. |
+| Diff hygiene | `git diff --check` | Passed. |
+| Diagnostics | `python3 scripts/check_diagnostics.py` | Passed; **65 Rust sources** checked, including the new v3 fuzz target. |
+| Workspace check | `cargo +1.100.0 check --locked --offline --workspace --all-targets` | Passed. |
+| Workspace clippy | `cargo +1.100.0 clippy --locked --offline --workspace --all-targets -- -D warnings` | Passed; two pre-existing advisory manifest warnings remain non-fatal (`p2p-core` in `p2p-crypto`, `zeroize` in `p2p-security`). |
+| Workspace tests | `cargo +1.100.0 test --workspace --locked --offline -- --test-threads=1` | **369 passed, 0 failed** across 26 test suites; 11 doc-test suites and 0 doc-tests. Breakdown: chat 86 (66 unit + 20 integration), core 4, crypto 8, desktop 19, files 20, groups 27 (9 unit + 6 lifecycle + 3 isolation + 9 MLS integration), identity 61 (58 unit + 3 integration), messaging 26 (23 unit + 3 integration), network 58 (46 unit + 12 integration), security 11, storage 49 (12 unit + 28 vault + 9 provider integration). |
+| GUI feature | `cargo +1.100.0 check --locked --offline -p p2p-desktop --features gui`, matching clippy, and `cargo +1.100.0 test --locked --offline -p p2p-desktop --features gui -- --test-threads=1` | Passed; **22 tests, 0 failures**. No visual inspection is claimed. |
+| Native feature | `cargo +1.100.0 check --locked --offline -p p2p-desktop --features native`, matching clippy, and `cargo +1.100.0 build --locked --offline -p p2p-desktop --features native` | Passed; no visual inspection or release claim. |
+| Fuzz locked build | `cargo +1.100.0 check/clippy --locked --offline --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings` and `cargo +1.100.0 build --locked --offline --release --manifest-path fuzz/Cargo.toml --bins` | Passed. |
+| Fuzz smoke | Seven release fuzz binaries, 1000 plain-libFuzzer inputs each | `fuzz_envelope`, `fuzz_v3_envelope`, `fuzz_setup`, `fuzz_file`, `fuzz_channel`, `fuzz_identity_export`, and `fuzz_contact_uri` each completed `Done 1000 runs` without crashes; not coverage-instrumented and not a long campaign. |
+| Root advisories | `cargo audit --file Cargo.lock`; `cargo deny --locked --manifest-path Cargo.toml check` | Zero vulnerabilities across 713 crates with five allowed unmaintained warnings; `advisories ok, bans ok, licenses ok, sources ok`. |
+| Fuzz advisories | `cargo audit --file fuzz/Cargo.lock`; `cargo deny --locked --manifest-path fuzz/Cargo.toml check` | Zero vulnerabilities across 489 crates with two allowed unmaintained warnings; `advisories ok, bans ok, licenses ok, sources ok`. |
+| SBOM | Two `python3 scripts/generate_sbom.py` runs per graph, compared with `cmp` | Root and fuzz documents regenerated byte-for-byte: 489 packages/1633 relationships and 489 packages/1604 relationships. Root lock SHA-256 `fb658b439b66e58aa24a6c7a84dabc3aa635e7cae9c8880dabbbb2c29da1e353`; fuzz lock SHA-256 `a65a47cc41aa3ab99a28ae612ca03f26888f52e0c8954783d4efd39e3fca9c36`. |
+
+Historical CI run IDs and 207/257/285/339/358-test workspace results remain historical baselines and are not evidence for this uncommitted workstream. No result in this table establishes availability, anonymity, full rollback resistance, distributed-flood capacity, signed release identity, reproducibility, or production readiness.
+
+## 9. Historical pre-v3 recorded local gates (2026-11-27)
+
+These are local-only, **historical pre-v3** results for the then-final uncommitted P0–P14 code state plus the Q1/Q2/Q5 privacy follow-up. They do not claim CI, release, commit, push, PR, review, merge, user/manual, external, two-machine, visual-GUI, or production verification. Historical 207/257/285/339-test results remain in `PROJECT_STATUS.md` and are not evidence for the SOCKS5, relay-only, or padding changes. Documentation-only reconciliation after those gates changed no Rust source or lockfile; `git diff --check` was re-run and passed, so the recorded code/build/test results remain valid for that code state. These counts are **not** the current post-v3 results: the Q3/Q4 wire, hybrid ciphersuite, and setup v4 changes came afterwards. They are superseded by the final post-v3 local gate table above; no CI, release, or external verification follows from either table.
 
 | Gate | Command | Result |
 |---|---|---|
@@ -216,8 +251,8 @@ These are local-only results for the final uncommitted P0–P14 code state plus 
 | Diagnostics | `python3 scripts/check_diagnostics.py` | Passed; 64 Rust sources checked. |
 | Workspace check | `cargo +1.100.0 check --locked --workspace --all-targets` | Passed. |
 | Workspace clippy | `cargo +1.100.0 clippy --locked --workspace --all-targets -- -D warnings` | Passed; two pre-existing advisory manifest warnings remain non-fatal (`p2p-core` in `p2p-crypto`, `zeroize` in `p2p-security`). |
-| Workspace tests | `cargo +1.100.0 test --workspace --locked -- --test-threads=1` | **358 passed, 0 failed** across 37 suites, 0 doc-tests: chat 86 (66 unit + 20 integration), core 4, crypto 8, desktop 19, files 20, groups 22 (4 unit + 6 lifecycle + 3 isolation + 9 MLS integration), identity 61 (58 unit + 3 integration), messaging 20 (17 unit + 3 integration), network 58 (46 unit + 12 integration), security 11, storage 49 (12 unit + 28 vault + 9 provider integration). |
-| GUI feature | `cargo +1.100.0 check --locked -p p2p-desktop --features gui`, matching clippy, and `cargo +1.100.0 test -p p2p-desktop --features gui --locked -- --test-threads=1` | Passed; **22 tests, 0 failures**. |
+| Workspace tests | `cargo +1.100.0 test --workspace --locked -- --test-threads=1` | Historical pre-v3: **358 passed, 0 failed** across 37 suites, 0 doc-tests: chat 86 (66 unit + 20 integration), core 4, crypto 8, desktop 19, files 20, groups 22 (4 unit + 6 lifecycle + 3 isolation + 9 MLS integration), identity 61 (58 unit + 3 integration), messaging 20 (17 unit + 3 integration), network 58 (46 unit + 12 integration), security 11, storage 49 (12 unit + 28 vault + 9 provider integration). |
+| GUI feature | `cargo +1.100.0 check --locked -p p2p-desktop --features gui`, matching clippy, and `cargo +1.100.0 test -p p2p-desktop --features gui --locked -- --test-threads=1` | Historical pre-v3: passed; **22 tests, 0 failures**. |
 | Native feature | `cargo +1.100.0 check --locked -p p2p-desktop --features native`, matching clippy, and `cargo +1.100.0 build --locked -p p2p-desktop --features native` | Passed; no visual inspection claimed. |
 | Fuzz locked build | `cargo +1.100.0 check/clippy --locked --manifest-path fuzz/Cargo.toml --all-targets` and `cargo +1.100.0 build --release --locked --manifest-path fuzz/Cargo.toml --bins` | Passed. |
 | Fuzz smoke | Six release fuzz binaries, 1000 plain-libFuzzer inputs each | All six completed without crashes; not coverage-instrumented and not a long campaign. |
@@ -225,4 +260,4 @@ These are local-only results for the final uncommitted P0–P14 code state plus 
 | Fuzz advisories | `cargo audit --file fuzz/Cargo.lock`; `cargo deny --locked --manifest-path fuzz/Cargo.toml check` | Zero vulnerabilities with two allowed unmaintained warnings; `advisories ok, bans ok, licenses ok, sources ok` after the SOCKS5 dependency and lock refresh. |
 | SBOM | Two `python3 scripts/generate_sbom.py` runs per graph, compared with `cmp` | Root and fuzz documents regenerated byte-for-byte, 480 packages each; root lock SHA-256 `03e4451bab061e6c08950669c66a91ffbc0d368fb27691d10cc654132bf90ba0`, fuzz lock SHA-256 `fc1c7a4e7f644e06686cf6d0cff1437985219062034bc581aba71e5ccf3312fb`. |
 
-The aggregate workspace and GUI test runs are authoritative; targeted commands above are retained for diagnosis. No result in this section establishes availability, anonymity, full rollback resistance, distributed-flood capacity, signed release identity, reproducibility, or production readiness.
+The workspace and GUI test runs recorded in this section are historical pre-v3 results, authoritative only for that code state; targeted commands above are retained for diagnosis. Current post-v3 aggregate results are recorded in the final local gate table above. No result in this document establishes availability, anonymity, full rollback resistance, distributed-flood capacity, signed release identity, reproducibility, or production readiness.

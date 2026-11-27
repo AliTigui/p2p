@@ -16,6 +16,12 @@ pub enum MessageError {
     Truncated,
     #[error("message envelope has trailing bytes")]
     TrailingBytes,
+    #[error("message envelope authentication tag is invalid")]
+    BadMac,
+    #[error("message route tag does not match the local group")]
+    BadRouteTag,
+    #[error("MLS-protected message metadata is malformed")]
+    BadV3Inner,
     #[error("unknown message kind code {0}")]
     BadKind(u8),
     #[error("message signature is invalid")]

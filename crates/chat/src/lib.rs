@@ -34,7 +34,9 @@ pub use p2p_files::{
     FileConfig, FileTransferInfo, QuarantineDeletionPolicy, ReleaseApproval, ReleasedFile,
     TransferDirection, TransferStatus,
 };
-pub use p2p_groups::{CommitOutcome, GroupError as GroupCryptoError, GroupOperation};
+pub use p2p_groups::{
+    CIPHERSUITE_ID, CommitOutcome, GroupError as GroupCryptoError, GroupOperation,
+};
 pub use p2p_security::{
     FileFormat, FileScanner, MAX_RELEASE_BYTES, MAX_RELEASE_CHUNKS, MAX_RELEASE_NAME_BYTES,
     ReleasePolicy, ReleaseRejection, ScanOutcome, ScanRequest, ScanResult, ScanStatus,
@@ -89,6 +91,10 @@ pub enum ChatError {
     NoActiveConversation,
     #[error("conversation is unknown")]
     UnknownConversation,
+    #[error("message route tag matched no local MLS group")]
+    UnknownMessageRoute,
+    #[error("message route tag matched more than one local MLS group")]
+    AmbiguousMessageRoute,
     #[error("conversation setup is not complete")]
     ConversationNotReady,
     #[error("only the group administrator may perform this action")]

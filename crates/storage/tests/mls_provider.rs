@@ -19,7 +19,7 @@ use p2p_storage::{MlsProviderError, StagedMlsProvider, Vault};
 
 const USERNAME: &str = "MLS_PROVIDER_USER_42";
 const PASSWORD: &str = "MLS_PROVIDER_PASSWORD_99";
-const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519;
 
 /// Signer backed by the device-specific Ed25519 identity, mirroring the
 /// application's group layer.

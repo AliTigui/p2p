@@ -58,8 +58,8 @@ tokio-util = { version = "0.7", features = ["compat"] }
 libp2p-identity = { version = "0.3.1", features = ["ed25519", "rand", "peerid"] }
 libp2p-request-response = "=0.30.0"
 openmls = "=0.10.0-rc.1"
-openmls_rust_crypto = "=0.7.0-rc.1"
-openmls_traits = "=0.7.0-rc.1"
+openmls_rust_crypto = { version = "=0.7.0-rc.1", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_traits = { version = "=0.7.0-rc.1", features = ["draft-ietf-mls-pq-ciphersuites"] }
 argon2 = "0.6"
 hkdf = "0.13"
 hmac = "0.13"

@@ -54,8 +54,8 @@ pub use privacy::{
     RelayEvent, RelayMode, TransportPrivacyMode,
 };
 pub use protocol::{
-    CONTROL_PROTOCOL, FILE_PROTOCOL, MAX_MESSAGE_BYTES, MESSAGE_PROTOCOL, MLS_SETUP_PROTOCOL,
-    MessageCodec,
+    CONTROL_PROTOCOL, FILE_PROTOCOL, LEGACY_MLS_SETUP_PROTOCOL, MAX_MESSAGE_BYTES,
+    MESSAGE_PROTOCOL, MLS_SETUP_PROTOCOL, MessageCodec,
 };
 
 // The derive emits an `unreachable!()` arm for event variants that cannot occur
@@ -3813,7 +3813,9 @@ mod tests {
     #[test]
     fn message_frame_bounds_are_checked_before_queueing() {
         assert_eq!(MESSAGE_PROTOCOL, "/p2p-messenger/message/1");
-        assert_eq!(MLS_SETUP_PROTOCOL, "/p2p-messenger/mls-setup/1");
+        assert_eq!(MLS_SETUP_PROTOCOL, "/p2p-messenger/mls-setup/2");
+        assert_eq!(LEGACY_MLS_SETUP_PROTOCOL, "/p2p-messenger/mls-setup/1");
+        assert_ne!(MLS_SETUP_PROTOCOL, LEGACY_MLS_SETUP_PROTOCOL);
         assert_eq!(FILE_PROTOCOL, "/p2p-messenger/file/1");
         assert!(matches!(
             validate_message_bytes(&[]),

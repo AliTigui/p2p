@@ -15,10 +15,10 @@ use p2p_files::{
 };
 use p2p_groups::{
     ChannelGroupBinding, ChannelKeyPackage, ChannelWelcome, GroupOperation, MlsChannelGroup,
-    MlsConversation, MlsKeyPackage, channel_group_id,
+    MlsConversation, MlsKeyPackage, channel_group_id, v3_route_tag,
 };
 use p2p_identity::Identity;
-use p2p_messaging::{DeliveryState, Envelope, MessageKind, ReceiptStatus, random_id};
+use p2p_messaging::{DeliveryState, EnvelopeV3, MessageKind, ReceiptStatus, random_id};
 use p2p_network::{
     ConnectionState, FileEvent, FileRequestId, FileResponseId, MessageEvent, MessageRequestId,
     Network, NetworkConfig, NetworkPrivacyStatus, SetupEvent, SetupResponseId,
@@ -1470,6 +1470,19 @@ impl MessengerController {
 
             let mut state = ConversationState::new(conversation, admin, members.clone());
             state.conversation.restore_epoch(epoch)?;
+            // Every still-pending outgoing message consumed a distinct local
+            // sequence, and a queued frame proves at least one compose. A
+            // restored snapshot that understates the sequence could reuse it
+            // after restart, so fail closed. Version 1 lacks authenticated
+            // outgoing history and is checked by its legacy rules above.
+            if record.version == PERSISTED_CONVERSATION_VERSION
+                && (record.next_sequence < (record.outgoing.len() as u64).saturating_add(1)
+                    || (!record.queued.is_empty() && record.next_sequence < 2))
+            {
+                return Err(ChatError::MlsRestore(
+                    "restored conversation sequence predates its outgoing history",
+                ));
+            }
             state.conversation.restore_sequence(record.next_sequence)?;
             state.channels.clear();
             for channel in record.channels {
@@ -1553,23 +1566,12 @@ impl MessengerController {
                         "restored queued message is inconsistent",
                     ));
                 }
-                let envelope = Envelope::from_bytes(&item.envelope_bytes)
-                    .map_err(|_| ChatError::MlsRestore("restored queue envelope is invalid"))?;
-                envelope.verify().map_err(|_| {
-                    ChatError::MlsRestore("restored queue envelope signature is invalid")
-                })?;
-                if envelope.conversation_id != conversation_id
-                    || envelope.message_id != item.message_id
-                    || envelope.sender != local
-                    || envelope.epoch != epoch
-                    || envelope.sender_sequence == 0
-                    || envelope.sender_sequence >= record.next_sequence
-                    || envelope.kind != MessageKind::Channel
-                {
-                    return Err(ChatError::MlsRestore(
-                        "restored queue envelope is not bound to this conversation",
-                    ));
-                }
+                state
+                    .conversation
+                    .verify_queued_v3(&item.envelope_bytes)
+                    .map_err(|_| {
+                        ChatError::MlsRestore("restored v3 queue frame is not group-authenticated")
+                    })?;
                 queued_messages.push_back(QueuedMessage {
                     peer: queued_peer,
                     conversation_id,
@@ -1749,6 +1751,13 @@ impl MessengerController {
                 ));
             }
             group.restore_epoch(record.epoch)?;
+            if record.next_sequence < (record.outgoing.len() as u64).saturating_add(1)
+                || (!record.queued.is_empty() && record.next_sequence < 2)
+            {
+                return Err(ChatError::MlsRestore(
+                    "restored channel sequence predates its outgoing history",
+                ));
+            }
             group.restore_sequence(record.next_sequence)?;
             let mls_members: BTreeSet<PeerId> = group.members()?.into_iter().collect();
             if mls_members != group_members {
@@ -1790,24 +1799,11 @@ impl MessengerController {
                         "restored channel queued message is inconsistent",
                     ));
                 }
-                let envelope = Envelope::from_bytes(&item.envelope_bytes).map_err(|_| {
-                    ChatError::MlsRestore("restored channel queue envelope is invalid")
+                group.verify_queued_v3(&item.envelope_bytes).map_err(|_| {
+                    ChatError::MlsRestore(
+                        "restored channel v3 queue frame is not group-authenticated",
+                    )
                 })?;
-                envelope.verify().map_err(|_| {
-                    ChatError::MlsRestore("restored channel queue envelope signature is invalid")
-                })?;
-                if envelope.conversation_id != group_id
-                    || envelope.message_id != item.message_id
-                    || envelope.sender != local
-                    || envelope.epoch != record.epoch
-                    || envelope.sender_sequence == 0
-                    || envelope.sender_sequence >= record.next_sequence
-                    || envelope.kind != MessageKind::Channel
-                {
-                    return Err(ChatError::MlsRestore(
-                        "restored channel queue envelope is not bound to this group",
-                    ));
-                }
                 queued_messages.push_back(QueuedMessage {
                     peer: queued_peer,
                     conversation_id: record.parent_conversation_id,
@@ -5929,20 +5925,21 @@ impl MessengerController {
             if !state.ready {
                 return Err(ChatError::ChannelGroupNotReady);
             }
-            let envelope = state
-                .group
-                .compose(&self.identity, MessageKind::Channel, &body)?;
-            (envelope.message_id, envelope.to_bytes()?)
+            let (envelope, message_id) =
+                state
+                    .group
+                    .compose_v3(&self.identity, MessageKind::Channel, &body)?;
+            (message_id, envelope.to_bytes()?)
         } else {
             let state = self
                 .conversations
                 .get_mut(&conversation_id)
                 .ok_or(ChatError::UnknownConversation)?;
-            let envelope =
+            let (envelope, message_id) =
                 state
                     .conversation
-                    .compose(&self.identity, MessageKind::Channel, &body)?;
-            (envelope.message_id, envelope.to_bytes()?)
+                    .compose_v3(&self.identity, MessageKind::Channel, &body)?;
+            (message_id, envelope.to_bytes()?)
         };
 
         let has_offline = recipients
@@ -6037,21 +6034,22 @@ impl MessengerController {
         peer: PeerId,
         bytes: &[u8],
     ) -> Result<Option<Vec<u8>>, ChatError> {
-        let envelope = Envelope::from_bytes(bytes)?;
-        let kind = envelope.kind;
+        let envelope = EnvelopeV3::from_bytes(bytes)?;
 
-        let group_id = envelope.conversation_id;
-        let (parent_conversation_id, derived_channel) =
-            if self.conversations.contains_key(&group_id) {
-                let state = self
-                    .conversations
-                    .get(&group_id)
-                    .ok_or(ChatError::UnknownConversation)?;
+        // The outer tag is a local selector only. It is checked against every
+        // current parent and derived group before any ciphertext is decrypted;
+        // ambiguity or absence fails closed rather than guessing a group.
+        let mut routes = Vec::new();
+        for (id, state) in &self.conversations {
+            if envelope.route_tag == v3_route_tag(*id, state.conversation.epoch()) {
                 if !state.members.contains(&peer) {
                     return Err(ChatError::NotGroupMember);
                 }
-                (group_id, None)
-            } else if let Some(state) = self.channel_groups.get(&group_id) {
+                routes.push((*id, None, *id));
+            }
+        }
+        for (group_id, state) in &self.channel_groups {
+            if envelope.route_tag == v3_route_tag(*group_id, state.group.epoch()) {
                 let parent = state.binding.parent_conversation_id();
                 let channel = state.binding.channel_id();
                 let parent_state = self
@@ -6068,24 +6066,32 @@ impl MessengerController {
                 {
                     return Err(ChatError::NotChannelMember);
                 }
-                (parent, Some(channel))
-            } else {
-                return Err(ChatError::UnknownConversation);
-            };
+                routes.push((parent, Some(channel), *group_id));
+            }
+        }
+        let (parent_conversation_id, derived_channel, group_id) = match routes.as_slice() {
+            [] => return Err(ChatError::UnknownMessageRoute),
+            [route] => *route,
+            _ => return Err(ChatError::AmbiguousMessageRoute),
+        };
 
-        let (message_id, plaintext, receipt_bytes, channel_text, apply_error) = {
+        let (message_id, plaintext, receipt_bytes, channel_text, apply_error, kind) = {
             if let Some(channel_id) = derived_channel {
-                if kind != MessageKind::Channel {
-                    return Err(ChatError::InvalidChannelFrame(
-                        "derived channel group accepted a non-channel frame",
-                    ));
-                }
                 let received = self
                     .channel_groups
                     .get_mut(&group_id)
                     .ok_or(ChatError::ChannelGroupNotReady)?
                     .group
-                    .receive(envelope)?;
+                    .receive_v3(envelope)?;
+                if received.metadata.sender != peer {
+                    return Err(ChatError::UnexpectedSender);
+                }
+                if received.metadata.kind != MessageKind::Channel {
+                    return Err(ChatError::InvalidChannelFrame(
+                        "derived channel group accepted a non-channel frame",
+                    ));
+                }
+                let kind = received.metadata.kind;
                 let message_id = received.metadata.message_id;
                 let plaintext = received.plaintext.to_vec();
                 let mut channel_text = None;
@@ -6121,7 +6127,8 @@ impl MessengerController {
                         .get_mut(&group_id)
                         .ok_or(ChatError::ChannelGroupNotReady)?
                         .group
-                        .receipt(&self.identity, ReceiptStatus::Delivered, message_id)?;
+                        .receipt_v3(&self.identity, ReceiptStatus::Delivered, message_id)?
+                        .0;
                     Some(receipt.to_bytes()?)
                 };
                 (
@@ -6130,21 +6137,26 @@ impl MessengerController {
                     receipt_bytes,
                     channel_text,
                     apply_error,
+                    kind,
                 )
             } else {
                 let state = self
                     .conversations
                     .get_mut(&parent_conversation_id)
                     .ok_or(ChatError::UnknownConversation)?;
-                let received = state.conversation.receive(envelope)?;
+                let received = state.conversation.receive_v3(envelope)?;
+                if received.metadata.sender != peer {
+                    return Err(ChatError::UnexpectedSender);
+                }
+                let kind = received.metadata.kind;
                 let message_id = received.metadata.message_id;
                 let plaintext = received.plaintext.to_vec();
-                if received.metadata.kind == MessageKind::Receipt {
-                    (message_id, plaintext, None, None, None)
+                if kind == MessageKind::Receipt {
+                    (message_id, plaintext, None, None, None, kind)
                 } else {
                     let mut channel_text = None;
                     let mut apply_error = None;
-                    if received.metadata.kind == MessageKind::Channel {
+                    if kind == MessageKind::Channel {
                         match ChannelFrame::from_bytes(&plaintext) {
                             Ok(frame) => {
                                 if matches!(frame.kind, ChannelFrameKind::Text { .. })
@@ -6165,19 +6177,19 @@ impl MessengerController {
                         }
                     }
                     if apply_error.is_some() {
-                        (message_id, plaintext, None, None, apply_error)
+                        (message_id, plaintext, None, None, apply_error, kind)
                     } else {
-                        let receipt = state.conversation.receipt(
-                            &self.identity,
-                            ReceiptStatus::Delivered,
-                            message_id,
-                        )?;
+                        let receipt = state
+                            .conversation
+                            .receipt_v3(&self.identity, ReceiptStatus::Delivered, message_id)?
+                            .0;
                         (
                             message_id,
                             plaintext,
                             Some(receipt.to_bytes()?),
                             channel_text,
                             None,
+                            kind,
                         )
                     }
                 }
@@ -6237,7 +6249,7 @@ impl MessengerController {
             return Ok(());
         };
         let peer = identity_peer(swarm_peer)?;
-        let envelope = Envelope::from_bytes(bytes)?;
+        let envelope = EnvelopeV3::from_bytes(bytes)?;
         let parent_conversation_id = *self
             .message_conversations
             .get(&local_message_id)
@@ -6247,11 +6259,8 @@ impl MessengerController {
             Some(channel_id) => channel_group_id(parent_conversation_id, channel_id),
             None => parent_conversation_id,
         };
-        if envelope.conversation_id != expected_group_id {
-            return Err(ChatError::InvalidChannelFrame(
-                "receipt MLS group does not match the composed message",
-            ));
-        }
+        // `receive_v3` binds the route tag, exporter MAC, MLS group, and inner
+        // sender before the receipt body is parsed.
         let received = if let Some(channel_id) = channel_id {
             let parent_state = self
                 .conversations
@@ -6270,7 +6279,7 @@ impl MessengerController {
             let Some(state) = self.channel_groups.get_mut(&expected_group_id) else {
                 return Ok(());
             };
-            state.group.receive(envelope)?
+            state.group.receive_v3(envelope)?
         } else {
             let state = self
                 .conversations
@@ -6279,8 +6288,16 @@ impl MessengerController {
             if !state.members.contains(&peer) {
                 return Err(ChatError::NotGroupMember);
             }
-            state.conversation.receive(envelope)?
+            state.conversation.receive_v3(envelope)?
         };
+        if received.metadata.sender != peer {
+            return Err(ChatError::UnexpectedSender);
+        }
+        if received.metadata.kind != MessageKind::Receipt {
+            return Err(ChatError::InvalidChannelFrame(
+                "v3 response was not an MLS-protected receipt",
+            ));
+        }
         let mut setup_trigger = None;
         if let Some(receipt) = received.metadata.receipt {
             if receipt.message_id != local_message_id {
@@ -6386,6 +6403,7 @@ mod tests {
     use super::*;
     use p2p_groups::GroupError;
     use p2p_identity::IdentityRole;
+    use p2p_messaging::MessageError;
     use p2p_storage::Vault;
 
     fn mls_public_key(identity: &Identity) -> Vec<u8> {
@@ -6648,8 +6666,8 @@ mod tests {
         let (admin, allowed, binding, mut admin_group, _allowed_group) =
             bound_channel_pair(parent, channel);
         let frame = ChannelFrame::text(channel, 1, secret).expect("channel text frame");
-        let envelope = admin_group
-            .compose(
+        let (envelope, _message_id) = admin_group
+            .compose_v3(
                 &admin,
                 MessageKind::Channel,
                 &frame.to_bytes().expect("frame bytes"),
@@ -6665,7 +6683,7 @@ mod tests {
         let error = controller
             .receive_message(admin.peer_id(), &ciphertext)
             .expect_err("excluded member has no bound channel group");
-        assert!(matches!(error, ChatError::UnknownConversation));
+        assert!(matches!(error, ChatError::UnknownMessageRoute));
         assert!(controller.messages.is_empty());
         assert_eq!(controller.last_error, None);
         assert!(binding.group_id() != parent);
@@ -6679,8 +6697,8 @@ mod tests {
         let (admin, allowed, binding, mut admin_group, allowed_group) =
             bound_channel_pair(parent, channel);
         let frame = ChannelFrame::text(channel, 1, secret).expect("channel text frame");
-        let envelope = admin_group
-            .compose(
+        let (envelope, message_id) = admin_group
+            .compose_v3(
                 &admin,
                 MessageKind::Channel,
                 &frame.to_bytes().expect("frame bytes"),
@@ -6707,15 +6725,15 @@ mod tests {
             .receive_message(admin.peer_id(), &ciphertext)
             .expect("bound member decrypts channel ciphertext")
             .expect("delivery receipt");
-        let receipt = Envelope::from_bytes(&receipt_bytes).expect("decode receipt");
-        assert_eq!(receipt.conversation_id, binding.group_id());
-        assert_eq!(receipt.kind, MessageKind::Receipt);
+        let receipt = EnvelopeV3::from_bytes(&receipt_bytes).expect("decode receipt");
         let verified = admin_group
-            .receive(receipt)
+            .receive_v3(receipt)
             .expect("receipt is in admin group");
+        assert_eq!(verified.metadata.sender, allowed.peer_id());
+        assert_eq!(verified.metadata.kind, MessageKind::Receipt);
         assert_eq!(
             verified.metadata.receipt.expect("receipt body").message_id,
-            envelope.message_id
+            message_id
         );
         assert_eq!(controller.messages.len(), 1);
         assert_eq!(controller.messages[0].channel_id, channel);
@@ -6758,15 +6776,15 @@ mod tests {
             },
         );
         let frame = ChannelFrame::text(channel, 1, secret).expect("channel text frame");
-        let envelope = admin_parent
-            .compose(
+        let parent = admin_parent.id();
+        let (envelope, _message_id) = admin_parent
+            .compose_v3(
                 &admin,
                 MessageKind::Channel,
                 &frame.to_bytes().expect("frame bytes"),
             )
             .expect("compose parent-group frame");
         let ciphertext = envelope.to_bytes().expect("encode parent-group frame");
-        let parent = envelope.conversation_id;
         let mut controller =
             MessengerController::start(&member, NetworkConfig::default()).expect("controller");
         controller.conversations.insert(parent, state);
@@ -7440,19 +7458,19 @@ mod tests {
         secret: &str,
     ) -> QueuedMessage {
         let conversation_id = state.conversation.id();
-        let envelope = state
+        let (envelope, message_id) = state
             .conversation
-            .compose(identity, MessageKind::Channel, secret.as_bytes())
+            .compose_v3(identity, MessageKind::Channel, secret.as_bytes())
             .expect("compose queued frame");
         state
             .conversation
-            .mark_queued(&envelope.message_id)
+            .mark_queued(&message_id)
             .expect("mark queued");
         QueuedMessage {
             peer,
             conversation_id,
             channel_id: DEFAULT_CHANNEL_ID,
-            message_id: envelope.message_id,
+            message_id,
             envelope_bytes: envelope.to_bytes().expect("encode queued envelope"),
         }
     }
@@ -7769,15 +7787,14 @@ mod tests {
             identity.peer_id(),
             BTreeSet::from([identity.peer_id(), peer.peer_id()]),
         );
-        let envelope = state
+        let (_envelope, message_id) = state
             .conversation
-            .compose(&identity, MessageKind::Channel, b"ciphertext")
+            .compose_v3(&identity, MessageKind::Channel, b"ciphertext")
             .expect("compose outgoing frame");
         state
             .conversation
-            .mark_sent_to_peer(&envelope.message_id)
+            .mark_sent_to_peer(&message_id)
             .expect("mark sent to peer");
-        let message_id = envelope.message_id;
         state
             .channels
             .get_mut(&DEFAULT_CHANNEL_ID)
@@ -8557,14 +8574,13 @@ mod tests {
             .expect("peer joins channel group");
 
         let frame = ChannelFrame::text(channel, 1, secret).expect("channel text frame");
-        let envelope = admin_group
-            .compose(
+        let (envelope, message_id) = admin_group
+            .compose_v3(
                 &identity,
                 MessageKind::Channel,
                 &frame.to_bytes().expect("frame bytes"),
             )
             .expect("compose queued channel ciphertext");
-        let message_id = envelope.message_id;
         admin_group
             .mark_queued(&message_id)
             .expect("mark queued ciphertext");
@@ -8805,8 +8821,9 @@ mod tests {
 
         let parent_receipt = fixture
             .peer_parent
-            .receipt(&fixture.peer, ReceiptStatus::Delivered, fixture.message_id)
+            .receipt_v3(&fixture.peer, ReceiptStatus::Delivered, fixture.message_id)
             .expect("peer parent receipt")
+            .0
             .to_bytes()
             .expect("encode parent receipt");
         let first_request = controller
@@ -8818,7 +8835,9 @@ mod tests {
             .insert(first_request, fixture.message_id);
         assert!(matches!(
             controller.handle_message_response(first_request, swarm_peer, &parent_receipt),
-            Err(ChatError::InvalidChannelFrame(_))
+            Err(ChatError::Group(GroupError::Message(
+                MessageError::BadRouteTag
+            )))
         ));
         assert!(
             controller
@@ -8828,8 +8847,9 @@ mod tests {
 
         let channel_receipt = fixture
             .peer_group
-            .receipt(&fixture.peer, ReceiptStatus::Delivered, fixture.message_id)
+            .receipt_v3(&fixture.peer, ReceiptStatus::Delivered, fixture.message_id)
             .expect("peer channel receipt")
+            .0
             .to_bytes()
             .expect("encode channel receipt");
         let second_request = controller

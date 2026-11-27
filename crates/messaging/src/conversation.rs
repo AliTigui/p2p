@@ -8,7 +8,9 @@ use p2p_identity::Identity;
 use p2p_storage::Session;
 
 use crate::envelope::{now_seconds, random_id};
-use crate::{Envelope, EnvelopeParams, MessageError, MessageKind, Receipt, ReceiptStatus};
+use crate::{
+    Envelope, EnvelopeParams, MessageError, MessageKind, Receipt, ReceiptStatus, V3InnerFrame,
+};
 
 const DEFAULT_REPLAY_CAPACITY: usize = 4096;
 
@@ -158,6 +160,92 @@ impl Conversation {
             .insert(envelope.message_id, DeliveryState::Composed);
         self.next_sequence = next;
         Ok(envelope)
+    }
+
+    /// Build the metadata that will be encrypted inside a v3 MLS body. No
+    /// state is consumed until [`Self::record_outgoing_v3`] succeeds, so a
+    /// failed MLS encryption cannot skip a sequence number.
+    pub fn prepare_v3_inner(
+        &self,
+        identity: &Identity,
+        kind: MessageKind,
+        application_body: &[u8],
+    ) -> Result<V3InnerFrame, MessageError> {
+        if identity.peer_id() != self.local {
+            return Err(MessageError::WrongLocalIdentity);
+        }
+        if application_body.is_empty() {
+            return Err(MessageError::BadV3Inner);
+        }
+        Ok(V3InnerFrame {
+            conversation_id: self.id,
+            message_id: random_id()?,
+            sender: identity.peer_id(),
+            sender_sequence: self.next_sequence,
+            created_at: now_seconds(),
+            kind,
+            body: application_body.to_vec(),
+        })
+    }
+
+    /// Commit local state for an outgoing v3 frame after MLS encryption and
+    /// MAC computation have succeeded.
+    pub fn record_outgoing_v3(&mut self, inner: &V3InnerFrame) -> Result<(), MessageError> {
+        if inner.sender == self.local
+            && inner.conversation_id == self.id
+            && inner.sender_sequence == self.next_sequence
+            && inner.sender_sequence > 0
+        {
+            let next = inner
+                .sender_sequence
+                .checked_add(1)
+                .ok_or(MessageError::SequenceExhausted)?;
+            self.replay.check_and_record_values(
+                self.id,
+                inner.sender.to_bytes(),
+                inner.message_id,
+                inner.sender_sequence,
+            )?;
+            self.outgoing
+                .insert(inner.message_id, DeliveryState::Composed);
+            self.next_sequence = next;
+            return Ok(());
+        }
+        Err(MessageError::InvalidStateTransition)
+    }
+
+    /// Apply a v3 inner frame only after the outer MAC and MLS decryption have
+    /// bound it to this group. Replay, sequence, and receipt policy are still
+    /// enforced here; no clear wire field is trusted.
+    pub fn receive_v3(&mut self, inner: V3InnerFrame) -> Result<ReceivedMessage, MessageError> {
+        if inner.conversation_id != self.id {
+            return Err(MessageError::WrongConversation);
+        }
+        if inner.sender_sequence == 0 {
+            return Err(MessageError::SequenceRegression);
+        }
+        self.replay.check_and_record_values(
+            self.id,
+            inner.sender.to_bytes(),
+            inner.message_id,
+            inner.sender_sequence,
+        )?;
+
+        let receipt = if inner.kind == MessageKind::Receipt {
+            let receipt = Receipt::from_bytes(&inner.body)?;
+            self.apply_receipt(receipt)?;
+            Some(receipt)
+        } else {
+            None
+        };
+        Ok(ReceivedMessage {
+            message_id: inner.message_id,
+            sender: inner.sender,
+            kind: inner.kind,
+            epoch: self.epoch,
+            sender_sequence: inner.sender_sequence,
+            receipt,
+        })
     }
 
     /// Verify envelope authenticity, conversation binding, and epoch without
@@ -412,21 +500,35 @@ impl ReplayCache {
     }
 
     fn check_and_record(&mut self, envelope: &Envelope) -> Result<(), MessageError> {
-        let sender = envelope.sender.to_bytes();
+        self.check_and_record_values(
+            envelope.conversation_id,
+            envelope.sender.to_bytes(),
+            envelope.message_id,
+            envelope.sender_sequence,
+        )
+    }
+
+    fn check_and_record_values(
+        &mut self,
+        conversation: [u8; 16],
+        sender: Vec<u8>,
+        message_id: [u8; 16],
+        sender_sequence: u64,
+    ) -> Result<(), MessageError> {
         let key = ReplayKey {
-            conversation: envelope.conversation_id,
+            conversation,
             sender: sender.clone(),
-            message_id: envelope.message_id,
+            message_id,
         };
         if self.seen.contains_key(&key) {
             return Err(MessageError::Replay);
         }
         let sequence_key = SequenceKey {
-            conversation: envelope.conversation_id,
+            conversation,
             sender,
         };
         if let Some(&last) = self.last_sequence.get(&sequence_key)
-            && envelope.sender_sequence <= last
+            && sender_sequence <= last
         {
             return Err(MessageError::SequenceRegression);
         }
@@ -446,8 +548,7 @@ impl ReplayCache {
         }
         self.seen.insert(key.clone(), ());
         self.order.push_back(key);
-        self.last_sequence
-            .insert(sequence_key, envelope.sender_sequence);
+        self.last_sequence.insert(sequence_key, sender_sequence);
         Ok(())
     }
 }
@@ -586,6 +687,81 @@ mod tests {
         assert!(matches!(
             conversation.receive(old_sequence),
             Err(MessageError::SequenceRegression)
+        ));
+    }
+
+    #[test]
+    fn v3_inner_replay_and_sequence_regression_are_rejected_after_decryption() {
+        let (local, remote) = identities();
+        let mut conversation = Conversation::with_id(local.peer_id(), [9u8; 16]);
+        let inner = V3InnerFrame {
+            conversation_id: [9u8; 16],
+            message_id: [10u8; 16],
+            sender: remote.peer_id(),
+            sender_sequence: 1,
+            created_at: 0,
+            kind: MessageKind::Text,
+            body: b"MLS-protected body".to_vec(),
+        };
+
+        conversation
+            .receive_v3(inner.clone())
+            .expect("first receive");
+        assert!(matches!(
+            conversation.receive_v3(inner),
+            Err(MessageError::Replay)
+        ));
+
+        let old_sequence = V3InnerFrame {
+            conversation_id: [9u8; 16],
+            message_id: [11u8; 16],
+            sender: remote.peer_id(),
+            sender_sequence: 1,
+            created_at: 0,
+            kind: MessageKind::Text,
+            body: b"older frame".to_vec(),
+        };
+        assert!(matches!(
+            conversation.receive_v3(old_sequence),
+            Err(MessageError::SequenceRegression)
+        ));
+
+        let wrong_conversation = V3InnerFrame {
+            conversation_id: [12u8; 16],
+            message_id: [13u8; 16],
+            sender: remote.peer_id(),
+            sender_sequence: 2,
+            created_at: 0,
+            kind: MessageKind::Text,
+            body: b"foreign frame".to_vec(),
+        };
+        assert!(matches!(
+            conversation.receive_v3(wrong_conversation),
+            Err(MessageError::WrongConversation)
+        ));
+    }
+
+    #[test]
+    fn v3_outgoing_sequence_is_consumed_only_after_a_successful_compose() {
+        let (local, _) = identities();
+        let mut conversation = Conversation::with_id(local.peer_id(), [14u8; 16]);
+        let inner = conversation
+            .prepare_v3_inner(&local, MessageKind::Text, b"cipher")
+            .expect("prepared inner frame");
+        assert_eq!(inner.sender_sequence, 1);
+        assert_eq!(conversation.next_sequence(), 1);
+
+        conversation
+            .record_outgoing_v3(&inner)
+            .expect("committed outgoing frame");
+        assert_eq!(conversation.next_sequence(), 2);
+        assert_eq!(
+            conversation.delivery_state(&inner.message_id),
+            Some(DeliveryState::Composed)
+        );
+        assert!(matches!(
+            conversation.record_outgoing_v3(&inner),
+            Err(MessageError::InvalidStateTransition)
         ));
     }
 

@@ -211,7 +211,7 @@ pub fn file_send_summary() -> &'static str {
 /// Detailed network wording is opt-in so the default screen stays calm. All
 /// values remain off/empty unless the user changes them explicitly.
 pub fn network_settings_details() -> &'static str {
-    "Optional capabilities are off and address lists are empty by default. Discovery candidates are advisory only: never auto-dialed, trusted, or fingerprint-verified. Relay-only routing avoids direct peer connections, but relay operators still see IPs, timing, and sizes and can deny service; file transfer over a relay is disabled. A SOCKS5/Tor route requires a local proxy address and removes direct listeners and DNS lookups from this app; the proxy itself is not verified, and timing correlation remains possible. AutoNAT, mDNS and DCUtR are disabled with SOCKS5/Tor routes. There is no Tor/I2P/mixnet, anonymity, or metadata privacy claim. Settings apply when the network worker starts: lock and unlock the vault after changing them."
+    "Optional capabilities are off and address lists are empty by default. Discovery candidates are advisory only: never auto-dialed, trusted, or fingerprint-verified. Relay-only routing avoids direct peer connections, but relay operators still see IPs, timing, and sizes and can deny service; file transfer over a relay is disabled. A SOCKS5/Tor route requires a local proxy address and removes direct listeners and DNS lookups from this app; a configured SOCKS5 proxy is policy only and the proxy itself is not established as Tor, and timing correlation remains possible. AutoNAT, mDNS and DCUtR are disabled with SOCKS5/Tor routes. MLS v3 hides sender, conversation, sequence, timestamp, and message kind inside encrypted MLS state, but relays and proxies still observe IP, timing, direction, volume, and coarse size. Wire bytes carry no transferable long-term-key authorship proof; recipients with MLS state can still attribute messages. There is no Tor/I2P/mixnet, anonymity, or complete metadata privacy claim. Settings apply when the network worker starts: lock and unlock the vault after changing them."
 }
 
 fn channel_group_label(status: ChannelGroupStatus) -> String {
@@ -439,6 +439,18 @@ pub fn security_rows(
             value: message_encryption,
         },
         StatusRow {
+            label: "Key agreement",
+            value: "MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519 (0x004F); Ed25519 signatures and Noise transport remain classical".to_owned(),
+        },
+        StatusRow {
+            label: "Message metadata",
+            value: "MLS v3 keeps sender, conversation, sequence, timestamp, and kind inside encrypted state; relays and proxies still observe IP, timing, volume, and coarse size".to_owned(),
+        },
+        StatusRow {
+            label: "Authorship deniability",
+            value: "No transferable long-term-key authorship proof in wire bytes; group members with MLS state can still attribute messages".to_owned(),
+        },
+        StatusRow {
             label: "Group control",
             value: group_control,
         },
@@ -481,7 +493,7 @@ pub fn security_rows(
         StatusRow {
             label: "SOCKS5 proxy",
             value: if privacy.socks5_proxy_configured {
-                "Configured (proxy identity and reachability not verified)".to_owned()
+                "Configured (policy only; proxy identity and reachability not established)".to_owned()
             } else {
                 "Not configured".to_owned()
             },
@@ -523,7 +535,7 @@ pub fn security_rows(
         },
         StatusRow {
             label: "Anonymity",
-            value: "No Tor/I2P/mixnet; a configured SOCKS5 proxy may hide IP from a direct peer, but proxy identity and reachability are not established, and peers or relays can observe timing and size metadata"
+            value: "No Tor/I2P/mixnet; a configured SOCKS5 proxy is policy only, may hide IP from a direct peer, but proxy identity and reachability are not established, and peers or relays can observe timing, volume, and coarse size metadata"
                 .to_owned(),
         },
     ]
@@ -593,7 +605,7 @@ mod tests {
         let network = network_info(1);
         let rows = security_rows(&VaultState::Unlocked(info.clone()), Some(&network), None);
 
-        assert_eq!(rows.len(), 27);
+        assert_eq!(rows.len(), 30);
         assert!(
             rows.iter()
                 .any(|row| row.label == "Fingerprint" && row.value == info.fingerprint)
@@ -617,6 +629,18 @@ mod tests {
             rows.iter()
                 .any(|row| row.label == "Message encryption" && row.value.contains("MLS available"))
         );
+        assert!(rows.iter().any(|row| {
+            row.label == "Key agreement"
+                && row.value.contains("MLKEM768X25519")
+                && row.value.contains("classical")
+        }));
+        assert!(rows.iter().any(|row| {
+            row.label == "Message metadata" && row.value.contains("MLS v3 keeps sender")
+        }));
+        assert!(rows.iter().any(|row| {
+            row.label == "Authorship deniability"
+                && row.value.contains("group members with MLS state")
+        }));
         assert!(
             rows.iter()
                 .any(|row| row.label == "Connection" && row.value == network.connection)
@@ -629,6 +653,9 @@ mod tests {
             matches!(
                 row.label,
                 "Message encryption"
+                    | "Key agreement"
+                    | "Message metadata"
+                    | "Authorship deniability"
                     | "Group control"
                     | "Pending group change"
                     | "Active channel"
@@ -678,7 +705,7 @@ mod tests {
             active_channel: Some([9u8; 16]),
         };
         let rows = security_rows(&VaultState::Unlocked(unlocked_info()), None, Some(&group));
-        assert_eq!(rows.len(), 27);
+        assert_eq!(rows.len(), 30);
         let control = rows
             .iter()
             .find(|row| row.label == "Group control")
@@ -1121,7 +1148,7 @@ mod tests {
             ..NetworkPrivacyStatus::default()
         };
         let rows = security_rows(&VaultState::Unlocked(unlocked_info()), Some(&network), None);
-        assert_eq!(rows.len(), 27);
+        assert_eq!(rows.len(), 30);
         let value = |label: &'static str| {
             rows.iter()
                 .find(|row| row.label == label)
@@ -1132,6 +1159,9 @@ mod tests {
         assert!(value("Transport mode").contains("Direct TCP + Noise"));
         assert!(value("Transport mode").contains("not anonymous"));
         assert_eq!(value("SOCKS5 proxy"), "Not configured");
+        assert!(value("Key agreement").contains("0x004F"));
+        assert!(value("Message metadata").contains("relays and proxies still observe IP"));
+        assert!(value("Authorship deniability").contains("No transferable"));
         assert!(value("Route policy").contains("Direct allowed"));
         assert!(value("Route policy").contains("not anonymous"));
         assert!(value("Bootstrap services").contains("1 user-supplied"));
@@ -1167,5 +1197,10 @@ mod tests {
         assert!(details.contains("advisory only"));
         assert!(details.contains("relay"));
         assert!(details.contains("no Tor/I2P/mixnet"));
+        assert!(details.contains("MLS v3 hides sender"));
+        assert!(
+            details.contains("Wire bytes carry no transferable long-term-key authorship proof")
+        );
+        assert!(details.contains("configured SOCKS5 proxy is policy only"));
     }
 }

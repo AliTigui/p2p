@@ -23,6 +23,14 @@ python3 scripts/generate_sbom.py \
 Both commands run fail-closed self-tests before invoking Cargo. The generated
 `sbom/` directory is ignored because it is an artifact, not source.
 
+## Record boundary
+
+Package counts, relationship counts, and `Cargo.lock` SHA-256 digests quoted in
+milestone/security records are historical pre-v3 results where presented as
+final. Current post-v3 final SBOM and gate results are recorded in
+`SECURITY_TESTS.md`, `PROJECT_STATUS.md`, and the final report. This document
+describes the generator and its scope, not a current count or hash.
+
 ## What is recorded
 
 Each document contains:

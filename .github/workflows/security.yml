@@ -72,7 +72,7 @@ jobs:
         working-directory: fuzz
         run: |
           for target in \
-            fuzz_envelope fuzz_setup fuzz_file \
+            fuzz_envelope fuzz_v3_envelope fuzz_setup fuzz_file \
             fuzz_channel fuzz_identity_export fuzz_contact_uri
           do
             cargo fuzz run "$target" -- \

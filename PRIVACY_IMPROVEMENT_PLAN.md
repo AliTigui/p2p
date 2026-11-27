@@ -1,6 +1,6 @@
 # Privacy Improvement Plan (Q0–Q5)
 
-This is a **local engineering plan**, not an external audit, not a privacy guarantee, and not a claim that the app is equivalent to Signal or Session. It follows the P0–P14 closeout. Status: **Q0, Q1, Q2, and Q5 are complete locally and uncommitted; Q3 and Q4 remain design-only**. All work remains local unless the user explicitly changes that requirement. No CI, release, commit, push, PR, review, merge, user/manual, or external verification claim is made.
+This is a **local engineering plan**, not an external audit, not a privacy guarantee, and not a claim that the app is equivalent to Signal or Session. It follows the P0–P14 closeout. Status: **Q0–Q5 are complete locally and uncommitted**, including Q3 v3 metadata reduction, Q4 bounded wire-level deniability, and the enabled hybrid MLS suite. All work remains local unless the user explicitly changes that requirement. No CI, release, commit, push, PR, review, merge, user/manual, or external verification claim is made.
 
 ## 1. What “fixed” can honestly mean
 
@@ -65,8 +65,8 @@ Source review of `crates/network/src/lib.rs`, `crates/network/src/privacy.rs`, `
 
 - Default transport is direct TCP + Noise + Yamux and explicitly non-anonymous.
 - Optional relay mode is off/empty by default; relay addresses must be direct `/p2p/<peer-id>` addresses and `/p2p-circuit` is rejected in configuration.
-- `TransportPrivacyMode::TorRequired` fails closed before any worker starts.
-- Application envelopes expose protocol, conversation, epoch, message ID, sender PeerId, certified role key, identity proof, sequence, sender time, kind, and ciphertext before MLS payload decryption. Q3 does not change this wire format.
+- `TransportPrivacyMode::TorRequired` selects a configured SOCKS5-only outbound route; without a valid proxy address it fails closed before a dial is created. It is not a verified Tor route.
+- Legacy v2 application envelopes expose protocol, conversation, epoch, message ID, sender PeerId, certified role key, identity proof, sequence, sender time, kind, and ciphertext before MLS payload decryption. They remain only as a compatibility/test artifact; production v3 paths reject them.
 - Stable identifiers include PeerId, transport key, Application/File/Mls role keys, conversation ID, transaction ID, transfer ID, channel ID, and sequence. Q4 does not change these identities.
 - Q1 adds a `DialPolicy::RelayOnly` route that rejects direct application dials and requires an observed relayed path.
 - Q2 pads MLS application plaintext to fixed buckets before encryption and rejects malformed padding after decryption.
@@ -114,35 +114,37 @@ Implementation boundary:
 
 Tests added: bucket selection, exact-fit and one-byte-over boundary behaviour, valid round trip, empty/oversized input rejection, wrong tag, zero length, extended claimed length, dirty tail, and wrong-length padding.
 
-Non-claims: no timing defence, no volume/correlation defence, no randomization, and no protection against a relay or peer observing outer frame sizes or the selected bucket. Q2 does not change clear envelope metadata.
+Non-claims: no timing defence, no volume/correlation defence, and no protection against a relay or peer observing outer frame sizes or the selected bucket. Q2 padding is retained inside the v3 MLS body; v3 additionally randomizes the outer nonce.
 
 ### Q3 — Clear envelope metadata reduction
 
 Goal: reduce stable metadata visible before MLS decryption.
 
-Candidates, each requiring a new wire version rather than silently changing v2:
+Implemented as a new wire version (`P2P3`, version 3) with no silent v2 change:
 
-- Replace or blind the clear conversation ID with a per-conversation route tag.
-- Coarsen or remove the untrusted sender timestamp.
-- Move the identity proof and long-term role key inside the encrypted inner body, verifying only after decryption.
+- The outer header carries only a per-epoch route tag, a fresh random nonce, an encrypted body length, the wrapped MLS ciphertext, and an HMAC-SHA256 tag keyed by an MLS exporter secret.
+- Sender PeerId certified proof, long-term role key, conversation ID, epoch, message ID, sequence, timestamp, and kind move into an MLS-protected inner frame that is recovered only after group-authenticated decryption.
+- The MLS ciphertext itself is wrapped with XChaCha20-Poly1305 under a purpose-separated MLS exporter key, so the MLS header, group ID, and epoch are not exposed in clear wire bytes. This is library-backed composition, not a custom primitive.
+- Route tags are SHA-256 over a domain separator, group ID, and epoch. They are local routing hints, not secrets, not proofs, and not unlinkability.
+- Production parsing rejects v1/v2 wire frames and legacy setup frames; the legacy v2 codec and its transferable-authorship test remain only as a compatibility artifact.
 
-Non-claims: transport PeerId, IP, timing, and frame size remain observable; this is not unlinkability.
+Non-claims: transport PeerId, IP, timing, direction, volume, outer bucket length, and route-tag linkability within one epoch remain observable. Version 3 is not unlinkability, not anonymity, and not a full metadata confidentiality claim.
 
-Status: design only; do not implement without explicit versioning and fresh adversarial tests.
+Status: **complete locally and uncommitted**; adversarial tests cover outer tampering, wrong route, legacy substitution, foreign groups, malformed inner frames, replay/sequence policy, and third-party metadata absence.
 
-### Q4 — Ephemeral delegated application keys
+### Q4 — Bounded authorship deniability
 
-Goal: reduce reuse of one long-term Application key across conversations and time.
+Goal: stop wire bytes from acting as third-party-verifiable long-term-key authorship proof.
 
-Candidates:
+Implemented in the v3 wire path:
 
-- Use the existing local `RoleDelegation` primitive to issue short-lived application-signing grants.
-- Bind grants to conversation context and expiry.
-- Fail closed on conflict, wrong role, or expired delegation.
+- The v2 identity proof and long-term application signature are no longer present on the wire. MLS group-authenticated decryption establishes the sender only for a recipient that holds current group state.
+- The exported route tag and outer MAC do not identify a sender to an outside observer; the outer MAC is group-keyed, not sender-keyed.
+- Recipients and current group members with MLS state can still attribute messages. A past member, an outside observer, or a party without the epoch's MLS state cannot turn a captured frame into transferable authorship proof.
 
-Non-claims: root/device/transport keys remain stable; relay/peer correlation remains possible; this is not deniability.
+Non-claims: root/device/transport keys remain stable; relay/peer correlation remains possible; this is bounded deniability, not full deniability and not anonymity. Ephemeral delegated application keys (`RoleDelegation` grants) were not introduced.
 
-Status: design only; requires identity/wire changes and GUI wording updates.
+Status: **complete locally and uncommitted** as bounded wire-level deniability; GUI wording and tests state the group-member attribution boundary explicitly.
 
 ### Q5 — Optional local SOCKS5/Tor route
 
@@ -178,15 +180,15 @@ Every implemented phase must report:
 - `Remaining limitations`
 - `Documentation updated`
 
-A phase is not called complete until targeted adversarial tests and the full local workspace/GUI gates pass. Historical CI/release results are not evidence for this workstream. The final post-Q local gate passed **358 workspace tests / 0 failures** (37 suites, doc-tests 0), **22 GUI-feature tests / 0 failures**, 64 diagnosed Rust sources, both-lockfile audit/deny, locked fuzz build/clippy, six 1000-input smoke runs, and byte-identical 480-package SBOM regeneration. Exact commands and results are in `SECURITY_TESTS.md`.
+A phase is not called complete until targeted adversarial tests and the full local workspace/GUI gates pass. Historical CI/release results are not evidence for this workstream. The historical pre-v3 post-Q gate passed **358 workspace tests / 0 failures** (37 suites, doc-tests 0), **22 GUI-feature tests / 0 failures**, 64 diagnosed Rust sources, both-lockfile audit/deny, locked fuzz build/clippy, six 1000-input smoke runs, and byte-identical 480-package SBOM regeneration; that count is retained only as pre-v3 evidence. The final Q3/Q4 post-v3 gate passed **369 workspace tests / 0 failures** (26 suites, 0 doc-tests), **22 GUI-feature tests / 0 failures**, 65 diagnosed Rust sources, both-lockfile audit/deny, locked fuzz check/clippy/build, seven 1000-input smoke runs, and byte-identical 489-package SBOM regeneration; exact commands and final results are recorded in `SECURITY_TESTS.md`, `PROJECT_STATUS.md`, and the final local report.
 
 ## 6. Current authoritative limitations
 
 The following remain true unless a specific phase changes them with source and tests:
 
 - No verified anonymity, Tor/I2P/mixnet, onion service, proxy identity, or unlinkability. Q5 configures a SOCKS5 route; it does not prove the proxy is Tor.
-- No metadata confidentiality or traffic-analysis resistance. Q2 coarse padding does not hide timing, direction, volume, or outer frame buckets.
+- No complete metadata confidentiality or traffic-analysis resistance. Q2 coarse padding and Q3 v3 wire reduction do not hide timing, direction, volume, outer frame buckets, or route-tag linkability within one epoch.
 - No mandatory centralized infrastructure.
 - No secure multi-device convergence, full ACL, or production readiness.
 - Relay operators and direct peers observe metadata that is not hidden by MLS content encryption. Q1 changes the destination peer's view under explicit relay-only routing, not the relay's view.
-- Q3 (clear envelope metadata reduction) and Q4 (ephemeral delegated application keys) remain unimplemented design candidates with no silent wire or identity change.
+- Q3 (v3 clear-envelope metadata reduction) and Q4 (bounded wire-level authorship deniability) are implemented locally and uncommitted. Ephemeral delegated application keys remain unimplemented; group members with MLS state can still attribute messages.

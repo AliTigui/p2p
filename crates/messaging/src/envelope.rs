@@ -10,6 +10,7 @@
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use hmac::{Hmac, KeyInit, Mac};
 use libp2p_identity::PeerId;
 use p2p_identity::{
     Identity, IdentityError, IdentityRole, MAX_IDENTITY_PROOF_BYTES, certified_role_public_key,
@@ -26,6 +27,21 @@ pub const PROTOCOL_MAGIC: &[u8; 4] = b"P2P1";
 pub const MAX_ENVELOPE_BYTES: usize = 1024 * 1024;
 /// Maximum opaque payload size, leaving room for bounded metadata fields.
 pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024 - 1024;
+
+/// Version 3 removes transferable clear-message authorship and stable
+/// identifiers from the outer wire. The outer layer carries only a local
+/// routing tag, a random nonce, the MLS ciphertext, and a group-keyed MAC.
+pub const ENVELOPE_V3_VERSION: u16 = 3;
+pub const V3_MAGIC: &[u8; 4] = b"P2P3";
+pub const V3_ROUTE_TAG_LEN: usize = 32;
+pub const V3_NONCE_LEN: usize = 16;
+pub const V3_MAC_LEN: usize = 32;
+
+/// Version 1 of the MLS-protected inner frame. It is never present on the wire
+/// in plaintext; only MLS group members can decrypt it.
+pub const V3_INNER_MAGIC: &[u8; 4] = b"P2I1";
+pub const V3_INNER_VERSION: u8 = 1;
+
 const MAX_PUBLIC_KEY_BYTES: usize = 256;
 const MAX_PEER_ID_BYTES: usize = 128;
 const SIGNATURE_LEN: usize = 64;
@@ -311,6 +327,259 @@ impl fmt::Debug for Envelope {
     }
 }
 
+/// A version-3 wire envelope. No stable sender key, identity proof, message
+/// ID, conversation ID, sequence, timestamp, or kind appears in the clear.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EnvelopeV3 {
+    pub version: u16,
+    pub protocol: [u8; 4],
+    /// Per-epoch tag used only for local route selection. It is derived from a
+    /// group ID and epoch, is not secret, and does not provide unlinkability.
+    pub route_tag: [u8; V3_ROUTE_TAG_LEN],
+    /// Fresh random bytes that make repeated outer frames differ.
+    pub nonce: [u8; V3_NONCE_LEN],
+    /// MLS ciphertext carrying [`V3InnerFrame`].
+    pub body: Vec<u8>,
+    /// HMAC-SHA256 under an MLS exporter-derived group key.
+    pub mac: [u8; V3_MAC_LEN],
+}
+
+impl EnvelopeV3 {
+    /// Build and authenticate a v3 envelope. `mac_key` comes from the current
+    /// MLS epoch; this crate never invents or exports key material itself.
+    pub fn new(
+        route_tag: [u8; V3_ROUTE_TAG_LEN],
+        body: Vec<u8>,
+        mac_key: &[u8; V3_MAC_LEN],
+    ) -> Result<Self, MessageError> {
+        if body.is_empty() || body.len() > MAX_PAYLOAD_BYTES {
+            return Err(MessageError::BadV3Inner);
+        }
+        let mut nonce = [0u8; V3_NONCE_LEN];
+        getrandom::fill(&mut nonce).map_err(|_| MessageError::Randomness)?;
+        let mut envelope = Self {
+            version: ENVELOPE_V3_VERSION,
+            protocol: *V3_MAGIC,
+            route_tag,
+            nonce,
+            body,
+            mac: [0; V3_MAC_LEN],
+        };
+        let authenticated = envelope.authenticated_bytes()?;
+        envelope.mac = derive_v3_mac(mac_key, &authenticated)?;
+        Ok(envelope)
+    }
+
+    /// Parse a canonical v3 envelope. This does **not** verify the MAC or the
+    /// MLS ciphertext; callers must do both before trusting the group route.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, MessageError> {
+        if bytes.len() > MAX_ENVELOPE_BYTES {
+            return Err(MessageError::TooLarge {
+                len: bytes.len(),
+                max: MAX_ENVELOPE_BYTES,
+            });
+        }
+        let mut reader = Reader::new(bytes);
+        let protocol: [u8; 4] = reader.fixed().map_err(|_| MessageError::BadProtocol)?;
+        if &protocol != V3_MAGIC {
+            return Err(MessageError::BadProtocol);
+        }
+        let version = reader.u16()?;
+        if version != ENVELOPE_V3_VERSION {
+            return Err(MessageError::UnsupportedVersion(version));
+        }
+        let route_tag = reader.fixed()?;
+        let nonce = reader.fixed()?;
+        let body_len = reader.u32()? as usize;
+        if body_len == 0 || body_len > MAX_PAYLOAD_BYTES {
+            return Err(MessageError::BadV3Inner);
+        }
+        let body = reader.take(body_len)?.to_vec();
+        let mac = reader.fixed()?;
+        reader.finish()?;
+        Ok(Self {
+            version,
+            protocol,
+            route_tag,
+            nonce,
+            body,
+            mac,
+        })
+    }
+
+    /// Versioned outer header used as AEAD associated data for the wrapped MLS
+    /// ciphertext. It contains only the route tag, nonce, and body length.
+    pub fn header_bytes(&self) -> Result<Vec<u8>, MessageError> {
+        if &self.protocol != V3_MAGIC {
+            return Err(MessageError::BadProtocol);
+        }
+        if self.version != ENVELOPE_V3_VERSION {
+            return Err(MessageError::UnsupportedVersion(self.version));
+        }
+        if self.body.is_empty() || self.body.len() > MAX_PAYLOAD_BYTES {
+            return Err(MessageError::BadV3Inner);
+        }
+        let mut bytes = Vec::with_capacity(V3_HEADER_LEN);
+        bytes.extend_from_slice(&self.protocol);
+        bytes.extend_from_slice(&self.version.to_le_bytes());
+        bytes.extend_from_slice(&self.route_tag);
+        bytes.extend_from_slice(&self.nonce);
+        bytes.extend_from_slice(&(self.body.len() as u32).to_le_bytes());
+        Ok(bytes)
+    }
+
+    /// All bytes covered by the MAC. The tag itself is deliberately excluded.
+    pub fn authenticated_bytes(&self) -> Result<Vec<u8>, MessageError> {
+        if &self.protocol != V3_MAGIC {
+            return Err(MessageError::BadProtocol);
+        }
+        if self.version != ENVELOPE_V3_VERSION {
+            return Err(MessageError::UnsupportedVersion(self.version));
+        }
+        if self.body.is_empty() || self.body.len() > MAX_PAYLOAD_BYTES {
+            return Err(MessageError::BadV3Inner);
+        }
+        let mut bytes = Vec::with_capacity(self.body.len() + V3_HEADER_LEN);
+        bytes.extend_from_slice(&self.protocol);
+        bytes.extend_from_slice(&self.version.to_le_bytes());
+        bytes.extend_from_slice(&self.route_tag);
+        bytes.extend_from_slice(&self.nonce);
+        bytes.extend_from_slice(&(self.body.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&self.body);
+        Ok(bytes)
+    }
+
+    /// Encode the full authenticated envelope.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, MessageError> {
+        let mut bytes = self.authenticated_bytes()?;
+        bytes.extend_from_slice(&self.mac);
+        if bytes.len() > MAX_ENVELOPE_BYTES {
+            return Err(MessageError::TooLarge {
+                len: bytes.len(),
+                max: MAX_ENVELOPE_BYTES,
+            });
+        }
+        Ok(bytes)
+    }
+
+    /// Constant-time verification of the group-keyed outer MAC.
+    pub fn verify_mac(&self, mac_key: &[u8; V3_MAC_LEN]) -> Result<(), MessageError> {
+        let authenticated = self.authenticated_bytes()?;
+        let mut mac = HmacSha256::new_from_slice(mac_key).map_err(|_| MessageError::BadMac)?;
+        mac.update(&authenticated);
+        mac.verify_slice(&self.mac)
+            .map_err(|_| MessageError::BadMac)
+    }
+}
+
+impl fmt::Debug for EnvelopeV3 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EnvelopeV3")
+            .field("version", &self.version)
+            .field("route_tag", &hex(&self.route_tag))
+            .field("body_len", &self.body.len())
+            .field("body", &"<mls ciphertext>")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Metadata recovered only after successful MLS decryption. The body is the
+/// application frame; it is zeroized by the caller's decrypted buffer.
+#[derive(Clone, PartialEq, Eq)]
+pub struct V3InnerFrame {
+    pub conversation_id: [u8; 16],
+    pub message_id: [u8; 16],
+    pub sender: PeerId,
+    pub sender_sequence: u64,
+    pub created_at: i64,
+    pub kind: MessageKind,
+    pub body: Vec<u8>,
+}
+
+impl V3InnerFrame {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, MessageError> {
+        if self.body.is_empty() || self.body.len() > MAX_PAYLOAD_BYTES {
+            return Err(MessageError::BadV3Inner);
+        }
+        let mut bytes = Vec::with_capacity(self.body.len() + 96);
+        bytes.extend_from_slice(V3_INNER_MAGIC);
+        bytes.push(V3_INNER_VERSION);
+        bytes.extend_from_slice(&self.conversation_id);
+        bytes.extend_from_slice(&self.message_id);
+        put_bytes(&mut bytes, &self.sender.to_bytes())?;
+        bytes.extend_from_slice(&self.sender_sequence.to_le_bytes());
+        bytes.extend_from_slice(&self.created_at.to_le_bytes());
+        bytes.push(self.kind.code());
+        put_bytes(&mut bytes, &self.body)?;
+        Ok(bytes)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, MessageError> {
+        let mut reader = Reader::new(bytes);
+        let magic: [u8; 4] = reader.fixed().map_err(|_| MessageError::BadV3Inner)?;
+        if &magic != V3_INNER_MAGIC {
+            return Err(MessageError::BadV3Inner);
+        }
+        let version = reader.u8()?;
+        if version != V3_INNER_VERSION {
+            return Err(MessageError::BadV3Inner);
+        }
+        let conversation_id = reader.fixed()?;
+        let message_id = reader.fixed()?;
+        let sender_bytes = reader.var(MAX_PEER_ID_BYTES)?;
+        let sender = PeerId::from_bytes(&sender_bytes).map_err(|_| MessageError::BadPeerId)?;
+        let sender_sequence = reader.u64()?;
+        let created_at = reader.i64()?;
+        let kind_code = reader.u8()?;
+        let kind = MessageKind::from_code(kind_code).ok_or(MessageError::BadKind(kind_code))?;
+        let body = reader.var(MAX_PAYLOAD_BYTES)?;
+        if body.is_empty() {
+            return Err(MessageError::BadV3Inner);
+        }
+        reader.finish()?;
+        Ok(Self {
+            conversation_id,
+            message_id,
+            sender,
+            sender_sequence,
+            created_at,
+            kind,
+            body,
+        })
+    }
+}
+
+impl fmt::Debug for V3InnerFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("V3InnerFrame")
+            .field("conversation_id", &hex(&self.conversation_id))
+            .field("message_id", &hex(&self.message_id))
+            .field("sender", &self.sender.to_string())
+            .field("sender_sequence", &self.sender_sequence)
+            .field("kind", &self.kind)
+            .field("body_len", &self.body.len())
+            .field("body", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+const V3_HEADER_LEN: usize = 4 + 2 + V3_ROUTE_TAG_LEN + V3_NONCE_LEN + 4;
+
+type HmacSha256 = Hmac<sha2::Sha256>;
+
+fn derive_v3_mac(
+    key: &[u8; V3_MAC_LEN],
+    authenticated: &[u8],
+) -> Result<[u8; V3_MAC_LEN], MessageError> {
+    let mut mac = HmacSha256::new_from_slice(key).map_err(|_| MessageError::BadMac)?;
+    mac.update(authenticated);
+    let bytes = mac.finalize().into_bytes();
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| MessageError::BadMac)
+}
+
 /// Generate a random 16-byte identifier.
 pub fn random_id() -> Result<[u8; 16], MessageError> {
     let mut id = [0u8; 16];
@@ -319,7 +588,7 @@ pub fn random_id() -> Result<[u8; 16], MessageError> {
 }
 
 /// Sender-supplied timestamp hint. Display only; never used for ordering.
-pub(crate) fn now_seconds() -> i64 {
+pub fn now_seconds() -> i64 {
     i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -654,6 +923,115 @@ mod tests {
             assert!(
                 Envelope::from_bytes(&bytes[..len]).is_err(),
                 "prefix of length {len} was accepted"
+            );
+        }
+    }
+
+    fn v3_inner() -> V3InnerFrame {
+        V3InnerFrame {
+            conversation_id: [0x11; 16],
+            message_id: [0x22; 16],
+            sender: Identity::generate().expect("sender").peer_id(),
+            sender_sequence: 7,
+            created_at: 1_700_000_001,
+            kind: MessageKind::Text,
+            body: b"MLS-protected application frame".to_vec(),
+        }
+    }
+
+    #[test]
+    fn v3_wire_has_no_stable_sender_or_message_metadata() {
+        let identity = Identity::generate().expect("identity");
+        let route = [0x77; V3_ROUTE_TAG_LEN];
+        let key = [0x33; V3_MAC_LEN];
+        let envelope = EnvelopeV3::new(route, vec![0xaa; 128], &key).expect("v3 envelope");
+        let bytes = envelope.to_bytes().expect("encoded v3");
+
+        assert_eq!(&bytes[..4], V3_MAGIC);
+        assert_eq!(&bytes[4..6], &ENVELOPE_V3_VERSION.to_le_bytes());
+        assert!(
+            !bytes
+                .windows(16)
+                .any(|w| w == identity.peer_id().to_bytes())
+        );
+        assert!(!bytes.windows(16).any(|w| w == [0x22; 16]));
+        assert!(!bytes.windows(16).any(|w| w == [0x11; 16]));
+        assert!(format!("{envelope:?}").contains("<mls ciphertext>"));
+        assert!(!format!("{envelope:?}").contains("aa"));
+
+        let decoded = EnvelopeV3::from_bytes(&bytes).expect("decoded v3");
+        decoded.verify_mac(&key).expect("valid group MAC");
+        assert_eq!(decoded.route_tag, route);
+        assert_eq!(decoded.body, vec![0xaa; 128]);
+    }
+
+    #[test]
+    fn v3_mac_rejects_body_nonce_route_tag_and_version_tampering() {
+        let key = [0x44; V3_MAC_LEN];
+        let envelope = EnvelopeV3::new([0x55; 32], vec![0x66; 96], &key).expect("v3 envelope");
+        let bytes = envelope.to_bytes().expect("encoded v3");
+
+        assert!(matches!(
+            EnvelopeV3::from_bytes(&[0u8; 8]),
+            Err(MessageError::BadProtocol)
+        ));
+
+        for index in [4, 6, 22, 38, 42, bytes.len() - 1] {
+            let mut changed = bytes.clone();
+            changed[index] ^= 0x01;
+            if let Ok(decoded) = EnvelopeV3::from_bytes(&changed) {
+                assert!(
+                    decoded.verify_mac(&key).is_err(),
+                    "byte {index} produced an authenticated frame"
+                );
+            }
+        }
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(matches!(
+            EnvelopeV3::from_bytes(&trailing),
+            Err(MessageError::TrailingBytes)
+        ));
+
+        let mut future = bytes.clone();
+        future[4..6].copy_from_slice(&(ENVELOPE_V3_VERSION + 1).to_le_bytes());
+        assert!(matches!(
+            EnvelopeV3::from_bytes(&future),
+            Err(MessageError::UnsupportedVersion(_))
+        ));
+    }
+
+    #[test]
+    fn v3_inner_frame_round_trips_and_rejects_tampering() {
+        let frame = v3_inner();
+        let bytes = frame.to_bytes().expect("encoded inner frame");
+        assert_eq!(V3InnerFrame::from_bytes(&bytes).expect("decoded"), frame);
+        assert!(format!("{frame:?}").contains("<redacted>"));
+        assert!(!format!("{frame:?}").contains("MLS-protected"));
+
+        for index in 0..bytes.len() {
+            let mut changed = bytes.clone();
+            changed[index] ^= 0x01;
+            assert!(
+                V3InnerFrame::from_bytes(&changed).is_err()
+                    || V3InnerFrame::from_bytes(&changed).expect("decoded") != frame,
+                "bit {index} left the inner frame unchanged"
+            );
+        }
+        let mut empty_body = frame.clone();
+        empty_body.body.clear();
+        assert!(empty_body.to_bytes().is_err());
+    }
+
+    #[test]
+    fn every_v3_prefix_is_rejected_without_panics() {
+        let envelope = EnvelopeV3::new([0x88; 32], vec![0x99; 64], &[0x01; 32]).expect("v3");
+        let bytes = envelope.to_bytes().expect("encoded v3");
+        for len in 0..bytes.len() {
+            assert!(
+                EnvelopeV3::from_bytes(&bytes[..len]).is_err(),
+                "v3 prefix of length {len} was accepted"
             );
         }
     }

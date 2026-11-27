@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 
 use libp2p_identity::PeerId;
 use p2p_chat::{
-    ChannelGroupStatus, ChatError, ConversationInfo, ConversationStatus, DEFAULT_CHANNEL_ID,
-    FileConfig, FileFormat, FileScanner, GroupOperation, MessageOrigin, MessengerController,
-    QuarantineDeletionPolicy, RedialState, ReleaseApproval, ReleasePolicy, SETUP_VERSION,
-    ScanRequest, ScanResult, ScanStatus, SecurityConfig, SetupEnvelope, SetupMessage,
-    TransferDirection, TransferStatus, parse_address,
+    CIPHERSUITE_ID, ChannelGroupStatus, ChatError, ConversationInfo, ConversationStatus,
+    DEFAULT_CHANNEL_ID, FileConfig, FileFormat, FileScanner, GroupOperation, MessageOrigin,
+    MessengerController, QuarantineDeletionPolicy, RedialState, ReleaseApproval, ReleasePolicy,
+    SETUP_VERSION, ScanRequest, ScanResult, ScanStatus, SecurityConfig, SetupEnvelope,
+    SetupMessage, TransferDirection, TransferStatus, parse_address,
 };
 use p2p_identity::Identity;
 use p2p_messaging::DeliveryState;
@@ -1768,21 +1768,22 @@ fn setup_frames_carry_and_sign_transaction_ids_and_reject_v1() {
 
     assert_eq!(&bytes[..4], b"MLS1");
     assert_eq!(&bytes[4..6], &SETUP_VERSION.to_le_bytes());
-    assert_eq!(&bytes[6..22], &transaction_id);
+    assert_eq!(&bytes[6..8], &CIPHERSUITE_ID.to_le_bytes());
+    assert_eq!(&bytes[8..24], &transaction_id);
 
     let decoded = SetupEnvelope::from_bytes(&bytes).expect("decoded ack");
     decoded
         .verify(&identity.peer_id())
         .expect("valid signature");
 
-    bytes[6] ^= 1;
+    bytes[8] ^= 1;
     let tampered = SetupEnvelope::from_bytes(&bytes).expect("decoded tampered ack");
     assert!(matches!(
         tampered.verify(&identity.peer_id()),
         Err(ChatError::InvalidSetup(_))
     ));
 
-    bytes[6] ^= 1;
+    bytes[8] ^= 1;
     bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
     let legacy = SetupEnvelope::from_bytes(&bytes).expect_err("version 1 is rejected");
     assert!(legacy.to_string().contains("version 1"));
