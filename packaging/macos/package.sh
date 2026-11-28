@@ -32,7 +32,6 @@ case "$arch" in
 esac
 
 p2p_require_file "$binary"
-p2p_require_file "$P2P_REPO_ROOT/README.md"
 p2p_require_file "$P2P_REPO_ROOT/packaging/NOTICE.md"
 p2p_require_file "$P2P_REPO_ROOT/packaging/macos/Info.plist.template"
 p2p_require_command hdiutil
@@ -45,7 +44,6 @@ trap 'rm -rf "$stage"' EXIT
 app_path="$stage/P2P Messenger.app"
 mkdir -p "$app_path/Contents/MacOS" "$app_path/Contents/Resources"
 install -m 0755 "$binary" "$app_path/Contents/MacOS/p2p-desktop"
-install -m 0644 "$P2P_REPO_ROOT/README.md" "$stage/README.md"
 install -m 0644 "$P2P_REPO_ROOT/packaging/NOTICE.md" "$stage/NOTICE.md"
 sed "s/__VERSION__/$version/g" \
     "$P2P_REPO_ROOT/packaging/macos/Info.plist.template" > "$app_path/Contents/Info.plist"

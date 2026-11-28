@@ -20,4 +20,5 @@ base64.workspace = true
 percent-encoding.workspace = true
 qrcode.workspace = true
 getrandom.workspace = true
+ml-dsa.workspace = true
 zeroize.workspace = true

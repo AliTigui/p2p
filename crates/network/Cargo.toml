@@ -12,6 +12,7 @@ p2p-core.workspace = true
 p2p-identity.workspace = true
 libp2p.workspace = true
 libp2p-request-response.workspace = true
+getrandom.workspace = true
 tokio.workspace = true
 tokio-socks.workspace = true
 tokio-util.workspace = true

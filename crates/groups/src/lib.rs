@@ -18,7 +18,7 @@ use openmls_traits::OpenMlsProvider;
 use openmls_traits::signatures::{Signer, SignerError};
 use openmls_traits::types::SignatureScheme;
 use p2p_crypto::{CryptoError, NONCE_LEN, TAG_LEN, decrypt_bytes, encrypt_bytes};
-use p2p_identity::{Identity, IdentityRole};
+use p2p_identity::{Identity, IdentityRole, PQ_PUBLIC_KEY_BYTES};
 use p2p_messaging::{
     Conversation, DeliveryState, Envelope, EnvelopeV3, MessageError, MessageKind, Receipt,
     ReceiptStatus, ReceivedMessage, V3_MAC_LEN, V3InnerFrame,
@@ -28,15 +28,15 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-/// Library-supported hybrid KEM suite from the pinned draft OpenMLS feature.
-/// This combines ML-KEM768 with X25519 inside the KEM; it is not a claim of
-/// full post-quantum security because identity signatures remain Ed25519 and
-/// the Noise transport remains classical.
-pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519;
-pub const CIPHERSUITE_ID: u16 = 0x004F;
+/// Pure ML-KEM768 + ML-DSA-65 suite from the pinned draft OpenMLS feature.
+/// MLS content encryption and all group authentication signatures use PQ
+/// primitives. The libp2p transport still authenticates its PeerId classically;
+/// the application layer binds setup authors with ML-DSA-65 separately.
+pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_192_MLKEM768_AES256GCM_SHA384_MLDSA65;
+pub const CIPHERSUITE_ID: u16 = 0x0051;
 
 /// Fail closed when a setup frame advertises any suite other than the fixed
-/// hybrid suite compiled into this build.
+/// ML-KEM/ML-DSA suite compiled into this build.
 pub fn is_supported_ciphersuite_id(id: u16) -> bool {
     id == CIPHERSUITE_ID && Ciphersuite::try_from(id).ok() == Some(CIPHERSUITE)
 }
@@ -209,20 +209,23 @@ pub enum GroupError {
     Crypto(#[from] CryptoError),
 }
 
-/// A signer that uses the certified MLS role key. MLS signatures cover the
-/// exact MLS payload bytes; role separation comes from the independent key.
+/// A signer that uses the certified ML-DSA-65 MLS role key. MLS signatures
+/// cover the exact MLS payload bytes; role separation comes from the independent
+/// seed in the encrypted identity bundle.
 #[derive(Clone)]
 struct IdentitySigner(Identity);
 
 impl Signer for IdentitySigner {
     fn sign(&self, payload: &[u8]) -> Result<Vec<u8>, SignerError> {
-        self.0
-            .sign_raw_with_role(IdentityRole::Mls, payload)
-            .map_err(|_| SignerError::SigningError)
+        let seed = self
+            .0
+            .pq_role_seed(IdentityRole::Mls)
+            .map_err(|_| SignerError::SigningError)?;
+        p2p_identity::pq_sign_for_mls(&seed, payload).map_err(|_| SignerError::SigningError)
     }
 
     fn signature_scheme(&self) -> SignatureScheme {
-        SignatureScheme::ED25519
+        SignatureScheme::MLDSA65
     }
 }
 
@@ -237,20 +240,17 @@ impl fmt::Debug for IdentitySigner {
 fn credential(identity: &Identity) -> Result<CredentialWithKey, GroupError> {
     Ok(CredentialWithKey {
         credential: BasicCredential::new(identity.peer_id().to_bytes()).into(),
-        signature_key: identity
-            .role_public_bytes(IdentityRole::Mls)?
-            .to_vec()
-            .into(),
+        signature_key: identity.pq_role_public_bytes(IdentityRole::Mls)?.into(),
     })
 }
 
-/// MLS leaf signature keys are raw 32-byte Ed25519 keys. The expected key is
-/// supplied by the certified identity proof in the signed setup frame, not by
-/// a protobuf transport key that would derive a different PeerId.
-fn expected_mls_key(expected_public_key: &[u8]) -> Result<[u8; 32], GroupError> {
-    expected_public_key
-        .try_into()
-        .map_err(|_| GroupError::SenderMismatch)
+/// MLS leaf signature keys are encoded ML-DSA-65 public keys. The expected key
+/// is supplied by the certified PQ identity proof in the signed setup frame.
+fn expected_mls_key(expected_public_key: &[u8]) -> Result<Vec<u8>, GroupError> {
+    if expected_public_key.len() != PQ_PUBLIC_KEY_BYTES {
+        return Err(GroupError::SenderMismatch);
+    }
+    Ok(expected_public_key.to_vec())
 }
 
 /// Application plaintexts are padded inside the MLS ciphertext so observers
@@ -599,7 +599,9 @@ impl MlsSession {
                     == Some(identity.peer_id())
             })
             .ok_or(GroupError::WrongLocalIdentity)?;
-        if local_member.signature_key.as_slice() != identity.role_public_bytes(IdentityRole::Mls)? {
+        if local_member.signature_key.as_slice()
+            != identity.pq_role_public_bytes(IdentityRole::Mls)?
+        {
             return Err(GroupError::WrongLocalIdentity);
         }
         Ok(())
@@ -688,6 +690,20 @@ impl MlsSession {
                 PeerId::from_bytes(member.credential.serialized_content()).ok() == Some(*peer)
             })
             .map(|member| member.index)
+    }
+
+    /// Certified MLS leaf key already bound to a PeerId when that member joined
+    /// the group. The legacy signed-v2 envelope carries only a classical
+    /// application key, so it cannot supply an ML-DSA-65 MLS key; legacy `receive`
+    /// uses the group's own authenticated leaf instead. Production uses v3.
+    fn member_signature_key(&self, peer: &PeerId) -> Result<Vec<u8>, GroupError> {
+        self.group
+            .members()
+            .find(|member| {
+                PeerId::from_bytes(member.credential.serialized_content()).ok() == Some(*peer)
+            })
+            .map(|member| member.signature_key.to_vec())
+            .ok_or(GroupError::SenderMismatch)
     }
 
     fn add_member_parts(
@@ -1039,7 +1055,7 @@ impl MlsSession {
                 .find(|member| member.index == *leaf)
                 .ok_or(GroupError::SenderMismatch)?;
             let expected_raw_key = expected_mls_key(expected_public_key)?;
-            if member.signature_key != expected_raw_key {
+            if member.signature_key.as_slice() != expected_raw_key.as_slice() {
                 return Err(GroupError::SenderMismatch);
             }
             match processed.into_content() {
@@ -1629,7 +1645,7 @@ impl MlsConversation {
     pub fn receive(&mut self, envelope: Envelope) -> Result<DecryptedMessage, GroupError> {
         self.conversation.advance_epoch(self.session.epoch())?;
         self.conversation.verify_envelope(&envelope)?;
-        let mls_key = envelope.sender_role_public_key(IdentityRole::Mls)?;
+        let mls_key = self.session.member_signature_key(&envelope.sender)?;
         let decrypted = self
             .session
             .decrypt(&envelope.payload, &envelope.sender, &mls_key)?;
@@ -2095,8 +2111,8 @@ mod post_quantum_evaluation {
             .add_member(
                 key_package.bytes(),
                 bob.peer_id(),
-                &bob.role_public_bytes(IdentityRole::Mls)
-                    .expect("bob mls key"),
+                &bob.pq_role_public_bytes(IdentityRole::Mls)
+                    .expect("bob PQ mls key"),
             )
             .expect("hybrid welcome");
         assert!(
@@ -2132,8 +2148,8 @@ mod v3_wire_tests {
         let mut creator = MlsConversation::create(&alice, conversation_id).expect("creator");
         let key_package = MlsConversation::key_package(&bob).expect("key package");
         let bob_key = bob
-            .role_public_bytes(IdentityRole::Mls)
-            .expect("bob MLS key");
+            .pq_role_public_bytes(IdentityRole::Mls)
+            .expect("bob PQ MLS key");
         let welcome = creator
             .add_member(key_package.bytes(), bob.peer_id(), &bob_key)
             .expect("welcome");

@@ -96,6 +96,57 @@ fn two_instances_connect_directly_with_zero_infrastructure() {
 }
 
 #[test]
+fn two_instances_connect_over_hybrid_key_exchange_quic() {
+    let alice_identity = Identity::generate().expect("alice identity");
+    let bob_identity = Identity::generate().expect("bob identity");
+    let mut alice = Network::start(&alice_identity, local_config()).expect("alice network");
+    let mut bob = Network::start(&bob_identity, local_config()).expect("bob network");
+
+    let quic_listening = |state: &ConnectionState| matches!(state, ConnectionState::Listening { addresses } if addresses.iter().any(|address| address.to_string().contains("/quic-v1")));
+    assert!(
+        wait_until(&mut alice, quic_listening, Duration::from_secs(5)),
+        "alice never reported a QUIC listener"
+    );
+    assert!(
+        wait_until(&mut bob, quic_listening, Duration::from_secs(5)),
+        "bob never reported a QUIC listener"
+    );
+
+    let bob_address = bob
+        .listen_addresses()
+        .into_iter()
+        .find(|address| address.to_string().contains("/quic-v1"))
+        .expect("bob QUIC listen address");
+    let target = format!("{bob_address}/p2p/{}", bob_identity.peer_id());
+    let target = Network::parse_address(&target).expect("valid QUIC target address");
+    alice.dial(target).expect("QUIC dial queued");
+
+    let alice_connected = |state: &ConnectionState| matches!(state, ConnectionState::Connected { peers } if peers.len() == 1);
+    let bob_connected = |state: &ConnectionState| matches!(state, ConnectionState::Connected { peers } if peers.len() == 1);
+    assert!(
+        wait_until(&mut alice, alice_connected, Duration::from_secs(10)),
+        "alice never completed the QUIC connection"
+    );
+    assert!(
+        wait_until(&mut bob, bob_connected, Duration::from_secs(10)),
+        "bob never completed the QUIC connection"
+    );
+
+    match alice.state() {
+        ConnectionState::Connected { peers } => {
+            assert_eq!(peers[0], bob_identity.peer_id());
+        }
+        other => panic!("expected connected state, got {other:?}"),
+    }
+    match bob.state() {
+        ConnectionState::Connected { peers } => {
+            assert_eq!(peers[0], alice_identity.peer_id());
+        }
+        other => panic!("expected connected state, got {other:?}"),
+    }
+}
+
+#[test]
 fn address_without_peer_id_is_rejected_before_dialing() {
     assert!(Network::parse_address("/ip4/127.0.0.1/tcp/4001").is_err());
 }

@@ -440,7 +440,7 @@ pub fn security_rows(
         },
         StatusRow {
             label: "Key agreement",
-            value: "MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519 (0x004F); Ed25519 signatures and Noise transport remain classical".to_owned(),
+            value: "MLS_192_MLKEM768_AES256GCM_SHA384_MLDSA65 (0x0051); setup/file signatures use ML-DSA-65 and direct QUIC negotiates X25519MLKEM768; TCP/Noise and TLS PeerId authentication remain classical".to_owned(),
         },
         StatusRow {
             label: "Message metadata",
@@ -631,7 +631,9 @@ mod tests {
         );
         assert!(rows.iter().any(|row| {
             row.label == "Key agreement"
-                && row.value.contains("MLKEM768X25519")
+                && row.value.contains("0x0051")
+                && row.value.contains("ML-DSA-65")
+                && row.value.contains("X25519MLKEM768")
                 && row.value.contains("classical")
         }));
         assert!(rows.iter().any(|row| {
@@ -1157,9 +1159,14 @@ mod tests {
                 .clone()
         };
         assert!(value("Transport mode").contains("Direct TCP + Noise"));
+        assert!(value("Transport mode").contains("QUIC hybrid KEX"));
         assert!(value("Transport mode").contains("not anonymous"));
+        assert!(value("Transport mode").contains("PeerId auth classical"));
         assert_eq!(value("SOCKS5 proxy"), "Not configured");
-        assert!(value("Key agreement").contains("0x004F"));
+        assert!(value("Key agreement").contains("0x0051"));
+        assert!(value("Key agreement").contains("ML-DSA-65"));
+        assert!(value("Key agreement").contains("X25519MLKEM768"));
+        assert!(value("Key agreement").contains("PeerId authentication remain classical"));
         assert!(value("Message metadata").contains("relays and proxies still observe IP"));
         assert!(value("Authorship deniability").contains("No transferable"));
         assert!(value("Route policy").contains("Direct allowed"));

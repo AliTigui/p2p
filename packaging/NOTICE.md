@@ -1,6 +1,6 @@
 # P2P Messenger release notice
 
-P2P Messenger is licensed under `MIT OR Apache-2.0`. Build and run instructions are in `README.md`; detailed platform packaging instructions are in `docs/BUILDING.md`.
+P2P Messenger is licensed under `MIT OR Apache-2.0`. Build and run instructions are in `docs/BUILDING.md`, with detailed platform packaging instructions in `packaging/README.md`.
 
 This application has no mandatory server, account, bootstrap list, relay, telemetry, auto-updater, browser engine, webview, JavaScript runtime, or npm dependency. Release archives are only a distribution convenience: the application does not phone home, and building from source is always supported.
 

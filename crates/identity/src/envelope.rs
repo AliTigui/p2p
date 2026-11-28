@@ -31,7 +31,7 @@ pub const DEFAULT_P_COST: u32 = 1;
 pub const EXPORT_PURPOSE: &[u8] = b"p2p-messenger/identity-export/v1";
 /// Maximum accepted exported identity envelope. Imports stop before header or
 /// ciphertext parsing when a supplied file exceeds this bound.
-pub const MAX_ENCRYPTED_IDENTITY_BYTES: usize = 8192;
+pub const MAX_ENCRYPTED_IDENTITY_BYTES: usize = 128 * 1024;
 
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;

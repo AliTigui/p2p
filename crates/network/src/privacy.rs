@@ -12,8 +12,9 @@ use libp2p::{Multiaddr, PeerId};
 /// claims that a requested hidden route was obtained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TransportPrivacyMode {
-    /// Direct TCP + Noise. This is the implemented default and is not
-    /// anonymous; peers can observe addresses and timing.
+    /// Direct TCP + Noise or direct QUIC hybrid key exchange. This is the
+    /// implemented default and is not anonymous; peers can observe addresses
+    /// and timing, and TLS/libp2p PeerId authentication remains classical.
     #[default]
     Direct,
     /// A user-configured SOCKS5 proxy route is required, typically a local Tor
@@ -26,7 +27,9 @@ impl TransportPrivacyMode {
     /// Honest description. It does not claim anonymity or an active route.
     pub fn description(self) -> &'static str {
         match self {
-            Self::Direct => "Direct TCP + Noise (not anonymous)",
+            Self::Direct => {
+                "Direct TCP + Noise or QUIC hybrid KEX (not anonymous; PeerId auth classical)"
+            }
             Self::TorRequired => {
                 "SOCKS5/Tor route required (proxy not verified; no direct fallback)"
             }
@@ -109,7 +112,9 @@ impl DiscoverySource {
 }
 
 /// Observed discovery facts. A discovered address is a candidate only: no
-/// dial, trust, or contact claim is made from these events.
+/// dial, trust, or contact claim is made from these events. Peer-scoped
+/// Kademlia observations are released only after PQ admission; mDNS facts
+/// remain advisory without full peer-admission context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscoveryEvent {
     /// A peer/address pair was observed by an enabled discovery behaviour.
@@ -138,7 +143,8 @@ pub enum DiscoveryEvent {
 
 /// Observed relay facts. `Reservation` and `Circuit` events are not trust or
 /// identity claims; the remote PeerId was authenticated by Noise or by the
-/// relay protocol as appropriate.
+/// relay protocol as appropriate. Peer-scoped observations are released only
+/// after PQ admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayEvent {
     /// The local client obtained a relay reservation.
@@ -159,7 +165,8 @@ pub enum RelayEvent {
 }
 
 /// Observed NAT-status facts. All variants are best-effort and never claim
-/// universal reachability.
+/// universal reachability. DCUtR hole-punch observations are released only
+/// after PQ admission; AutoNAT status is advisory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NatEvent {
     /// AutoNAT reported a status change. libp2p 0.56's AutoNAT v1
@@ -177,7 +184,8 @@ pub enum NatEvent {
 }
 
 /// Observed identify facts. Peer-provided strings are length-bounded and no
-/// peer-provided addresses are retained in this event.
+/// peer-provided addresses are retained in this event. Results and errors are
+/// released only after PQ admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdentifyEvent {
     /// A peer completed identify. The peer's protocol list may still contain
@@ -196,7 +204,9 @@ pub enum IdentifyEvent {
 /// Snapshot of configured capabilities and observed optional-network facts.
 ///
 /// Configuration fields describe local settings only. Observed fields change
-/// only after the corresponding libp2p behaviour emits a real event.
+/// only after the corresponding libp2p behaviour emits a real event;
+/// peer-scoped counters advance only when the observation is released after
+/// PQ admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkPrivacyStatus {
     /// Requested mode, not an observed anonymity property.

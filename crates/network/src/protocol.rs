@@ -36,6 +36,13 @@ pub const FILE_PROTOCOL: &str = "/p2p-messenger/file/1";
 /// state, file keys, or identity material.
 pub const CONTROL_PROTOCOL: &str = "/p2p-messenger/control/1";
 
+/// Mandatory ML-DSA-65 connection admission protocol. Every accepted libp2p
+/// connection must complete this exchange before application request/response
+/// events are delivered. It authenticates possession of the certified PQ
+/// application key bound to the classically authenticated PeerId; it does not
+/// replace libp2p Noise/TLS PeerId authentication.
+pub const PQ_AUTH_PROTOCOL: &str = "/p2p-messenger/pq-auth/1";
+
 /// Canonical framed codec for the v1 protocols.
 ///
 /// Wire format: `u32 big-endian length || payload`. Empty and oversized frames

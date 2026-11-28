@@ -18,7 +18,7 @@ The application has strong privacy constraints: no plaintext sensitive state on 
    - Linux: `.tar.gz` and `.deb` built with `dpkg-deb`.
    - Windows: `.zip` and `.msi` built with WiX Toolset 3.14+ (`candle.exe`/`light.exe`, `-arch x64`).
    - macOS: `.app` inside `.tar.gz` and `.dmg` built with `hdiutil`.
-4. Each package includes `README.md` and a short `NOTICE.md` that states the license, absence of centralized runtime services, default unsigned status, and memory-only MLS/chat state.
+4. Each package includes a short `NOTICE.md` that states the license, build documentation reference, absence of centralized runtime services, default unsigned status, and memory-only MLS/chat state.
 5. Tagged releases upload all artifacts, a single `SHA256SUMS` manifest, and generated release notes. Checksums are verified in CI before publishing.
 6. Signing is optional and operator-controlled through `WINDOWS_SIGNING_THUMBPRINT` or `MACOS_SIGNING_IDENTITY`. No secret or certificate is committed. macOS notarization is out of scope for this milestone.
 7. No auto-updater, telemetry, phone-home endpoint, account service, discovery service, relay, or developer-operated package feed is added. GitHub Releases are only an optional download host.

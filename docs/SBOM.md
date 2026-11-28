@@ -27,7 +27,7 @@ Both commands run fail-closed self-tests before invoking Cargo. The generated
 
 Package counts, relationship counts, and `Cargo.lock` SHA-256 digests quoted in
 milestone/security records are historical pre-v3 results where presented as
-final. Current post-v3 final SBOM and gate results are recorded in
+final. Current post-PQ final SBOM and gate results are recorded in
 `SECURITY_TESTS.md`, `PROJECT_STATUS.md`, and the final report. This document
 describes the generator and its scope, not a current count or hash.
 

@@ -23,9 +23,6 @@
                   Name="p2p-desktop.exe"
                   Source="$(var.SourceDir)\p2p-desktop.exe"
                   KeyPath="yes" />
-            <File Id="Readme"
-                  Name="README.md"
-                  Source="$(var.SourceDir)\README.md" />
             <File Id="Notice"
                   Name="NOTICE.md"
                   Source="$(var.SourceDir)\NOTICE.md" />

@@ -3,10 +3,20 @@
 //! A [`Network`] owns a libp2p Swarm on a dedicated Tokio runtime thread. It
 //! listens on a local address and dials only addresses the user supplies. No
 //! bootstrap nodes, DHT servers, relays, or developer-operated services are
-//! configured by default. Noise authenticates the remote PeerId; the caller's
-//! identity keypair is reused so the network identity matches the vault.
+//! configured by default. Direct TCP/SOCKS5/relay connections use Noise and
+//! direct QUIC uses libp2p TLS; both authenticate the remote PeerId. The pinned
+//! QUIC stack negotiates X25519MLKEM768 for hybrid key exchange, but PeerId
+//! authentication remains classical. The caller's identity keypair is reused so
+//! the network identity matches the vault.
 //!
-//! Three explicit protocols share the Noise-authenticated connection: message
+//! Every accepted connection must first complete a mandatory ML-DSA-65
+//! admission exchange (`/p2p-messenger/pq-auth/1`). It proves possession of the
+//! certified PQ application key bound to the classical PeerId and withholds all
+//! application protocol events until verification succeeds. It is an admission
+//! gate, not quantum-resistant PeerId authentication: Noise and libp2p TLS
+//! remain classical.
+//!
+//! Three explicit protocols then share the libp2p connection: message
 //! delivery, MLS setup, and encrypted file transfer. All carry
 //! application-authenticated opaque bytes; the transport never composes,
 //! decrypts, or accepts application state.
@@ -38,11 +48,12 @@ use libp2p_request_response as request_response;
 use libp2p_request_response::{
     InboundRequestId, OutboundRequestId, ProtocolSupport, ResponseChannel,
 };
-use p2p_identity::Identity;
+use p2p_identity::{Identity, unix_time_seconds};
 use thiserror::Error;
 use tokio::sync::mpsc as tokio_mpsc;
 
 mod pending_admission;
+mod pq_auth;
 mod privacy;
 mod protocol;
 mod socks5;
@@ -55,7 +66,7 @@ pub use privacy::{
 };
 pub use protocol::{
     CONTROL_PROTOCOL, FILE_PROTOCOL, LEGACY_MLS_SETUP_PROTOCOL, MAX_MESSAGE_BYTES,
-    MESSAGE_PROTOCOL, MLS_SETUP_PROTOCOL, MessageCodec,
+    MESSAGE_PROTOCOL, MLS_SETUP_PROTOCOL, MessageCodec, PQ_AUTH_PROTOCOL,
 };
 
 // The derive emits an `unreachable!()` arm for event variants that cannot occur
@@ -73,6 +84,9 @@ mod behaviour {
     /// `Network::start`.
     #[derive(NetworkBehaviour)]
     pub(super) struct Behaviour {
+        /// Mandatory PQ admission protocol. It is always present, never
+        /// toggled, and must complete before application events are delivered.
+        pub(super) pq_auth: request_response::Behaviour<MessageCodec>,
         pub(super) messages: request_response::Behaviour<MessageCodec>,
         pub(super) setup: request_response::Behaviour<MessageCodec>,
         pub(super) files: request_response::Behaviour<MessageCodec>,
@@ -85,7 +99,7 @@ mod behaviour {
         pub(super) relay_server: Toggle<relay::Behaviour>,
         pub(super) autonat: Toggle<autonat::v1::Behaviour>,
         pub(super) dcutr: Toggle<dcutr::Behaviour>,
-        // Enforces socket admission limits before Noise authentication. The
+        // Enforces socket admission limits before transport authentication. The
         // established-connection counters below remain authoritative for
         // per-peer/per-IP policy and relayed-path accounting.
         pub(super) connection_limits: ConnectionLimitBehaviour,
@@ -142,7 +156,8 @@ pub enum ConnectionState {
     Listening { addresses: Vec<Multiaddr> },
     /// An outbound dial is in progress.
     Connecting { peer: PeerId },
-    /// At least one authenticated connection is live.
+    /// At least one classically authenticated connection has also completed
+    /// the mandatory ML-DSA-65 admission exchange.
     Connected { peers: Vec<PeerId> },
     /// The last known peer disconnected and none remain.
     Disconnected { peer: PeerId },
@@ -190,6 +205,50 @@ fn short_peer(peer: &PeerId) -> String {
     text.chars().take(12).collect()
 }
 
+/// Upper bound on observations waiting for PQ admission. Optional behaviours
+/// can emit from many peers before any admission completes; the queue is a
+/// bounded projection, not a buffer of transport payloads.
+const MAX_PENDING_OBSERVATIONS: usize = 64;
+
+/// A peer-scoped optional observation that is withheld until the peer has
+/// completed PQ admission. The underlying libp2p behaviour may still exchange
+/// protocol bytes before admission; only application-visible state is gated.
+#[derive(Debug, Clone)]
+enum PendingObservation {
+    Identify(IdentifyEvent),
+    Discovery(DiscoveryEvent),
+    Relay(RelayEvent),
+    Nat(NatEvent),
+    Listening {
+        peer: PeerId,
+        addresses: Vec<Multiaddr>,
+    },
+    RelayedConnectionsChanged {
+        connection_id: ConnectionId,
+        count: usize,
+    },
+}
+
+impl PendingObservation {
+    fn peer(&self) -> Option<PeerId> {
+        match self {
+            Self::Identify(IdentifyEvent::Identified { peer, .. })
+            | Self::Identify(IdentifyEvent::Failed { peer, .. })
+            | Self::Discovery(DiscoveryEvent::Discovered { peer, .. })
+            | Self::Discovery(DiscoveryEvent::Expired { peer, .. })
+            | Self::Relay(RelayEvent::ReservationAccepted { relay: peer })
+            | Self::Relay(RelayEvent::OutboundCircuitEstablished { relay: peer })
+            | Self::Relay(RelayEvent::InboundCircuitEstablished { source: peer })
+            | Self::Relay(RelayEvent::ServerReservationAccepted { source: peer })
+            | Self::Relay(RelayEvent::ServerCircuitAccepted { source: peer, .. })
+            | Self::Nat(NatEvent::HolePunch { peer, .. })
+            | Self::Listening { peer, .. } => Some(*peer),
+            Self::Discovery(_) | Self::Relay(_) | Self::Nat(_) => None,
+            Self::RelayedConnectionsChanged { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum IpKey {
     V4(Ipv4Addr),
@@ -230,7 +289,7 @@ impl ConnectionLimits {
     }
 }
 
-/// Explicit libp2p pending-socket limits enforced before Noise authentication.
+/// Explicit libp2p pending-socket limits enforced before transport authentication.
 /// `PerIpPendingTransport` adds a per-source-IP pre-auth cap; the worker-side
 /// [`ConnectionLimits`] owns established per-IP and relayed-path policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -479,6 +538,15 @@ impl std::fmt::Display for FileResponseId {
     }
 }
 
+impl FileResponseId {
+    /// Construct an identifier for adversarial tests in downstream crates.
+    /// Production identifiers are issued only by the network receive path.
+    #[doc(hidden)]
+    pub fn for_tests(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
 /// Local identifier for one outbound control-protocol request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ControlRequestId(u64);
@@ -503,7 +571,7 @@ impl std::fmt::Display for ControlResponseId {
 /// do not claim message delivery or application-level acceptance.
 #[derive(Clone, PartialEq, Eq)]
 pub enum MessageEvent {
-    /// The request was handed to the Noise-protected libp2p behaviour. This is
+    /// The request was handed to the transport-protected libp2p behaviour. This is
     /// not proof that the peer received, accepted, or read it.
     SentToPeer {
         request_id: MessageRequestId,
@@ -818,7 +886,9 @@ impl std::fmt::Debug for ControlEvent {
 /// Configuration for a direct-connect network worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkConfig {
-    /// Address to listen on. Ephemeral TCP ports are allowed.
+    /// Direct TCP listen address. Ephemeral ports are allowed. In direct mode a
+    /// same-port UDP/QUIC listener is also derived; proxy and relay-only modes
+    /// use no direct listener.
     pub listen_addr: Multiaddr,
     /// Maximum time for a transport upgrade or dial.
     pub connection_timeout: Duration,
@@ -832,14 +902,16 @@ pub struct NetworkConfig {
     /// Hard cap on simultaneously established connections.
     pub max_total_connections: usize,
     /// Hard cap on simultaneous connections to one authenticated PeerId.
+    /// PQ admission requires exactly one connection per peer so its challenge
+    /// and acknowledgement cannot be delivered on a different connection.
     pub max_connections_per_peer: usize,
     /// Hard cap on simultaneous established or pre-authentication connections
     /// from one observed IP address. Pre-auth slots are released when the
-    /// Noise/Yamux upgrade completes or is dropped.
+    /// transport upgrade completes or is dropped.
     pub max_connections_per_ip: usize,
-    /// Hard cap on concurrent inbound sockets before Noise authentication.
+    /// Hard cap on concurrent inbound sockets before transport authentication.
     pub max_pending_incoming_connections: u32,
-    /// Hard cap on concurrent outbound sockets before Noise authentication.
+    /// Hard cap on concurrent outbound sockets before transport authentication.
     pub max_pending_outgoing_connections: u32,
     /// Maximum inbound application requests from one peer per rate window.
     pub max_requests_per_peer_per_window: u32,
@@ -1004,6 +1076,11 @@ impl Network {
 
     /// Start listening with the vault identity.
     ///
+    /// Each accepted connection must complete the mandatory ML-DSA-65 admission
+    /// exchange before it is reported as `Connected` or application protocols
+    /// are delivered. This gate is bound to the classical libp2p PeerId; it
+    /// does not make Transport authentication quantum-resistant.
+    ///
     /// With the default configuration this contacts no peer; dialing requires
     /// an explicit address from the user. If the user explicitly configures
     /// DHT bootstrap peers or relay servers, those user-supplied peers may be
@@ -1021,6 +1098,10 @@ impl Network {
                 .map_err(|error| {
                     NetworkError::Runtime(format!("identity key import failed: {error}"))
                 })?;
+        // The worker needs the role-separated identity to sign PQ admission
+        // challenges on each accepted connection. It never exports private key
+        // bytes to the wire or to diagnostics.
+        let identity = identity.clone();
         let (command_tx, command_rx) = tokio_mpsc::channel(16);
         let (event_tx, event_rx) = tokio_mpsc::channel(32);
         let (message_event_tx, message_event_rx) = tokio_mpsc::channel(64);
@@ -1038,6 +1119,7 @@ impl Network {
             .spawn(move || {
                 run_worker(
                     keypair,
+                    identity,
                     config,
                     command_rx,
                     event_tx,
@@ -1317,6 +1399,8 @@ impl Network {
     }
 
     /// Drain one pending discovery observation and update the cached snapshot.
+    /// Peer-scoped Kademlia observations are released only after PQ admission;
+    /// mDNS and non-peer facts remain advisory.
     pub fn poll_discovery_event(&mut self) -> Option<DiscoveryEvent> {
         let event = match self.discovery_events.try_recv() {
             Ok(event) => event,
@@ -1352,6 +1436,8 @@ impl Network {
     }
 
     /// Drain one pending relay observation and update the cached snapshot.
+    /// Peer-scoped reservation, circuit, and relayed-connection observations
+    /// are released only after PQ admission.
     pub fn poll_relay_event(&mut self) -> Option<RelayEvent> {
         let event = match self.relay_events.try_recv() {
             Ok(event) => event,
@@ -1377,6 +1463,8 @@ impl Network {
     }
 
     /// Drain one pending NAT observation and update the cached snapshot.
+    /// DCUtR hole-punch observations are released only after PQ admission;
+    /// AutoNAT status is advisory.
     pub fn poll_nat_event(&mut self) -> Option<NatEvent> {
         let event = match self.nat_events.try_recv() {
             Ok(event) => event,
@@ -1390,6 +1478,7 @@ impl Network {
     }
 
     /// Drain one pending identify observation and update the cached snapshot.
+    /// Results and errors are released only after PQ admission.
     pub fn poll_identify_event(&mut self) -> Option<IdentifyEvent> {
         let event = match self.identify_events.try_recv() {
             Ok(event) => event,
@@ -1489,8 +1578,44 @@ fn peer_from_address(address: &Multiaddr) -> Option<PeerId> {
     })
 }
 
+/// Derive a QUIC listener from the configured direct TCP listener. A listener
+/// explicitly configured as `/quic-v1` is left alone; a TCP listener becomes a
+/// UDP listener with the same port. This is address derivation only and does not
+/// make the configured peer an authority on any cryptographic identity.
+fn quic_listen_addr(address: &Multiaddr) -> Option<Multiaddr> {
+    let mut derived = Multiaddr::empty();
+    let mut have_ip = false;
+    let mut have_transport = false;
+    for protocol in address.iter() {
+        match protocol {
+            Protocol::Ip4(ip) => {
+                derived.push(Protocol::Ip4(ip));
+                have_ip = true;
+            }
+            Protocol::Ip6(ip) => {
+                derived.push(Protocol::Ip6(ip));
+                have_ip = true;
+            }
+            Protocol::Tcp(port) if have_ip && !have_transport => {
+                derived.push(Protocol::Udp(port));
+                derived.push(Protocol::QuicV1);
+                have_transport = true;
+            }
+            // A listener address must not contain an authenticated peer suffix.
+            Protocol::P2p(_) | Protocol::P2pCircuit => return None,
+            _ => return None,
+        }
+    }
+    (have_ip && have_transport).then_some(derived)
+}
+
 fn validate_direct_peer_address(address: &Multiaddr) -> Result<(), NetworkError> {
-    if peer_from_address(address).is_none() {
+    if !address
+        .iter()
+        .collect::<Vec<_>>()
+        .last()
+        .is_some_and(|protocol| matches!(protocol, Protocol::P2p(_)))
+    {
         return Err(NetworkError::InvalidAddress(
             "address must end in /p2p/<peer-id>".to_owned(),
         ));
@@ -1619,6 +1744,15 @@ fn validate_config(config: &NetworkConfig) -> Result<(), NetworkError> {
             "connection limits must be at least one".to_owned(),
         ));
     }
+    // `request_response::Behaviour::send_request` selects a connection by
+    // PeerId. PQ admission is therefore defined for one connection per peer so
+    // its challenge and acknowledgement cannot be delivered on a different
+    // connection than the one being admitted.
+    if config.max_connections_per_peer != 1 {
+        return Err(NetworkError::InvalidConfig(
+            "PQ connection admission requires max_connections_per_peer == 1".to_owned(),
+        ));
+    }
     if config.max_pending_incoming_connections == 0 || config.max_pending_outgoing_connections == 0
     {
         return Err(NetworkError::InvalidConfig(
@@ -1683,6 +1817,7 @@ fn validate_message_bytes(bytes: &[u8]) -> Result<(), NetworkError> {
 #[allow(clippy::too_many_arguments)]
 fn run_worker(
     keypair: libp2p::identity::Keypair,
+    identity: Identity,
     config: NetworkConfig,
     mut commands: tokio_mpsc::Receiver<Command>,
     events: tokio_mpsc::Sender<ConnectionState>,
@@ -1717,14 +1852,21 @@ fn run_worker(
         };
 
         // Neither relay-only nor SOCKS5/Tor route mode advertises a direct TCP
-        // listener. Relay clients still create circuit listeners below, and
-        // those reservation dials use the selected transport.
+        // or QUIC listener. Relay clients still create circuit listeners below,
+        // and those reservation dials use the selected transport.
         if config.transport_mode != TransportPrivacyMode::TorRequired
             && config.dial_policy != DialPolicy::RelayOnly
-            && let Err(error) = swarm.listen_on(config.listen_addr.clone())
         {
-            let _ = startup.send(Startup::Error(error.to_string()));
-            return;
+            if let Err(error) = swarm.listen_on(config.listen_addr.clone()) {
+                let _ = startup.send(Startup::Error(error.to_string()));
+                return;
+            }
+            if let Some(quic_addr) = quic_listen_addr(&config.listen_addr)
+                && let Err(error) = swarm.listen_on(quic_addr)
+            {
+                let _ = startup.send(Startup::Error(error.to_string()));
+                return;
+            }
         }
 
         // Optional capabilities are applied only at worker startup. Only peers
@@ -1781,6 +1923,9 @@ fn run_worker(
         let mut addresses = Vec::new();
         let mut connected: BTreeSet<PeerId> = BTreeSet::new();
         let mut expected_peers: BTreeSet<PeerId> = BTreeSet::new();
+        let local_peer_id = *swarm.local_peer_id();
+        let mut pq = pq_auth::PqAuth::default();
+        let mut pq_failed_connections: HashSet<ConnectionId> = HashSet::new();
         let mut total_connections = 0usize;
         let mut ip_connections: HashMap<IpKey, usize> = HashMap::new();
         let mut rejected_connections: HashSet<ConnectionId> = HashSet::new();
@@ -1824,6 +1969,18 @@ fn run_worker(
         > = HashMap::new();
         let mut control_inbound_by_swarm: HashMap<InboundRequestId, ControlResponseId> =
             HashMap::new();
+
+        // Optional peer-facing observations are queued here until PQ admission
+        // completes on the exact connection that produced them. Local listener
+        // and startup failure events are not peer observations and stay direct.
+        let mut pending_observations: Vec<PendingObservation> = Vec::new();
+        let observation_senders = ObservationSenders {
+            state: &events,
+            discovery: &discovery_events,
+            relay: &relay_events,
+            nat: &nat_events,
+            identify: &identify_events,
+        };
 
         let _ = startup.send(Startup::Ready);
 
@@ -1916,16 +2073,57 @@ fn run_worker(
                             if let Some(key) = remote_ip {
                                 *ip_connections.entry(key).or_default() += 1;
                             }
-                            connected.insert(peer_id);
                             if relayed {
                                 relayed_connections.insert(connection_id);
                                 let count = relayed_peers.entry(peer_id).or_default();
                                 *count = count.saturating_add(1);
-                                emit_relay(&relay_events, RelayEvent::RelayedConnectionsChanged {
-                                    count: relayed_connections.len(),
-                                });
+                                // The relayed path exists, but it is not a
+                                // usable peer until admission completes.
+                                defer_observation(
+                                    &mut pending_observations,
+                                    PendingObservation::RelayedConnectionsChanged {
+                                        connection_id,
+                                        count: relayed_connections.len(),
+                                    },
+                                );
                             }
-                            emit_connected(&events, &connected);
+                            // The transport is classically authenticated by
+                            // Noise/TLS. Start the mandatory ML-DSA-65 admission
+                            // exchange and withhold `Connected` and all
+                            // application events until it succeeds.
+                            let nonce = match pq_auth::random_nonce() {
+                                Ok(nonce) => nonce,
+                                Err(_) => {
+                                    rejected_connections.insert(connection_id);
+                                    let _ = swarm.close_connection(connection_id);
+                                    emit(&events, ConnectionState::Failed {
+                                        peer: Some(peer_id),
+                                        reason: "PQ authentication randomness source failed"
+                                            .to_owned(),
+                                    });
+                                    continue;
+                                }
+                            };
+                            let request = match pq_auth::encode_request(
+                                &identity,
+                                local_peer_id,
+                                peer_id,
+                                &nonce,
+                            ) {
+                                Ok(request) => request,
+                                Err(_) => {
+                                    rejected_connections.insert(connection_id);
+                                    let _ = swarm.close_connection(connection_id);
+                                    emit(&events, ConnectionState::Failed {
+                                        peer: Some(peer_id),
+                                        reason: "PQ authentication request could not be signed"
+                                            .to_owned(),
+                                    });
+                                    continue;
+                                }
+                            };
+                            let outbound = swarm.behaviour_mut().pq_auth.send_request(&peer_id, request);
+                            pq.start(connection_id, peer_id, outbound, nonce);
                         }
                         SwarmEvent::ConnectionClosed {
                             peer_id,
@@ -1934,19 +2132,37 @@ fn run_worker(
                             num_established,
                             ..
                         } => {
+                            let pq_pending = pq.is_pending(connection_id);
+                            let pq_authenticated = pq.is_authenticated(connection_id);
+                            pq.on_closed(connection_id);
                             if relayed_connections.remove(&connection_id) {
                                 let entry = relayed_peers.entry(peer_id).or_default();
                                 *entry = entry.saturating_sub(1);
                                 if *entry == 0 {
                                     relayed_peers.remove(&peer_id);
                                 }
-                                emit_relay(&relay_events, RelayEvent::RelayedConnectionsChanged {
-                                    count: relayed_connections.len(),
-                                });
+                                drop_pending_connection_observations(
+                                    &mut pending_observations,
+                                    connection_id,
+                                );
+                                if pq_authenticated {
+                                    emit_relay(
+                                        &relay_events,
+                                        RelayEvent::RelayedConnectionsChanged {
+                                            count: relayed_connections.len(),
+                                        },
+                                    );
+                                }
+                            }
+                            if !pq_authenticated {
+                                // Observations from a connection that never
+                                // completed admission must never be promoted.
+                                drop_pending_peer_observations(&mut pending_observations, peer_id);
                             }
                             if rejected_connections.remove(&connection_id) {
                                 continue;
                             }
+                            let pq_failed = pq_failed_connections.remove(&connection_id);
                             total_connections = total_connections.saturating_sub(1);
                             if let Some(key) = ip_key(endpoint.get_remote_address()) {
                                 let entry = ip_connections.entry(key).or_default();
@@ -1957,6 +2173,20 @@ fn run_worker(
                             }
                             if num_established == 0 {
                                 connected.remove(&peer_id);
+                            }
+                            // A connection that never completed PQ admission
+                            // was never a `Connected` peer. Report an
+                            // unfinished admission as a failure, not as a
+                            // normal disconnect.
+                            if pq_failed {
+                                continue;
+                            }
+                            if !pq_authenticated && pq_pending {
+                                emit(&events, ConnectionState::Failed {
+                                    peer: Some(peer_id),
+                                    reason: "PQ connection admission did not complete".to_owned(),
+                                });
+                                continue;
                             }
                             if connected.is_empty() {
                                 emit(&events, ConnectionState::Disconnected { peer: peer_id });
@@ -1987,7 +2217,51 @@ fn run_worker(
                                 reason: truncate_reason(&error.to_string()),
                             });
                         }
+                        SwarmEvent::Behaviour(BehaviourEvent::PqAuth(event)) => {
+                            for action in pq.handle_event(event, local_peer_id, unix_time_seconds()) {
+                                match action {
+                                    pq_auth::Action::Respond { channel, bytes } => {
+                                        let _ = swarm.behaviour_mut().pq_auth.send_response(channel, bytes);
+                                    }
+                                    pq_auth::Action::Authenticated {
+                                        connection_id,
+                                        peer,
+                                    } => {
+                                        connected.insert(peer);
+                                        emit_connected(&events, &connected);
+                                        flush_pending_observations(
+                                            &mut pending_observations,
+                                            peer,
+                                            connection_id,
+                                            &observation_senders,
+                                        );
+                                    }
+                                    pq_auth::Action::Reject {
+                                        connection_id,
+                                        peer,
+                                        reason,
+                                    } => {
+                                        pq_failed_connections.insert(connection_id);
+                                        let _ = swarm.close_connection(connection_id);
+                                        emit(&events, ConnectionState::Failed {
+                                            peer: Some(peer),
+                                            reason: reason.to_owned(),
+                                        });
+                                    }
+                                }
+                            }
+                        }
                         SwarmEvent::Behaviour(BehaviourEvent::Messages(event)) => {
+                            let (event_peer, event_connection) = application_event_connection(&event);
+                            if !pq.can_receive(event_connection) {
+                                pq_failed_connections.insert(event_connection);
+                                let _ = swarm.close_connection(event_connection);
+                                emit(&events, ConnectionState::Failed {
+                                    peer: Some(event_peer),
+                                    reason: "application traffic before PQ authentication".to_owned(),
+                                });
+                                continue;
+                            }
                             if let Some((peer, bytes, route_denied)) =
                                 denied_request(&event, config.dial_policy, &relayed_peers)
                                 && (route_denied
@@ -2024,6 +2298,16 @@ fn run_worker(
                             );
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Setup(event)) => {
+                            let (event_peer, event_connection) = application_event_connection(&event);
+                            if !pq.can_receive(event_connection) {
+                                pq_failed_connections.insert(event_connection);
+                                let _ = swarm.close_connection(event_connection);
+                                emit(&events, ConnectionState::Failed {
+                                    peer: Some(event_peer),
+                                    reason: "application traffic before PQ authentication".to_owned(),
+                                });
+                                continue;
+                            }
                             if let Some((peer, bytes, route_denied)) =
                                 denied_request(&event, config.dial_policy, &relayed_peers)
                                 && (route_denied
@@ -2061,6 +2345,16 @@ fn run_worker(
                             );
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Files(event)) => {
+                            let (event_peer, event_connection) = application_event_connection(&event);
+                            if !pq.can_receive(event_connection) {
+                                pq_failed_connections.insert(event_connection);
+                                let _ = swarm.close_connection(event_connection);
+                                emit(&events, ConnectionState::Failed {
+                                    peer: Some(event_peer),
+                                    reason: "application traffic before PQ authentication".to_owned(),
+                                });
+                                continue;
+                            }
                             if let Some((peer, bytes, route_denied)) =
                                 denied_request(&event, config.dial_policy, &relayed_peers)
                                 && (route_denied
@@ -2099,6 +2393,16 @@ fn run_worker(
                             );
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Control(event)) => {
+                            let (event_peer, event_connection) = application_event_connection(&event);
+                            if !pq.can_receive(event_connection) {
+                                pq_failed_connections.insert(event_connection);
+                                let _ = swarm.close_connection(event_connection);
+                                emit(&events, ConnectionState::Failed {
+                                    peer: Some(event_peer),
+                                    reason: "application traffic before PQ authentication".to_owned(),
+                                });
+                                continue;
+                            }
                             if let Some((peer, bytes, route_denied)) =
                                 denied_request(&event, config.dial_policy, &relayed_peers)
                                 && (route_denied
@@ -2138,9 +2442,11 @@ fn run_worker(
                         SwarmEvent::Behaviour(BehaviourEvent::Identify(event)) => match event {
                             identify::Event::Received {
                                 peer_id, info, ..
-                            } => emit_identify(
-                                &identify_events,
-                                IdentifyEvent::Identified {
+                            } => emit_or_defer_peer_observation(
+                                &mut pending_observations,
+                                &pq,
+                                &observation_senders,
+                                PendingObservation::Identify(IdentifyEvent::Identified {
                                     peer: peer_id,
                                     protocol_version: privacy::bounded_text(
                                         &info.protocol_version,
@@ -2149,15 +2455,19 @@ fn run_worker(
                                     agent_version: privacy::bounded_text(&info.agent_version, 64),
                                     protocol_count: info.protocols.len(),
                                     listen_address_count: info.listen_addrs.len(),
-                                },
+                                }),
                             ),
-                            identify::Event::Error { peer_id, .. } => emit_identify(
-                                &identify_events,
-                                IdentifyEvent::Failed {
-                                    peer: peer_id,
-                                    reason: "identify exchange failed".to_owned(),
-                                },
-                            ),
+                            identify::Event::Error { peer_id, .. } => {
+                                emit_or_defer_peer_observation(
+                                    &mut pending_observations,
+                                    &pq,
+                                    &observation_senders,
+                                    PendingObservation::Identify(IdentifyEvent::Failed {
+                                        peer: peer_id,
+                                        reason: "identify exchange failed".to_owned(),
+                                    }),
+                                );
+                            }
                             _ => {}
                         },
                         SwarmEvent::Behaviour(BehaviourEvent::Ping(_)) => {}
@@ -2206,13 +2516,15 @@ fn run_worker(
                             }
                             kad::Event::RoutingUpdated {
                                 peer, addresses, ..
-                            } => emit_discovery(
-                                &discovery_events,
-                                DiscoveryEvent::Discovered {
+                            } => emit_or_defer_peer_observation(
+                                &mut pending_observations,
+                                &pq,
+                                &observation_senders,
+                                PendingObservation::Discovery(DiscoveryEvent::Discovered {
                                     source: DiscoverySource::Kad,
                                     peer,
                                     address: addresses.first().clone(),
-                                },
+                                }),
                             ),
                             kad::Event::UnroutablePeer { .. } | kad::Event::ModeChanged { .. } => {}
                             _ => {}
@@ -2221,14 +2533,19 @@ fn run_worker(
                             relay::client::Event::ReservationReqAccepted {
                                 relay_peer_id, ..
                             } => {
-                                emit_relay(
-                                    &relay_events,
-                                    RelayEvent::ReservationAccepted { relay: relay_peer_id },
+                                // The relay reservation exchange is operational
+                                // bootstrap traffic and may occur before PQ
+                                // admission. Its observable event and circuit
+                                // listener state are withheld until the relay
+                                // itself completes admission.
+                                emit_or_defer_peer_observation(
+                                    &mut pending_observations,
+                                    &pq,
+                                    &observation_senders,
+                                    PendingObservation::Relay(RelayEvent::ReservationAccepted {
+                                        relay: relay_peer_id,
+                                    }),
                                 );
-                                // A circuit listener only exists after the relay
-                                // confirms the reservation. Advertise that
-                                // address as observed state; never replace it
-                                // with a direct listener under relay-only mode.
                                 if let Some(relay_address) = config
                                     .relay_servers
                                     .iter()
@@ -2239,9 +2556,12 @@ fn run_worker(
                                     circuit_address.push(Protocol::P2p(*swarm.local_peer_id()));
                                     if !addresses.contains(&circuit_address) {
                                         addresses.push(circuit_address);
-                                        emit(
-                                            &events,
-                                            ConnectionState::Listening {
+                                        emit_or_defer_peer_observation(
+                                            &mut pending_observations,
+                                            &pq,
+                                            &observation_senders,
+                                            PendingObservation::Listening {
+                                                peer: relay_peer_id,
                                                 addresses: addresses.clone(),
                                             },
                                         );
@@ -2250,33 +2570,53 @@ fn run_worker(
                             }
                             relay::client::Event::OutboundCircuitEstablished {
                                 relay_peer_id, ..
-                            } => emit_relay(
-                                &relay_events,
-                                RelayEvent::OutboundCircuitEstablished { relay: relay_peer_id },
+                            } => emit_or_defer_peer_observation(
+                                &mut pending_observations,
+                                &pq,
+                                &observation_senders,
+                                PendingObservation::Relay(
+                                    RelayEvent::OutboundCircuitEstablished {
+                                        relay: relay_peer_id,
+                                    },
+                                ),
                             ),
                             relay::client::Event::InboundCircuitEstablished { src_peer_id, .. } => {
-                                emit_relay(
-                                    &relay_events,
-                                    RelayEvent::InboundCircuitEstablished {
-                                        source: src_peer_id,
-                                    },
-                                )
+                                emit_or_defer_peer_observation(
+                                    &mut pending_observations,
+                                    &pq,
+                                    &observation_senders,
+                                    PendingObservation::Relay(
+                                        RelayEvent::InboundCircuitEstablished {
+                                            source: src_peer_id,
+                                        },
+                                    ),
+                                );
                             }
                         },
                         SwarmEvent::Behaviour(BehaviourEvent::RelayServer(event)) => match event {
-                            relay::Event::ReservationReqAccepted { src_peer_id, .. } => emit_relay(
-                                &relay_events,
-                                RelayEvent::ServerReservationAccepted { source: src_peer_id },
-                            ),
+                            relay::Event::ReservationReqAccepted { src_peer_id, .. } => {
+                                emit_or_defer_peer_observation(
+                                    &mut pending_observations,
+                                    &pq,
+                                    &observation_senders,
+                                    PendingObservation::Relay(
+                                        RelayEvent::ServerReservationAccepted {
+                                            source: src_peer_id,
+                                        },
+                                    ),
+                                );
+                            }
                             relay::Event::CircuitReqAccepted {
                                 src_peer_id,
                                 dst_peer_id,
-                            } => emit_relay(
-                                &relay_events,
-                                RelayEvent::ServerCircuitAccepted {
+                            } => emit_or_defer_peer_observation(
+                                &mut pending_observations,
+                                &pq,
+                                &observation_senders,
+                                PendingObservation::Relay(RelayEvent::ServerCircuitAccepted {
                                     source: src_peer_id,
                                     destination: dst_peer_id,
-                                },
+                                }),
                             ),
                             _ => {}
                         },
@@ -2295,18 +2635,22 @@ fn run_worker(
                                 NatEvent::StatusChanged { status, address },
                             );
                         }
-                        SwarmEvent::Behaviour(BehaviourEvent::Dcutr(event)) => emit_nat(
-                            &nat_events,
-                            NatEvent::HolePunch {
-                                peer: event.remote_peer_id,
-                                succeeded: event.result.is_ok(),
-                                reason: if event.result.is_ok() {
-                                    "hole punch established a direct connection".to_owned()
-                                } else {
-                                    "hole punch did not establish a direct connection".to_owned()
-                                },
-                            },
-                        ),
+                        SwarmEvent::Behaviour(BehaviourEvent::Dcutr(event)) => {
+                            emit_or_defer_peer_observation(
+                                &mut pending_observations,
+                                &pq,
+                                &observation_senders,
+                                PendingObservation::Nat(NatEvent::HolePunch {
+                                    peer: event.remote_peer_id,
+                                    succeeded: event.result.is_ok(),
+                                    reason: if event.result.is_ok() {
+                                        "hole punch established a direct connection".to_owned()
+                                    } else {
+                                        "hole punch did not establish a direct connection".to_owned()
+                                    },
+                                }),
+                            );
+                        }
                         _ => {}
                     }
                 }
@@ -2650,16 +2994,28 @@ fn build_swarm(
         .with_timeout(Duration::from_secs(10));
 
     // The standard builder applies libp2p's connection limits only after the
-    // transport emits an inbound connection. Wrap the upgraded TCP transport
-    // so a single source IP cannot occupy the whole pre-authentication budget
-    // with stalled sockets before Noise authentication.
+    // transport emits an inbound connection. Wrap all direct transports so a
+    // single source IP cannot occupy the whole pre-authentication budget with
+    // stalled sockets before authentication. QUIC uses the pinned libp2p-tls
+    // stack, which configures rustls with `prefer-post-quantum` and negotiates
+    // X25519MLKEM768; its TLS peer authentication remains classical. Every
+    // accepted connection is additionally gated by the mandatory ML-DSA-65
+    // admission behaviour below before application traffic is delivered.
     let noise_direct = libp2p::noise::Config::new(keypair).map_err(|error| error.to_string())?;
+    let tcp_transport = libp2p::tcp::tokio::Transport::new(Default::default())
+        .upgrade(libp2p::core::upgrade::Version::V1Lazy)
+        .authenticate(noise_direct)
+        .multiplex(libp2p::yamux::Config::default())
+        .map(|(peer, connection), _| (peer, StreamMuxerBox::new(connection)));
+    let quic_transport = libp2p::quic::tokio::Transport::new(libp2p::quic::Config::new(keypair))
+        .map(|(peer, connection), _| (peer, StreamMuxerBox::new(connection)));
     let direct_transport = PerIpPendingTransport::new(
-        libp2p::tcp::tokio::Transport::new(Default::default())
-            .upgrade(libp2p::core::upgrade::Version::V1Lazy)
-            .authenticate(noise_direct)
-            .multiplex(libp2p::yamux::Config::default())
-            .map(|(peer, connection), _| (peer, StreamMuxerBox::new(connection))),
+        libp2p::core::transport::OrTransport::new(tcp_transport, quic_transport).map(
+            |connection, _| match connection {
+                libp2p::futures::future::Either::Left(connection)
+                | libp2p::futures::future::Either::Right(connection) => connection,
+            },
+        ),
         config.max_connections_per_ip,
     )
     .boxed();
@@ -2697,6 +3053,15 @@ fn build_swarm(
         .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)
         .map_err(|error| error.to_string())?
         .with_behaviour(|key, relay_client| Behaviour {
+            pq_auth: request_response::Behaviour::new(
+                [(PQ_AUTH_PROTOCOL.to_owned(), ProtocolSupport::Full)],
+                // Both endpoints send a request on the same connection. Allow
+                // one inbound and one outbound stream concurrently so the two
+                // directions cannot block each other during admission.
+                request_response::Config::default()
+                    .with_request_timeout(connection_timeout)
+                    .with_max_concurrent_streams(2),
+            ),
             messages: request_response::Behaviour::new(
                 [(MESSAGE_PROTOCOL.to_owned(), ProtocolSupport::Full)],
                 request_response::Config::default()
@@ -3210,6 +3575,36 @@ fn inbound_failure_reason(error: &request_response::InboundFailure) -> &'static 
     }
 }
 
+/// Peer and connection that produced an application protocol event. Every
+/// request-response event carries the connection, so PQ admission can gate
+/// application traffic before any payload is decoded or emitted.
+fn application_event_connection(
+    event: &request_response::Event<Vec<u8>, Vec<u8>>,
+) -> (PeerId, ConnectionId) {
+    match event {
+        request_response::Event::Message {
+            peer,
+            connection_id,
+            ..
+        }
+        | request_response::Event::OutboundFailure {
+            peer,
+            connection_id,
+            ..
+        }
+        | request_response::Event::InboundFailure {
+            peer,
+            connection_id,
+            ..
+        }
+        | request_response::Event::ResponseSent {
+            peer,
+            connection_id,
+            ..
+        } => (*peer, *connection_id),
+    }
+}
+
 /// Inbound application request denied by the selected route policy. The
 /// boolean marks a relay-only policy rejection; rate-limit rejection is decided
 /// separately by the caller.
@@ -3277,6 +3672,104 @@ fn emit_identify(events: &tokio_mpsc::Sender<IdentifyEvent>, event: IdentifyEven
     // Only bounded strings and counts are emitted; peer-provided addresses are
     // deliberately discarded.
     let _ = events.try_send(event);
+}
+
+/// Output channels used to project optional libp2p observations to callers.
+struct ObservationSenders<'a> {
+    state: &'a tokio_mpsc::Sender<ConnectionState>,
+    discovery: &'a tokio_mpsc::Sender<DiscoveryEvent>,
+    relay: &'a tokio_mpsc::Sender<RelayEvent>,
+    nat: &'a tokio_mpsc::Sender<NatEvent>,
+    identify: &'a tokio_mpsc::Sender<IdentifyEvent>,
+}
+
+fn defer_observation(pending: &mut Vec<PendingObservation>, observation: PendingObservation) {
+    // Keep the queue bounded even when an unauthenticated peer churns identify
+    // or relay events. Dropping the oldest advisory observation is safe.
+    if pending.len() >= MAX_PENDING_OBSERVATIONS {
+        pending.remove(0);
+    }
+    pending.push(observation);
+}
+
+fn emit_observation(observation: PendingObservation, senders: &ObservationSenders<'_>) {
+    match observation {
+        PendingObservation::Identify(event) => emit_identify(senders.identify, event),
+        PendingObservation::Discovery(event) => emit_discovery(senders.discovery, event),
+        PendingObservation::Relay(event) => emit_relay(senders.relay, event),
+        PendingObservation::Nat(event) => emit_nat(senders.nat, event),
+        PendingObservation::Listening { addresses, .. } => {
+            emit(senders.state, ConnectionState::Listening { addresses });
+        }
+        PendingObservation::RelayedConnectionsChanged { count, .. } => {
+            emit_relay(
+                senders.relay,
+                RelayEvent::RelayedConnectionsChanged { count },
+            );
+        }
+    }
+}
+
+/// Gate one optional observation before it reaches callers. Peer-scoped
+/// observations wait until that peer completes PQ admission; advisory facts
+/// without a peer are emitted immediately.
+fn emit_or_defer_peer_observation(
+    pending: &mut Vec<PendingObservation>,
+    pq: &pq_auth::PqAuth,
+    senders: &ObservationSenders<'_>,
+    observation: PendingObservation,
+) {
+    let Some(peer) = observation.peer() else {
+        emit_observation(observation, senders);
+        return;
+    };
+    if pq.is_peer_authenticated(peer) {
+        emit_observation(observation, senders);
+    } else {
+        defer_observation(pending, observation);
+    }
+}
+
+fn flush_pending_observations(
+    pending: &mut Vec<PendingObservation>,
+    peer: PeerId,
+    connection_id: ConnectionId,
+    senders: &ObservationSenders<'_>,
+) {
+    let queued = std::mem::take(pending);
+    for observation in queued {
+        let ready = match &observation {
+            PendingObservation::RelayedConnectionsChanged {
+                connection_id: queued_connection,
+                ..
+            } => *queued_connection == connection_id,
+            other => other.peer() == Some(peer),
+        };
+        if ready {
+            emit_observation(observation, senders);
+        } else {
+            defer_observation(pending, observation);
+        }
+    }
+}
+
+fn drop_pending_peer_observations(pending: &mut Vec<PendingObservation>, peer: PeerId) {
+    pending.retain(|observation| observation.peer() != Some(peer));
+}
+
+fn drop_pending_connection_observations(
+    pending: &mut Vec<PendingObservation>,
+    connection_id: ConnectionId,
+) {
+    pending.retain(|observation| {
+        !matches!(
+            observation,
+            PendingObservation::RelayedConnectionsChanged {
+                connection_id: queued_connection,
+                ..
+            } if *queued_connection == connection_id
+        )
+    });
 }
 
 fn emit_connected(events: &tokio_mpsc::Sender<ConnectionState>, peers: &BTreeSet<PeerId>) {
@@ -4124,5 +4617,64 @@ mod tests {
             assert!(debug.contains("<redacted>"), "{debug}");
             assert!(!debug.contains(&bytes_debug), "{debug}");
         }
+    }
+
+    #[test]
+    fn pending_optional_observations_are_bounded_and_peer_scoped() {
+        let peer = generated_peer_id();
+        let other = generated_peer_id();
+        let mut pending = Vec::new();
+        for index in 0..(MAX_PENDING_OBSERVATIONS + 2) {
+            defer_observation(
+                &mut pending,
+                PendingObservation::Identify(IdentifyEvent::Failed {
+                    peer,
+                    reason: format!("failure-{index}"),
+                }),
+            );
+        }
+        assert_eq!(pending.len(), MAX_PENDING_OBSERVATIONS);
+        assert!(
+            matches!(&pending[0], PendingObservation::Identify(IdentifyEvent::Failed { reason, .. }) if reason == "failure-2"),
+            "the oldest advisory observations are dropped first"
+        );
+
+        drop_pending_peer_observations(&mut pending, other);
+        assert_eq!(pending.len(), MAX_PENDING_OBSERVATIONS);
+        drop_pending_peer_observations(&mut pending, peer);
+        assert!(pending.is_empty());
+
+        let (state_tx, _state_rx) = tokio_mpsc::channel(4);
+        let (discovery_tx, mut discovery_rx) = tokio_mpsc::channel(4);
+        let (relay_tx, _relay_rx) = tokio_mpsc::channel(4);
+        let (nat_tx, _nat_rx) = tokio_mpsc::channel(4);
+        let (identify_tx, _identify_rx) = tokio_mpsc::channel(4);
+        let senders = ObservationSenders {
+            state: &state_tx,
+            discovery: &discovery_tx,
+            relay: &relay_tx,
+            nat: &nat_tx,
+            identify: &identify_tx,
+        };
+        emit_or_defer_peer_observation(
+            &mut pending,
+            &pq_auth::PqAuth::default(),
+            &senders,
+            PendingObservation::Discovery(DiscoveryEvent::KadBootstrapFinished {
+                query_id: 7,
+                result: "ok".to_owned(),
+            }),
+        );
+        assert!(
+            pending.is_empty(),
+            "advisory observations without a peer must not be deferred"
+        );
+        assert!(
+            matches!(
+                discovery_rx.try_recv(),
+                Ok(DiscoveryEvent::KadBootstrapFinished { query_id: 7, .. })
+            ),
+            "advisory observations without a peer must be emitted immediately"
+        );
     }
 }

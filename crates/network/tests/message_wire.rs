@@ -13,9 +13,8 @@ use p2p_messaging::{DeliveryState, Envelope, MessageKind, Receipt, ReceiptStatus
 
 fn mls_key(identity: &Identity) -> Vec<u8> {
     identity
-        .role_public_bytes(IdentityRole::Mls)
-        .expect("certified MLS role key")
-        .to_vec()
+        .pq_role_public_bytes(IdentityRole::Mls)
+        .expect("certified ML-DSA-65 MLS role key")
 }
 use p2p_network::{ConnectionState, MessageEvent, Network, NetworkConfig};
 

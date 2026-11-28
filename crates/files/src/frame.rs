@@ -1,18 +1,20 @@
 //! Bounded, signed application frames for the file-transfer protocol.
 //!
-//! Frames travel inside `/p2p-messenger/file/1` over a Noise-authenticated
-//! connection. The Ed25519 signature binds transfer ID, sender PeerId, public
-//! key, message code, and payload so a receiver can reject a frame attributed
-//! to a different authenticated peer. Payload bytes are opaque here; chunk
-//! ciphertext is authenticated separately with bound AAD.
+//! Frames travel inside `/p2p-messenger/file/1` over a libp2p-authenticated
+//! connection. Version 3 carries a self-contained ML-DSA-65 proof and an
+//! ML-DSA-65 `File` signature binding transfer ID, sender PeerId, public key,
+//! message code, and payload. Version 2 is a decodable legacy Ed25519 codec for
+//! adversarial tests; the chat controller rejects it. Payload bytes are opaque
+//! here; chunk ciphertext is authenticated separately with bound AAD.
 
 use std::fmt;
 
 use libp2p_identity::PeerId;
 use p2p_crypto::{NONCE_LEN, TAG_LEN};
 use p2p_identity::{
-    Identity, IdentityRole, MAX_IDENTITY_PROOF_BYTES, unix_time_seconds,
-    verify_application_signature,
+    Identity, IdentityRole, MAX_IDENTITY_PROOF_BYTES, MAX_PQ_IDENTITY_PROOF_BYTES,
+    PQ_PUBLIC_KEY_BYTES, PQ_SIGNATURE_BYTES, unix_time_seconds, verify_application_signature,
+    verify_pq_application_signature,
 };
 use zeroize::Zeroizing;
 
@@ -25,8 +27,11 @@ pub const FILE_PROTOCOL: &str = "/p2p-messenger/file/1";
 
 /// Fixed frame magic. Unknown magic is rejected, never negotiated.
 pub const FILE_MAGIC: [u8; 4] = *b"FILE";
-/// File frame version implemented by this build.
-pub const FILE_VERSION: u16 = 2;
+/// Post-quantum file frame version implemented by this build.
+pub const FILE_VERSION: u16 = 3;
+/// Last classical-signature file codec. It decodes for compatibility tests
+/// only and is rejected by every production receive path.
+pub const LEGACY_FILE_VERSION: u16 = 2;
 
 /// Maximum bytes accepted in one file request or response frame. This matches
 /// the transport codec cap and prevents unbounded length-prefix allocation.
@@ -42,9 +47,9 @@ pub const MAX_TRANSFER_BYTES: u64 = 64 * 1024 * 1024;
 /// Maximum chunk count implied by the fixed size and chunk bounds.
 pub const MAX_CHUNKS: u32 = 256;
 
-const MAX_PUBLIC_KEY_BYTES: usize = 256;
+const MAX_PUBLIC_KEY_BYTES: usize = PQ_PUBLIC_KEY_BYTES;
 const MAX_PEER_ID_BYTES: usize = 128;
-const SIGNATURE_LEN: usize = 64;
+const LEGACY_SIGNATURE_LEN: usize = 64;
 const MAX_CHUNK_CIPHERTEXT_BYTES: usize = MAX_CHUNK_PLAINTEXT_BYTES + NONCE_LEN + TAG_LEN;
 
 const OFFER: u8 = 1;
@@ -333,34 +338,69 @@ impl fmt::Debug for FileMessage {
 }
 
 /// A signed file-protocol frame. Decoding does not verify the signature;
-/// callers must call [`Self::verify`] with the Noise-authenticated peer.
+/// callers must call [`Self::verify`] with the authenticated peer and
+/// [`Self::require_pq`] in production paths.
 #[derive(Clone, PartialEq, Eq)]
 pub struct FileEnvelope {
     pub sender: PeerId,
     pub sender_public_key: Vec<u8>,
     pub identity_proof: Vec<u8>,
     pub message: FileMessage,
-    signature: [u8; SIGNATURE_LEN],
+    version: u16,
+    signature: Vec<u8>,
 }
 
 impl FileEnvelope {
-    /// Sign a new file frame with the local vault identity.
+    /// Sign a new post-quantum file frame with the local vault identity.
     pub fn new(identity: &Identity, message: FileMessage) -> Result<Self, FileError> {
         message.check_sizes()?;
         let mut envelope = Self {
             sender: identity.peer_id(),
-            sender_public_key: identity.role_public_bytes(IdentityRole::File)?.to_vec(),
-            identity_proof: identity.proof().to_bytes(),
+            sender_public_key: identity.pq_role_public_bytes(IdentityRole::File)?,
+            identity_proof: identity.pq_proof_bytes(),
             message,
-            signature: [0; SIGNATURE_LEN],
+            version: FILE_VERSION,
+            signature: vec![0u8; PQ_SIGNATURE_BYTES],
         };
         envelope.check_sizes()?;
-        let signature = identity.sign_with_role(IdentityRole::File, &envelope.signing_bytes()?)?;
-        envelope.signature = signature
-            .as_slice()
-            .try_into()
-            .map_err(|_| FileError::BadSignature)?;
+        envelope.signature =
+            identity.pq_sign_with_role(IdentityRole::File, &envelope.signing_bytes()?)?;
         Ok(envelope)
+    }
+
+    /// Wire version of this frame.
+    pub fn version(&self) -> u16 {
+        self.version
+    }
+
+    /// Fail closed unless this frame is the post-quantum codec. The legacy v2
+    /// codec remains decodable and verifiable for adversarial tests only.
+    pub fn require_pq(&self) -> Result<(), FileError> {
+        if self.version != FILE_VERSION {
+            return Err(FileError::UnsupportedVersion);
+        }
+        Ok(())
+    }
+
+    /// Build a valid classical-signature v2 frame for adversarial controller
+    /// tests. Production send paths always use [`Self::new`] with v3 frames.
+    #[doc(hidden)]
+    pub fn legacy_v2_frame_for_tests(
+        sender: &Identity,
+        message: FileMessage,
+    ) -> Result<Self, FileError> {
+        message.check_sizes()?;
+        let mut frame = Self {
+            sender: sender.peer_id(),
+            sender_public_key: sender.role_public_bytes(IdentityRole::File)?.to_vec(),
+            identity_proof: sender.proof().to_bytes(),
+            message,
+            version: LEGACY_FILE_VERSION,
+            signature: vec![0u8; LEGACY_SIGNATURE_LEN],
+        };
+        frame.check_sizes()?;
+        frame.signature = sender.sign_with_role(IdentityRole::File, &frame.signing_bytes()?)?;
+        Ok(frame)
     }
 
     /// Decode a signed frame. This does not verify the signature or sender.
@@ -373,16 +413,16 @@ impl FileEnvelope {
             return Err(FileError::BadMagic);
         }
         let version = reader.u16()?;
-        if version != FILE_VERSION {
+        if version != FILE_VERSION && version != LEGACY_FILE_VERSION {
             return Err(FileError::UnsupportedVersion);
         }
         let code = reader.u8()?;
         let transfer_id = reader.fixed::<16>()?;
         let sender_public_key = reader.var(MAX_PUBLIC_KEY_BYTES)?;
         let sender_bytes = reader.var(MAX_PEER_ID_BYTES)?;
-        let identity_proof = reader.var(MAX_IDENTITY_PROOF_BYTES)?;
+        let identity_proof = reader.var(MAX_PQ_IDENTITY_PROOF_BYTES)?;
         let payload = reader.var(MAX_FILE_PAYLOAD_BYTES)?;
-        let signature = reader.fixed::<SIGNATURE_LEN>()?;
+        let signature = reader.take(signature_len_for_version(version))?.to_vec();
         reader.finish()?;
 
         let sender = PeerId::from_bytes(sender_bytes).map_err(|_| FileError::BadPeerId)?;
@@ -392,6 +432,7 @@ impl FileEnvelope {
             sender_public_key: sender_public_key.to_vec(),
             identity_proof: identity_proof.to_vec(),
             message,
+            version,
             signature,
         };
         envelope.check_sizes()?;
@@ -421,14 +462,27 @@ impl FileEnvelope {
             return Err(FileError::UnexpectedSender);
         }
         self.check_sizes()?;
-        let certified_key = verify_application_signature(
-            &self.identity_proof,
-            IdentityRole::File,
-            &self.sender,
-            &self.signing_bytes()?,
-            &self.signature,
-            unix_time_seconds(),
-        )?;
+        let signing_bytes = self.signing_bytes()?;
+        let certified_key = if self.version == FILE_VERSION {
+            verify_pq_application_signature(
+                &self.identity_proof,
+                IdentityRole::File,
+                &self.sender,
+                &signing_bytes,
+                &self.signature,
+                unix_time_seconds(),
+            )
+        } else {
+            verify_application_signature(
+                &self.identity_proof,
+                IdentityRole::File,
+                &self.sender,
+                &signing_bytes,
+                &self.signature,
+                unix_time_seconds(),
+            )
+            .map(|key| key.to_vec())
+        }?;
         if self.sender_public_key != certified_key {
             return Err(FileError::InvalidField);
         }
@@ -439,7 +493,7 @@ impl FileEnvelope {
         let payload = self.message.payload()?;
         let mut bytes = Vec::with_capacity(payload.len() + 128);
         bytes.extend_from_slice(&FILE_MAGIC);
-        bytes.extend_from_slice(&FILE_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&self.version.to_le_bytes());
         bytes.push(self.message.code());
         bytes.extend_from_slice(self.message.transfer_id());
         put_bytes(&mut bytes, &self.sender_public_key)?;
@@ -453,27 +507,54 @@ impl FileEnvelope {
         if FILE_MAGIC != *b"FILE" {
             return Err(FileError::BadMagic);
         }
-        if self.sender_public_key.len() != 32 {
+        if self.version != FILE_VERSION && self.version != LEGACY_FILE_VERSION {
+            return Err(FileError::UnsupportedVersion);
+        }
+        let is_pq = self.version == FILE_VERSION;
+        let expected_key_len = if is_pq { PQ_PUBLIC_KEY_BYTES } else { 32 };
+        if self.sender_public_key.len() != expected_key_len {
             return Err(FileError::InvalidField);
         }
-        if self.identity_proof.is_empty() || self.identity_proof.len() > MAX_IDENTITY_PROOF_BYTES {
+        let proof_max = if is_pq {
+            MAX_PQ_IDENTITY_PROOF_BYTES
+        } else {
+            MAX_IDENTITY_PROOF_BYTES
+        };
+        if self.identity_proof.is_empty() || self.identity_proof.len() > proof_max {
             return Err(FileError::InvalidField);
+        }
+        if self.signature.len() != signature_len_for_version(self.version) {
+            return Err(FileError::BadSignature);
         }
         let peer_bytes = self.sender.to_bytes();
         if peer_bytes.is_empty() || peer_bytes.len() > MAX_PEER_ID_BYTES {
             return Err(FileError::BadPeerId);
         }
         self.message.check_sizes()?;
-        if self.signing_bytes()?.len().saturating_add(SIGNATURE_LEN) > MAX_FILE_FRAME_BYTES {
+        if self
+            .signing_bytes()?
+            .len()
+            .saturating_add(signature_len_for_version(self.version))
+            > MAX_FILE_FRAME_BYTES
+        {
             return Err(FileError::FrameTooLarge);
         }
         Ok(())
     }
 }
 
+fn signature_len_for_version(version: u16) -> usize {
+    if version == FILE_VERSION {
+        PQ_SIGNATURE_BYTES
+    } else {
+        LEGACY_SIGNATURE_LEN
+    }
+}
+
 impl fmt::Debug for FileEnvelope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FileEnvelope")
+            .field("version", &self.version)
             .field("sender", &self.sender.to_string())
             .field("sender_public_key_len", &self.sender_public_key.len())
             .field("identity_proof_len", &self.identity_proof.len())
@@ -611,7 +692,6 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p2p_identity::{CERTIFICATE_BYTES, IDENTITY_PROOF_HEADER_BYTES};
 
     fn offer(sender: &Identity) -> FileEnvelope {
         FileEnvelope::new(
@@ -659,36 +739,52 @@ mod tests {
         ));
     }
 
-    fn tampered_proof(identity: &Identity) -> Vec<u8> {
-        let mut bytes = identity.proof().to_bytes();
-        let index = IDENTITY_PROOF_HEADER_BYTES + CERTIFICATE_BYTES * 4 + 34;
-        bytes[index] ^= 0x01;
+    fn tampered_pq_proof(identity: &Identity) -> Vec<u8> {
+        let mut bytes = identity.pq_proof_bytes();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
         bytes
     }
 
+    fn legacy_v2_frame(sender: &Identity) -> FileEnvelope {
+        FileEnvelope::legacy_v2_frame_for_tests(
+            sender,
+            FileMessage::Accept {
+                transfer_id: [7; 16],
+                accepted: true,
+            },
+        )
+        .expect("legacy frame")
+    }
+
     #[test]
-    fn wrong_role_and_transport_signatures_are_rejected() {
+    fn legacy_v2_frames_decode_and_verify_but_fail_the_production_gate() {
+        let sender = Identity::generate().expect("identity");
+        let frame = legacy_v2_frame(&sender);
+        let encoded = frame.to_bytes().expect("legacy encoded frame");
+        let decoded = FileEnvelope::from_bytes(&encoded).expect("legacy decode");
+        assert_eq!(decoded.version(), LEGACY_FILE_VERSION);
+        decoded.verify(&sender.peer_id()).expect("legacy signature");
+        assert!(decoded.require_pq().is_err());
+    }
+
+    #[test]
+    fn wrong_role_and_classical_signatures_are_rejected() {
         let sender = Identity::generate().expect("identity");
         let mut frame = offer(&sender);
         let signed_bytes = frame.signing_bytes().expect("signed bytes");
 
         let application_signature = sender
-            .sign_with_role(IdentityRole::Application, &signed_bytes)
-            .expect("application role signature");
-        frame.signature = application_signature
-            .as_slice()
-            .try_into()
-            .expect("signature");
+            .pq_sign_with_role(IdentityRole::Application, &signed_bytes)
+            .expect("application PQ role signature");
+        frame.signature = application_signature;
         assert!(matches!(
             frame.verify(&sender.peer_id()),
             Err(FileError::BadSignature)
         ));
 
         let transport_signature = sender.sign(&signed_bytes).expect("transport signature");
-        frame.signature = transport_signature
-            .as_slice()
-            .try_into()
-            .expect("signature");
+        frame.signature = transport_signature;
         assert!(matches!(
             frame.verify(&sender.peer_id()),
             Err(FileError::BadSignature)
@@ -696,30 +792,27 @@ mod tests {
     }
 
     #[test]
-    fn substituted_and_tampered_proofs_are_rejected() {
+    fn substituted_and_tampered_pq_proofs_are_rejected() {
         let sender = Identity::generate().expect("identity");
         let other = Identity::generate().expect("other identity");
         let frame = offer(&sender);
 
         let mut substituted = frame.clone();
-        substituted.identity_proof = other.proof().to_bytes();
-        assert!(matches!(
-            substituted.verify(&sender.peer_id()),
-            Err(FileError::BadPeerId)
-        ));
+        substituted.identity_proof = other.pq_proof_bytes();
+        assert!(substituted.verify(&sender.peer_id()).is_err());
 
         let mut tampered = frame.clone();
-        tampered.identity_proof = tampered_proof(&sender);
+        tampered.identity_proof = tampered_pq_proof(&sender);
         assert!(tampered.verify(&sender.peer_id()).is_err());
 
         assert_eq!(
             frame.sender_public_key,
             sender
-                .role_public_bytes(IdentityRole::File)
-                .expect("local file key")
+                .pq_role_public_bytes(IdentityRole::File)
+                .expect("local PQ file key")
         );
         assert_ne!(
-            frame.sender_public_key,
+            frame.sender_public_key.as_slice(),
             sender.ed25519_public_bytes().expect("transport key")
         );
     }

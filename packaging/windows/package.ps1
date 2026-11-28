@@ -28,7 +28,6 @@ if ([string]::IsNullOrWhiteSpace($OutDir)) {
 
 $required = @(
     $Binary,
-    (Join-Path $repoRoot 'README.md'),
     (Join-Path $repoRoot 'packaging\NOTICE.md'),
     (Join-Path $repoRoot 'packaging\windows\p2p-messenger.wxs')
 )
@@ -51,7 +50,6 @@ function Write-Sha256([string]$path) {
 try {
     $exePath = Join-Path $stage 'p2p-desktop.exe'
     Copy-Item -LiteralPath $Binary -Destination $exePath
-    Copy-Item -LiteralPath (Join-Path $repoRoot 'README.md') -Destination (Join-Path $stage 'README.md')
     Copy-Item -LiteralPath (Join-Path $repoRoot 'packaging\NOTICE.md') -Destination (Join-Path $stage 'NOTICE.md')
 
     if (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_THUMBPRINT)) {

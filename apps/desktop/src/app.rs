@@ -1058,7 +1058,7 @@ impl MessengerApp {
                             .selected_text(self.network_options.transport_mode.description())
                             .show_ui(ui, |ui| {
                                 for (mode, label) in [
-                                    (TransportPrivacyMode::Direct, "Direct TCP"),
+                                    (TransportPrivacyMode::Direct, "Direct TCP/QUIC"),
                                     (TransportPrivacyMode::TorRequired, "SOCKS5/Tor required"),
                                 ] {
                                     ui.selectable_value(

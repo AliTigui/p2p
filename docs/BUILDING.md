@@ -50,7 +50,7 @@ bash packaging/linux/package.sh \
 
 Artifacts:
 
-- `p2p-messenger-<version>-linux-x86_64.tar.gz`: portable binary, `README.md`, and `NOTICE.md`.
+- `p2p-messenger-<version>-linux-x86_64.tar.gz`: portable binary and `NOTICE.md`.
 - `p2p-messenger-<version>-linux-x86_64.deb`: installs the binary to `/usr/bin/p2p-desktop` and a freedesktop launcher entry.
 
 Inspect before publishing:
@@ -80,7 +80,7 @@ cargo build --locked --release -p p2p-desktop --features native --target x86_64-
 
 Artifacts:
 
-- `p2p-messenger-<version>-windows-x86_64.zip`: portable executable, `README.md`, and `NOTICE.md`.
+- `p2p-messenger-<version>-windows-x86_64.zip`: portable executable and `NOTICE.md`.
 - `p2p-messenger-<version>-windows-x86_64.msi`: per-machine x64 installer with a Start Menu shortcut.
 
 Inspect the ZIP with `Expand-Archive` or any archive viewer. The MSI is built by `candle.exe`/`light.exe` from `packaging/windows/p2p-messenger.wxs` with fixed upgrade and component GUIDs.
@@ -100,7 +100,7 @@ bash packaging/macos/package.sh \
 
 Artifacts:
 
-- `p2p-messenger-<version>-macos-<arch>.dmg`: drag-to-install disk image containing the app bundle, `README.md`, and `NOTICE.md`.
+- `p2p-messenger-<version>-macos-<arch>.dmg`: drag-to-install disk image containing the app bundle and `NOTICE.md`.
 - `p2p-messenger-<version>-macos-<arch>.tar.gz`: portable app bundle archive.
 
 Inspect with:

@@ -1,28 +1,35 @@
 //! Signed, versioned frames for the MLS setup protocol.
 //!
-//! KeyPackage and Welcome frames are transport-protected by Noise and signed by
-//! the vault Ed25519 identity. The signature binds the sender PeerId, public
-//! key, transaction ID, conversation ID, and frame body so an application cannot
-//! accept a setup message from a different authenticated peer or a different
-//! operation. Setup frames are not chat messages and never carry delivery
-//! status.
+//! KeyPackage and Welcome frames travel over the libp2p transport and are
+//! signed by the vault ML-DSA-65 `Application` key. The signature binds the
+//! sender PeerId, public key, transaction ID, conversation ID, ciphersuite ID,
+//! and frame body so an application cannot accept a setup message from a
+//! different authenticated peer or a different operation. Version 4 is a
+//! decodable legacy classical signature codec for adversarial tests; the
+//! controller accepts only version 5 post-quantum frames. Setup frames are not
+//! chat messages and never carry delivery status.
 
 use std::fmt;
 
 use libp2p_identity::PeerId;
 use p2p_groups::{CIPHERSUITE_ID, GroupOperation, is_supported_ciphersuite_id};
 use p2p_identity::{
-    Identity, IdentityError, IdentityRole, MAX_IDENTITY_PROOF_BYTES, certified_role_public_key,
-    unix_time_seconds, verify_application_signature,
+    Identity, IdentityError, IdentityRole, MAX_IDENTITY_PROOF_BYTES, MAX_PQ_IDENTITY_PROOF_BYTES,
+    PQ_PUBLIC_KEY_BYTES, PQ_SIGNATURE_BYTES, certified_pq_role_public_key,
+    certified_role_public_key, unix_time_seconds, verify_application_signature,
+    verify_pq_application_signature,
 };
 
 use crate::ChatError;
 
 /// Fixed frame magic. Unknown magic is rejected, never negotiated.
 pub const SETUP_MAGIC: [u8; 4] = *b"MLS1";
-/// Setup frame version implemented by this build. Versions 1–3 predate the
-/// signed hybrid-suite identifier and are rejected rather than downgraded.
-pub const SETUP_VERSION: u16 = 4;
+/// Post-quantum setup frame version implemented by this build. It carries a
+/// self-contained ML-DSA-65 proof and a 3309-byte ML-DSA-65 signature.
+pub const SETUP_VERSION: u16 = 5;
+/// Last classical-signature setup codec. It decodes for compatibility tests
+/// only and is rejected by every production receive path.
+pub const LEGACY_SETUP_VERSION: u16 = 4;
 /// Length of the random, signed transaction ID carried by every setup frame.
 pub const TRANSACTION_ID_LEN: usize = 16;
 /// A fresh random identifier shared by every frame of one setup operation.
@@ -33,9 +40,9 @@ pub const MAX_SETUP_FRAME_BYTES: usize = p2p_network::MAX_MESSAGE_BYTES;
 /// Maximum bytes in the signed setup body, leaving room for metadata.
 pub const MAX_SETUP_PAYLOAD_BYTES: usize = MAX_SETUP_FRAME_BYTES - 4096;
 
-const MAX_PUBLIC_KEY_BYTES: usize = 256;
+const MAX_PUBLIC_KEY_BYTES: usize = PQ_PUBLIC_KEY_BYTES;
 const MAX_PEER_ID_BYTES: usize = 128;
-const SIGNATURE_LEN: usize = 64;
+const LEGACY_SIGNATURE_LEN: usize = 64;
 
 const KEY_PACKAGE_REQUEST: u8 = 1;
 const KEY_PACKAGE_RESPONSE: u8 = 2;
@@ -590,22 +597,24 @@ impl fmt::Debug for SetupMessage {
 }
 
 /// A signed setup frame. Parsing does not verify the signature; callers must
-/// call [`Self::verify`] with the PeerId authenticated by Noise before using
-/// any field for group state.
+/// call [`Self::verify`] with the authenticated PeerId before using any field
+/// for group state. Production receive paths additionally require
+/// [`Self::require_pq`], rejecting the decodable legacy version 4 codec.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SetupEnvelope {
     pub sender: PeerId,
     pub sender_public_key: Vec<u8>,
     pub identity_proof: Vec<u8>,
-    /// Signed MLS ciphersuite code point. This build accepts only the hybrid
-    /// ML-KEM768/X25519 suite; legacy and unknown suites fail closed.
+    /// Signed MLS ciphersuite code point. This build accepts only the pure
+    /// ML-KEM768/ML-DSA-65 suite; legacy and unknown suites fail closed.
     pub ciphersuite_id: u16,
     pub message: SetupMessage,
-    signature: [u8; SIGNATURE_LEN],
+    version: u16,
+    signature: Vec<u8>,
 }
 
 impl SetupEnvelope {
-    /// Sign a new setup frame with the local vault identity.
+    /// Sign a new post-quantum setup frame with the local vault identity.
     pub fn new(identity: &Identity, message: SetupMessage) -> Result<Self, ChatError> {
         Self::new_with_ciphersuite(identity, message, CIPHERSUITE_ID)
     }
@@ -617,21 +626,59 @@ impl SetupEnvelope {
     ) -> Result<Self, ChatError> {
         let mut envelope = Self {
             sender: identity.peer_id(),
+            sender_public_key: identity.pq_role_public_bytes(IdentityRole::Application)?,
+            identity_proof: identity.pq_proof_bytes(),
+            ciphersuite_id,
+            message,
+            version: SETUP_VERSION,
+            signature: vec![0u8; PQ_SIGNATURE_BYTES],
+        };
+        envelope.check_sizes()?;
+        envelope.signature =
+            identity.pq_sign_with_role(IdentityRole::Application, &envelope.signing_bytes()?)?;
+        Ok(envelope)
+    }
+
+    /// Build a valid classical-signature v4 frame for adversarial controller
+    /// tests. This is never used by a production send path.
+    #[cfg(test)]
+    pub(crate) fn legacy_v4_frame_for_tests(
+        identity: &Identity,
+        message: SetupMessage,
+    ) -> Result<Self, ChatError> {
+        let mut frame = Self {
+            sender: identity.peer_id(),
             sender_public_key: identity
                 .role_public_bytes(IdentityRole::Application)?
                 .to_vec(),
             identity_proof: identity.proof().to_bytes(),
-            ciphersuite_id,
+            ciphersuite_id: CIPHERSUITE_ID,
             message,
-            signature: [0; SIGNATURE_LEN],
+            version: LEGACY_SETUP_VERSION,
+            signature: vec![0u8; LEGACY_SIGNATURE_LEN],
         };
-        envelope.check_sizes()?;
-        let signature =
-            identity.sign_with_role(IdentityRole::Application, &envelope.signing_bytes()?)?;
-        envelope.signature = signature.as_slice().try_into().map_err(|_| {
-            ChatError::InvalidSetup("identity produced an unexpected signature length")
-        })?;
-        Ok(envelope)
+        frame.check_sizes()?;
+        frame.signature =
+            identity.sign_with_role(IdentityRole::Application, &frame.signing_bytes()?)?;
+        Ok(frame)
+    }
+
+    /// Wire version of this frame. Callers must not treat a legacy version as
+    /// an acceptable substitute for the post-quantum frame.
+    pub fn version(&self) -> u16 {
+        self.version
+    }
+
+    /// Fail closed unless this frame is the post-quantum codec. Kept as an
+    /// explicit gate so legacy decoding remains available to adversarial tests
+    /// without ever becoming an accepted production setup frame.
+    pub fn require_pq(&self) -> Result<(), ChatError> {
+        if self.version != SETUP_VERSION {
+            return Err(ChatError::InvalidSetup(
+                "post-quantum setup frame version required",
+            ));
+        }
+        Ok(())
     }
 
     /// Decode a setup frame. This does not verify the signature.
@@ -644,12 +691,12 @@ impl SetupEnvelope {
             return Err(ChatError::InvalidSetup("wrong frame magic"));
         }
         let version = reader.u16()?;
-        if version < 4 {
+        if version < LEGACY_SETUP_VERSION {
             return Err(ChatError::InvalidSetup(
-                "unsupported legacy setup frame version 1-3; hybrid suite binding is required",
+                "unsupported legacy setup frame version 1-3; signed suite binding is required",
             ));
         }
-        if version != SETUP_VERSION {
+        if version > SETUP_VERSION {
             return Err(ChatError::InvalidSetup("unsupported setup frame version"));
         }
         let ciphersuite_id = reader.u16()?;
@@ -658,9 +705,9 @@ impl SetupEnvelope {
         let conversation_id = reader.fixed::<16>()?;
         let sender_public_key = reader.var(MAX_PUBLIC_KEY_BYTES)?;
         let sender_bytes = reader.var(MAX_PEER_ID_BYTES)?;
-        let identity_proof = reader.var(MAX_IDENTITY_PROOF_BYTES)?;
+        let identity_proof = reader.var(MAX_PQ_IDENTITY_PROOF_BYTES)?;
         let payload = reader.var(MAX_SETUP_PAYLOAD_BYTES)?;
-        let signature = reader.fixed::<SIGNATURE_LEN>()?;
+        let signature = reader.take(signature_len_for_version(version))?.to_vec();
         reader.finish()?;
 
         let sender = PeerId::from_bytes(&sender_bytes)
@@ -672,6 +719,7 @@ impl SetupEnvelope {
             identity_proof,
             ciphersuite_id,
             message,
+            version,
             signature,
         };
         envelope.check_sizes()?;
@@ -697,14 +745,29 @@ impl SetupEnvelope {
             return Err(ChatError::UnexpectedSender);
         }
         self.check_sizes()?;
-        let certified_key = match verify_application_signature(
-            &self.identity_proof,
-            IdentityRole::Application,
-            &self.sender,
-            &self.signing_bytes()?,
-            &self.signature,
-            unix_time_seconds(),
-        ) {
+        let signing_bytes = self.signing_bytes()?;
+        let now = unix_time_seconds();
+        let verified = if self.version == SETUP_VERSION {
+            verify_pq_application_signature(
+                &self.identity_proof,
+                IdentityRole::Application,
+                &self.sender,
+                &signing_bytes,
+                &self.signature,
+                now,
+            )
+        } else {
+            verify_application_signature(
+                &self.identity_proof,
+                IdentityRole::Application,
+                &self.sender,
+                &signing_bytes,
+                &self.signature,
+                now,
+            )
+            .map(|key| key.to_vec())
+        };
+        let certified_key = match verified {
             Ok(key) => key,
             Err(IdentityError::InvalidSignature) => {
                 return Err(ChatError::InvalidSetup("signature is invalid"));
@@ -719,15 +782,25 @@ impl SetupEnvelope {
         Ok(())
     }
 
-    /// Certified MLS signing key for the sender. Group membership checks must
-    /// use this role key instead of the transport key carried in older frames.
-    pub fn sender_mls_public_key(&self) -> Result<[u8; 32], ChatError> {
-        Ok(certified_role_public_key(
-            &self.identity_proof,
-            IdentityRole::Mls,
-            &self.sender,
-            unix_time_seconds(),
-        )?)
+    /// Certified ML-DSA-65 MLS signing key for a post-quantum sender. Legacy
+    /// frames still return the classical key for compatibility tests only.
+    pub fn sender_mls_public_key(&self) -> Result<Vec<u8>, ChatError> {
+        if self.version == SETUP_VERSION {
+            Ok(certified_pq_role_public_key(
+                &self.identity_proof,
+                IdentityRole::Mls,
+                &self.sender,
+                unix_time_seconds(),
+            )?)
+        } else {
+            Ok(certified_role_public_key(
+                &self.identity_proof,
+                IdentityRole::Mls,
+                &self.sender,
+                unix_time_seconds(),
+            )?
+            .to_vec())
+        }
     }
 
     /// Verify the signed peer identity and exact channel scope. Callers pass the
@@ -739,6 +812,7 @@ impl SetupEnvelope {
         expected_peer: &PeerId,
         expected: &ChannelScope,
     ) -> Result<(), ChatError> {
+        self.require_pq()?;
         self.verify(expected_peer)?;
         let actual = self
             .message
@@ -755,7 +829,7 @@ impl SetupEnvelope {
     fn signing_bytes(&self) -> Result<Vec<u8>, ChatError> {
         let mut bytes = Vec::with_capacity(self.message.payload()?.len() + 128);
         bytes.extend_from_slice(&SETUP_MAGIC);
-        bytes.extend_from_slice(&SETUP_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&self.version.to_le_bytes());
         bytes.extend_from_slice(&self.ciphersuite_id.to_le_bytes());
         bytes.extend_from_slice(self.message.transaction_id());
         bytes.push(self.message.code());
@@ -771,14 +845,30 @@ impl SetupEnvelope {
         if SETUP_MAGIC != *b"MLS1" {
             return Err(ChatError::InvalidSetup("wrong frame magic"));
         }
+        if self.version != SETUP_VERSION && self.version != LEGACY_SETUP_VERSION {
+            return Err(ChatError::InvalidSetup("unsupported setup frame version"));
+        }
         if !is_supported_ciphersuite_id(self.ciphersuite_id) {
             return Err(ChatError::InvalidSetup("unsupported MLS ciphersuite"));
         }
-        if self.sender_public_key.len() != 32 {
+        let expected_key_len = if self.version == SETUP_VERSION {
+            PQ_PUBLIC_KEY_BYTES
+        } else {
+            32
+        };
+        if self.sender_public_key.len() != expected_key_len {
             return Err(ChatError::InvalidSetup("invalid sender public key length"));
         }
-        if self.identity_proof.is_empty() || self.identity_proof.len() > MAX_IDENTITY_PROOF_BYTES {
+        let proof_max = if self.version == SETUP_VERSION {
+            MAX_PQ_IDENTITY_PROOF_BYTES
+        } else {
+            MAX_IDENTITY_PROOF_BYTES
+        };
+        if self.identity_proof.is_empty() || self.identity_proof.len() > proof_max {
             return Err(ChatError::InvalidSetup("invalid identity proof length"));
+        }
+        if self.signature.len() != signature_len_for_version(self.version) {
+            return Err(ChatError::InvalidSetup("invalid signature length"));
         }
         let peer_bytes = self.sender.to_bytes();
         if peer_bytes.is_empty() || peer_bytes.len() > MAX_PEER_ID_BYTES {
@@ -794,7 +884,7 @@ impl SetupEnvelope {
 impl fmt::Debug for SetupEnvelope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SetupEnvelope")
-            .field("version", &SETUP_VERSION)
+            .field("version", &self.version)
             .field("ciphersuite_id", &self.ciphersuite_id)
             .field("sender", &self.sender.to_string())
             .field("public_key_len", &self.sender_public_key.len())
@@ -802,6 +892,14 @@ impl fmt::Debug for SetupEnvelope {
             .field("message", &self.message)
             .field("signature", &"<redacted>")
             .finish_non_exhaustive()
+    }
+}
+
+fn signature_len_for_version(version: u16) -> usize {
+    if version == SETUP_VERSION {
+        PQ_SIGNATURE_BYTES
+    } else {
+        LEGACY_SIGNATURE_LEN
     }
 }
 
@@ -985,7 +1083,6 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p2p_identity::{CERTIFICATE_BYTES, IDENTITY_PROOF_HEADER_BYTES};
     use p2p_messaging::random_id;
 
     fn txid() -> TransactionId {
@@ -1012,51 +1109,51 @@ mod tests {
             .expect("valid signature");
     }
 
-    fn tampered_proof(identity: &Identity) -> Vec<u8> {
-        let mut bytes = identity.proof().to_bytes();
-        let index = IDENTITY_PROOF_HEADER_BYTES + CERTIFICATE_BYTES * 4 + 34;
-        bytes[index] ^= 0x01;
+    fn tampered_pq_proof(identity: &Identity) -> Vec<u8> {
+        let mut bytes = identity.pq_proof_bytes();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
         bytes
     }
 
+    fn legacy_v4_frame(identity: &Identity, message: SetupMessage) -> SetupEnvelope {
+        SetupEnvelope::legacy_v4_frame_for_tests(identity, message).expect("legacy frame")
+    }
+
     #[test]
-    fn wrong_role_and_transport_signatures_are_rejected() {
+    fn wrong_role_and_classical_signatures_are_rejected() {
         let identity = Identity::generate().expect("identity");
         let mut frame = SetupEnvelope::new(&identity, message()).expect("signed frame");
         let signed_bytes = frame.signing_bytes().expect("signed bytes");
 
         let file_signature = identity
-            .sign_with_role(IdentityRole::File, &signed_bytes)
-            .expect("file role signature");
-        frame.signature = file_signature.as_slice().try_into().expect("signature");
+            .pq_sign_with_role(IdentityRole::File, &signed_bytes)
+            .expect("file PQ role signature");
+        frame.signature = file_signature;
         assert!(matches!(
             frame.verify(&identity.peer_id()),
             Err(ChatError::InvalidSetup("signature is invalid"))
         ));
 
+        // A classical 64-byte transport signature cannot even occupy a v5
+        // frame's ML-DSA-65 signature field.
         let transport_signature = identity.sign(&signed_bytes).expect("transport signature");
-        frame.signature = transport_signature
-            .as_slice()
-            .try_into()
-            .expect("signature");
-        assert!(matches!(
-            frame.verify(&identity.peer_id()),
-            Err(ChatError::InvalidSetup("signature is invalid"))
-        ));
+        frame.signature = transport_signature;
+        assert!(frame.verify(&identity.peer_id()).is_err());
     }
 
     #[test]
-    fn substituted_and_tampered_proofs_are_rejected() {
+    fn substituted_and_tampered_pq_proofs_are_rejected() {
         let identity = Identity::generate().expect("identity");
         let other = Identity::generate().expect("other identity");
         let frame = SetupEnvelope::new(&identity, message()).expect("signed frame");
 
         let mut substituted = frame.clone();
-        substituted.identity_proof = other.proof().to_bytes();
+        substituted.identity_proof = other.pq_proof_bytes();
         assert!(substituted.verify(&identity.peer_id()).is_err());
 
         let mut tampered = frame.clone();
-        tampered.identity_proof = tampered_proof(&identity);
+        tampered.identity_proof = tampered_pq_proof(&identity);
         assert!(tampered.verify(&identity.peer_id()).is_err());
         assert!(tampered.sender_mls_public_key().is_err());
 
@@ -1064,13 +1161,26 @@ mod tests {
         assert_eq!(
             certified,
             identity
-                .role_public_bytes(IdentityRole::Mls)
-                .expect("local MLS key")
+                .pq_role_public_bytes(IdentityRole::Mls)
+                .expect("local PQ MLS key")
         );
         assert_ne!(
-            certified,
+            certified.as_slice(),
             identity.ed25519_public_bytes().expect("transport key")
         );
+    }
+
+    #[test]
+    fn legacy_v4_frames_decode_and_verify_but_fail_the_production_gate() {
+        let identity = Identity::generate().expect("identity");
+        let frame = legacy_v4_frame(&identity, message());
+        let encoded = frame.to_bytes().expect("legacy encoded frame");
+        let decoded = SetupEnvelope::from_bytes(&encoded).expect("legacy decode");
+        assert_eq!(decoded.version(), LEGACY_SETUP_VERSION);
+        decoded
+            .verify(&identity.peer_id())
+            .expect("legacy signature");
+        assert!(decoded.require_pq().is_err());
     }
 
     #[test]
@@ -1493,6 +1603,12 @@ mod tests {
             let error = SetupEnvelope::from_bytes(&old).expect_err("legacy frame is rejected");
             assert!(error.to_string().contains("version"));
         }
+
+        // A version-5 frame cannot be relabelled as v4: the PQ signature is
+        // longer than the legacy signature codec.
+        let mut downgraded = bytes.clone();
+        downgraded[4..6].copy_from_slice(&LEGACY_SETUP_VERSION.to_le_bytes());
+        assert!(SetupEnvelope::from_bytes(&downgraded).is_err());
 
         let mut future = bytes.clone();
         future[4..6].copy_from_slice(&(SETUP_VERSION + 1).to_le_bytes());

@@ -14,6 +14,7 @@ mod contact;
 mod delegation;
 mod envelope;
 mod fingerprint;
+mod pq;
 mod proof;
 mod roles;
 mod rotation;
@@ -29,6 +30,11 @@ pub use envelope::{
     KDF_ARGON2ID_V1,
 };
 pub use fingerprint::{FINGERPRINT_PREFIX, Fingerprint};
+pub use pq::{
+    MAX_PQ_IDENTITY_PROOF_BYTES, PQ_PROOF_VERSION, PQ_PROOF_VERSION as PQ_SIGNATURE_VERSION,
+    PQ_PUBLIC_KEY_BYTES, PQ_SCHEME_ID, PQ_SEED_BYTES, PQ_SIGNATURE_BYTES,
+};
+pub(crate) use pq::{PqIdentityProof, PqSeeds, random_seed, sign_seed};
 pub use proof::{IDENTITY_PROOF_HEADER_BYTES, IdentityProof, MAX_IDENTITY_PROOF_BYTES};
 pub use roles::IdentityRole;
 pub use rotation::{ROTATION_BYTES, ROTATION_VERSION, RotationRecord};
@@ -169,6 +175,37 @@ impl Identity {
     /// Raw 32-byte public key for one purpose-specific role.
     pub fn role_public_bytes(&self, role: IdentityRole) -> Result<[u8; 32], IdentityError> {
         self.bundle.proof().role_public_key(role)
+    }
+
+    /// Self-contained ML-DSA-65 proof for this identity. This is the proof
+    /// carried by post-quantum setup and file frames.
+    pub fn pq_proof_bytes(&self) -> Vec<u8> {
+        self.bundle.pq_proof().to_bytes()
+    }
+
+    /// Encoded ML-DSA-65 public key for one non-transport role.
+    pub fn pq_role_public_bytes(&self, role: IdentityRole) -> Result<Vec<u8>, IdentityError> {
+        Ok(self.bundle.pq_proof().role_public_key(role)?.to_vec())
+    }
+
+    /// Zeroizing ML-DSA-65 seed for one role. Used by the MLS signer and never
+    /// exposed on the wire.
+    pub fn pq_role_seed(
+        &self,
+        role: IdentityRole,
+    ) -> Result<zeroize::Zeroizing<[u8; PQ_SEED_BYTES]>, IdentityError> {
+        self.bundle.pq_seeds().get(role).cloned()
+    }
+
+    /// Sign application data with an ML-DSA-65 role key. The signed bytes bind
+    /// the role, message length, message, and exact certified public key.
+    pub fn pq_sign_with_role(
+        &self,
+        role: IdentityRole,
+        message: &[u8],
+    ) -> Result<Vec<u8>, IdentityError> {
+        let signed = self.bundle.pq_proof().signing_bytes(role, message)?;
+        sign_seed(self.bundle.pq_seeds().get(role)?, &signed)
     }
 
     /// Signed public certificate for one role.
@@ -312,6 +349,9 @@ impl Identity {
         proof.validate_at(now)?;
         self.bundle.set_root(next);
         self.bundle.replace_proof(proof);
+        let pq_root = random_seed()?;
+        self.bundle
+            .replace_pq_seed(IdentityRole::Root, pq_root, now)?;
         Ok(record)
     }
 
@@ -344,6 +384,8 @@ impl Identity {
         let mut proof = self.bundle.proof().clone();
         proof.replace_certificate(certificate);
         self.bundle.replace_proof(proof);
+        let pq_seed = random_seed()?;
+        self.bundle.replace_pq_seed(role, pq_seed, now)?;
         Ok(())
     }
 
@@ -486,6 +528,16 @@ impl Identity {
     }
 }
 
+/// Sign raw MLS payload bytes with an ML-DSA-65 seed. OpenMLS requires the
+/// signature to cover exactly its serialized bytes, so no domain prefix is
+/// added here; role separation comes from the certified MLS seed.
+pub fn pq_sign_for_mls(
+    seed: &[u8; PQ_SEED_BYTES],
+    payload: &[u8],
+) -> Result<Vec<u8>, IdentityError> {
+    sign_seed(seed, payload)
+}
+
 /// Domain-separated bytes actually signed by a role key.
 pub fn role_signing_bytes(role: IdentityRole, message: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(role.signing_domain().len() + message.len());
@@ -564,6 +616,35 @@ pub fn certified_role_public_key(
         return Err(IdentityError::PeerIdMismatch);
     }
     proof.role_public_key(role)
+}
+
+/// Extract one certified ML-DSA-65 role key from a self-contained PQ proof.
+/// The proof's root/device chain and PeerId binding are fully validated first.
+pub fn certified_pq_role_public_key(
+    proof_bytes: &[u8],
+    role: IdentityRole,
+    expected_peer: &PeerId,
+    now: u64,
+) -> Result<Vec<u8>, IdentityError> {
+    let proof = PqIdentityProof::from_bytes(proof_bytes)?;
+    proof.validate_at(expected_peer, now)?;
+    Ok(proof.role_public_key(role)?.to_vec())
+}
+
+/// Verify an ML-DSA-65 role signature against a self-contained PQ proof. The
+/// returned key is the certified key that verified the signature.
+pub fn verify_pq_application_signature(
+    proof_bytes: &[u8],
+    role: IdentityRole,
+    expected_peer: &PeerId,
+    message: &[u8],
+    signature: &[u8],
+    now: u64,
+) -> Result<Vec<u8>, IdentityError> {
+    let proof = PqIdentityProof::from_bytes(proof_bytes)?;
+    proof.validate_at(expected_peer, now)?;
+    proof.verify_role_signature(role, message, signature)?;
+    Ok(proof.role_public_key(role)?.to_vec())
 }
 
 /// Verify a role signature against a self-contained public identity proof.

@@ -3667,6 +3667,7 @@ impl MessengerController {
     ) -> Result<(PeerId, SetupEnvelope), ChatError> {
         let peer = identity_peer(swarm_peer)?;
         let frame = SetupEnvelope::from_bytes(bytes)?;
+        frame.require_pq()?;
         frame.verify(&peer)?;
         Ok((peer, frame))
     }
@@ -5400,6 +5401,7 @@ impl MessengerController {
         bytes: &[u8],
     ) -> Result<(), ChatError> {
         let frame = FileEnvelope::from_bytes(bytes)?;
+        frame.require_pq()?;
         frame.verify(&peer)?;
         let transfer_id = *frame.transfer_id();
 
@@ -5521,6 +5523,7 @@ impl MessengerController {
             return Ok(());
         };
         let frame = FileEnvelope::from_bytes(bytes)?;
+        frame.require_pq()?;
         frame.verify(&peer)?;
 
         if let FileMessage::Reject { transfer_id } = &frame.message {
@@ -6408,9 +6411,56 @@ mod tests {
 
     fn mls_public_key(identity: &Identity) -> Vec<u8> {
         identity
-            .role_public_bytes(IdentityRole::Mls)
-            .expect("certified MLS role key")
-            .to_vec()
+            .pq_role_public_bytes(IdentityRole::Mls)
+            .expect("certified ML-DSA-65 MLS role key")
+    }
+
+    #[test]
+    fn legacy_v4_setup_frames_fail_the_controller_decode_gate() {
+        let sender = Identity::generate().expect("sender");
+        let frame = SetupEnvelope::legacy_v4_frame_for_tests(
+            &sender,
+            SetupMessage::WelcomeAck {
+                conversation_id: [7; 16],
+                transaction_id: [8; 16],
+                accepted: true,
+            },
+        )
+        .expect("valid classical frame");
+        frame
+            .verify(&sender.peer_id())
+            .expect("legacy codec still verifies as a frame");
+        let bytes = frame.to_bytes().expect("encoded legacy setup frame");
+
+        let error = MessengerController::decode_setup(
+            swarm_peer(&sender.peer_id()).expect("swarm peer"),
+            &bytes,
+        )
+        .expect_err("a classical v4 setup frame must never enter the controller");
+        assert!(error.to_string().contains("post-quantum"));
+    }
+
+    #[test]
+    fn legacy_v2_file_frames_fail_the_controller_receive_gate() {
+        let (_, mut controller) = test_controller();
+        let sender = Identity::generate().expect("sender");
+        let frame = FileEnvelope::legacy_v2_frame_for_tests(
+            &sender,
+            FileMessage::Accept {
+                transfer_id: [7; 16],
+                accepted: true,
+            },
+        )
+        .expect("valid classical frame");
+        frame
+            .verify(&sender.peer_id())
+            .expect("legacy codec still verifies as a frame");
+        let bytes = frame.to_bytes().expect("encoded legacy file frame");
+
+        let error = controller
+            .handle_file_request(FileResponseId::for_tests(1), sender.peer_id(), &bytes)
+            .expect_err("a classical v2 file frame must never enter the controller");
+        assert!(error.to_string().contains("version"));
     }
 
     #[test]

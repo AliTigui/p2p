@@ -36,7 +36,6 @@ case "$arch" in
 esac
 
 p2p_require_file "$binary"
-p2p_require_file "$P2P_REPO_ROOT/README.md"
 p2p_require_file "$P2P_REPO_ROOT/packaging/NOTICE.md"
 p2p_require_file "$P2P_REPO_ROOT/packaging/linux/control"
 p2p_require_file "$P2P_REPO_ROOT/packaging/desktop/p2p-messenger.desktop"
@@ -53,11 +52,9 @@ mkdir -p "$stage/portable" "$stage/deb/DEBIAN" \
 
 install -m 0755 "$binary" "$stage/portable/p2p-desktop"
 install -m 0755 "$binary" "$stage/deb/usr/bin/p2p-desktop"
-install -m 0644 "$P2P_REPO_ROOT/README.md" "$stage/portable/README.md"
 install -m 0644 "$P2P_REPO_ROOT/packaging/NOTICE.md" "$stage/portable/NOTICE.md"
 install -m 0644 "$P2P_REPO_ROOT/packaging/desktop/p2p-messenger.desktop" \
     "$stage/deb/usr/share/applications/p2p-messenger.desktop"
-install -m 0644 "$P2P_REPO_ROOT/README.md" "$stage/deb/usr/share/doc/p2p-messenger/README.md"
 install -m 0644 "$P2P_REPO_ROOT/packaging/NOTICE.md" "$stage/deb/usr/share/doc/p2p-messenger/NOTICE.md"
 
 sed \

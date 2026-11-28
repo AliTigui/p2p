@@ -46,6 +46,7 @@ libp2p = { version = "=0.57.1", default-features = false, features = [
   "macros",
   "mdns",
   "ping",
+  "quic",
   "relay",
   "tcp",
   "noise",
@@ -60,6 +61,7 @@ libp2p-request-response = "=0.30.0"
 openmls = "=0.10.0-rc.1"
 openmls_rust_crypto = { version = "=0.7.0-rc.1", features = ["draft-ietf-mls-pq-ciphersuites"] }
 openmls_traits = { version = "=0.7.0-rc.1", features = ["draft-ietf-mls-pq-ciphersuites"] }
+ml-dsa = { version = "=0.1.2", features = ["alloc"] }
 argon2 = "0.6"
 hkdf = "0.13"
 hmac = "0.13"

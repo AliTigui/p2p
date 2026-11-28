@@ -9,17 +9,19 @@ use std::fmt;
 use libp2p_identity::{Keypair, ed25519};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::pq::PqSeed;
 use crate::{
     DEFAULT_CERT_VALIDITY_SECONDS, IdentityCertificate, IdentityError, IdentityProof, IdentityRole,
-    unix_time_seconds,
+    PqIdentityProof, PqSeeds, unix_time_seconds,
 };
 
 pub(crate) const BUNDLE_MAGIC: &[u8] = b"P2PMSGR-IDENTITY-BUNDLE";
-const BUNDLE_VERSION: u8 = 1;
+const BUNDLE_VERSION: u8 = 2;
+const LEGACY_BUNDLE_VERSION: u8 = 1;
 const ROLE_KEY_LEN: usize = 64;
 const MAX_TRANSPORT_KEY_BYTES: usize = 512;
 /// Upper bound for one encoded identity bundle.
-pub const MAX_IDENTITY_BUNDLE_BYTES: usize = 8192;
+pub const MAX_IDENTITY_BUNDLE_BYTES: usize = 128 * 1024;
 
 /// Private keys and public certificates for one local identity.
 #[derive(Clone)]
@@ -31,6 +33,10 @@ pub(crate) struct IdentityBundle {
     application: ed25519::Keypair,
     file: ed25519::Keypair,
     proof: IdentityProof,
+    pq_seeds: PqSeeds,
+    // Boxed so cloning/passing an `Identity` does not copy ~26 KiB of PQ
+    // certificates and signatures onto every call frame.
+    pq_proof: Box<PqIdentityProof>,
 }
 
 impl IdentityBundle {
@@ -122,6 +128,14 @@ impl IdentityBundle {
         )?;
         proof.validate_at(now)?;
 
+        let pq_seeds = PqSeeds::generate()?;
+        let pq_proof = Box::new(PqIdentityProof::new(
+            &transport.public().to_peer_id(),
+            now,
+            &pq_seeds,
+        )?);
+        pq_proof.validate_at(&transport.public().to_peer_id(), now)?;
+
         Ok(Self {
             transport,
             root,
@@ -130,11 +144,38 @@ impl IdentityBundle {
             application,
             file,
             proof,
+            pq_seeds,
+            pq_proof,
         })
     }
 
     pub(crate) fn proof(&self) -> &IdentityProof {
         &self.proof
+    }
+
+    pub(crate) fn pq_proof(&self) -> &PqIdentityProof {
+        &self.pq_proof
+    }
+
+    pub(crate) fn pq_seeds(&self) -> &PqSeeds {
+        &self.pq_seeds
+    }
+
+    pub(crate) fn pq_seed(&self, role: IdentityRole) -> Result<&PqSeed, IdentityError> {
+        self.pq_seeds.get(role)
+    }
+
+    pub(crate) fn replace_pq_seed(
+        &mut self,
+        role: IdentityRole,
+        seed: PqSeed,
+        now: u64,
+    ) -> Result<(), IdentityError> {
+        self.pq_seeds.set(role, seed)?;
+        *self.pq_proof =
+            PqIdentityProof::new(&self.transport.public().to_peer_id(), now, &self.pq_seeds)?;
+        self.pq_proof
+            .validate_at(&self.transport.public().to_peer_id(), now)
     }
 
     pub(crate) fn transport(&self) -> &Keypair {
@@ -170,6 +211,8 @@ impl IdentityBundle {
 
     pub(crate) fn validate_at(&self, now: u64) -> Result<(), IdentityError> {
         self.proof.validate_at(now)?;
+        self.pq_proof
+            .validate_at(&self.transport.public().to_peer_id(), now)?;
         let root = self.proof.root().public_key();
         let device = self.proof.device().public_key();
         if self.root.public().to_bytes() != root
@@ -213,8 +256,23 @@ impl IdentityBundle {
                 "identity proof is too large".to_owned(),
             ));
         }
+        let pq_proof = self.pq_proof.to_bytes();
+        if pq_proof.len() > u32::MAX as usize {
+            return Err(IdentityError::InvalidEnvelope(
+                "PQ identity proof is too large".to_owned(),
+            ));
+        }
         let mut bytes = Zeroizing::new(Vec::with_capacity(
-            BUNDLE_MAGIC.len() + 1 + 2 + transport.len() + 5 * ROLE_KEY_LEN + 4 + proof.len(),
+            BUNDLE_MAGIC.len()
+                + 1
+                + 2
+                + transport.len()
+                + 5 * ROLE_KEY_LEN
+                + 4
+                + proof.len()
+                + 5 * crate::PQ_SEED_BYTES
+                + 4
+                + pq_proof.len(),
         ));
         bytes.extend_from_slice(BUNDLE_MAGIC);
         bytes.push(BUNDLE_VERSION);
@@ -233,6 +291,19 @@ impl IdentityBundle {
         }
         bytes.extend_from_slice(&(proof.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&proof);
+        for role in [
+            IdentityRole::Root,
+            IdentityRole::Device,
+            IdentityRole::Mls,
+            IdentityRole::Application,
+            IdentityRole::File,
+        ] {
+            let mut seed = self.pq_seed(role)?.clone();
+            bytes.extend_from_slice(seed.as_ref());
+            seed.zeroize();
+        }
+        bytes.extend_from_slice(&(pq_proof.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&pq_proof);
         if bytes.len() > MAX_IDENTITY_BUNDLE_BYTES {
             return Err(IdentityError::InvalidEnvelope(
                 "identity bundle is too large".to_owned(),
@@ -260,7 +331,8 @@ impl IdentityBundle {
                 "identity bundle has the wrong magic".to_owned(),
             ));
         }
-        if bytes[BUNDLE_MAGIC.len()] != BUNDLE_VERSION {
+        let version = bytes[BUNDLE_MAGIC.len()];
+        if version != BUNDLE_VERSION && version != LEGACY_BUNDLE_VERSION {
             return Err(IdentityError::InvalidEnvelope(
                 "unsupported identity bundle version".to_owned(),
             ));
@@ -308,15 +380,74 @@ impl IdentityBundle {
         let proof_end = position
             .checked_add(proof_len)
             .ok_or_else(|| IdentityError::InvalidEnvelope("invalid bundle offsets".to_owned()))?;
-        if proof_end != bytes.len() {
-            return Err(IdentityError::InvalidEnvelope(
-                "identity bundle has trailing or missing bytes".to_owned(),
-            ));
-        }
         let proof =
             IdentityProof::from_bytes(bytes.get(position..proof_end).ok_or_else(|| {
                 IdentityError::InvalidEnvelope("identity bundle is truncated".to_owned())
             })?)?;
+        position = proof_end;
+
+        let (pq_seeds, pq_proof) = if version == LEGACY_BUNDLE_VERSION {
+            if position != bytes.len() {
+                return Err(IdentityError::InvalidEnvelope(
+                    "legacy identity bundle has trailing bytes".to_owned(),
+                ));
+            }
+            let pq_seeds = PqSeeds::generate()?;
+            let now = unix_time_seconds();
+            let pq_proof = PqIdentityProof::new(&transport.public().to_peer_id(), now, &pq_seeds)?;
+            pq_proof.validate_at(&transport.public().to_peer_id(), now)?;
+            (pq_seeds, pq_proof)
+        } else {
+            let pq_seed_bytes = 5 * crate::PQ_SEED_BYTES;
+            let pq_seed_end = position.checked_add(pq_seed_bytes).ok_or_else(|| {
+                IdentityError::InvalidEnvelope("invalid bundle offsets".to_owned())
+            })?;
+            let pq_seed_slice = bytes.get(position..pq_seed_end).ok_or_else(|| {
+                IdentityError::InvalidEnvelope("identity bundle is truncated".to_owned())
+            })?;
+            position = pq_seed_end;
+            if bytes.len() < position + 4 {
+                return Err(IdentityError::InvalidEnvelope(
+                    "identity bundle is truncated".to_owned(),
+                ));
+            }
+            let pq_proof_len = u32::from_le_bytes(
+                bytes[position..position + 4]
+                    .try_into()
+                    .expect("fixed slice"),
+            ) as usize;
+            position += 4;
+            let pq_proof_end = position.checked_add(pq_proof_len).ok_or_else(|| {
+                IdentityError::InvalidEnvelope("invalid bundle offsets".to_owned())
+            })?;
+            if pq_proof_end != bytes.len() {
+                return Err(IdentityError::InvalidEnvelope(
+                    "identity bundle has trailing or missing bytes".to_owned(),
+                ));
+            }
+            let pq_proof =
+                PqIdentityProof::from_bytes(bytes.get(position..pq_proof_end).ok_or_else(
+                    || IdentityError::InvalidEnvelope("identity bundle is truncated".to_owned()),
+                )?)?;
+            let seeds: Vec<_> = pq_seed_slice
+                .chunks_exact(crate::PQ_SEED_BYTES)
+                .map(|chunk| {
+                    let mut seed = Zeroizing::new([0u8; crate::PQ_SEED_BYTES]);
+                    seed.copy_from_slice(chunk);
+                    seed
+                })
+                .collect();
+            let pq_seeds = PqSeeds {
+                root: seeds[0].clone(),
+                device: seeds[1].clone(),
+                mls: seeds[2].clone(),
+                application: seeds[3].clone(),
+                file: seeds[4].clone(),
+            };
+            pq_proof.validate_at(&transport.public().to_peer_id(), unix_time_seconds())?;
+            (pq_seeds, pq_proof)
+        };
+        let pq_proof = Box::new(pq_proof);
 
         Ok(Self {
             transport,
@@ -326,6 +457,8 @@ impl IdentityBundle {
             application: role_keys.remove(0),
             file: role_keys.remove(0),
             proof,
+            pq_seeds,
+            pq_proof,
         })
     }
 }
