@@ -3,6 +3,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use p2p_crypto::{
+    ARGON2_ID_V1, Argon2Params, SALT_LEN, derive_kek, fresh_salt, unwrap_key, wrap_key,
+};
 use p2p_identity::Identity;
 use p2p_storage::{ControlRecordOutcome, StorageError, Vault};
 use sha2::{Digest, Sha256};
@@ -22,6 +25,15 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         || haystack
             .windows(needle.len())
             .any(|window| window == needle)
+}
+
+fn master_aad(profile_id: &[u8; 16], salt: &[u8; SALT_LEN], params: Argon2Params) -> Vec<u8> {
+    let mut aad = b"p2p-messenger/master-key-wrap/v1".to_vec();
+    aad.extend_from_slice(profile_id);
+    aad.extend_from_slice(salt);
+    aad.extend_from_slice(&[ARGON2_ID_V1]);
+    aad.extend_from_slice(&params.to_bytes());
+    aad
 }
 
 fn every_file(directory: &Path) -> Vec<PathBuf> {
@@ -307,6 +319,80 @@ fn damaged_master_wrap_is_rejected() {
 
     assert!(matches!(
         vault.unlock(PASSWORD),
+        Err(StorageError::AuthenticationFailed)
+    ));
+}
+
+#[test]
+fn weak_kdf_vault_is_rewrapped_on_unlock() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let vault = Vault::open(directory.path()).expect("open vault");
+    let identity = Identity::generate().expect("identity");
+    drop(vault.create(USERNAME, PASSWORD, &identity).expect("create"));
+
+    let conn = rusqlite::Connection::open(vault.database_path()).expect("open raw db");
+    let (profile_id, salt, wrapped): (Vec<u8>, Vec<u8>, Vec<u8>) = conn
+        .query_row(
+            "SELECT profile_id, kdf_salt, wrapped_master FROM profile WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read profile");
+    let profile_id: [u8; 16] = profile_id.try_into().expect("profile id");
+    let salt: [u8; SALT_LEN] = salt.try_into().expect("salt");
+    let old_params = Argon2Params::RECOMMENDED;
+    let old_kek = derive_kek(PASSWORD, &salt, old_params).expect("old KEK");
+    let master = unwrap_key(
+        &wrapped,
+        &old_kek,
+        &master_aad(&profile_id, &salt, old_params),
+    )
+    .expect("unwrap master");
+
+    let weak_params = Argon2Params {
+        memory_kib: 8 * 1024,
+        iterations: 1,
+        parallelism: 1,
+    };
+    let weak_salt = fresh_salt().expect("weak salt");
+    let weak_kek = derive_kek(PASSWORD, &weak_salt, weak_params).expect("weak KEK");
+    let weak_wrapped = wrap_key(
+        &master,
+        &weak_kek,
+        &master_aad(&profile_id, &weak_salt, weak_params),
+    )
+    .expect("weak wrap");
+    let mut weak_blob = vec![ARGON2_ID_V1];
+    weak_blob.extend_from_slice(&weak_params.to_bytes());
+    conn.execute(
+        "UPDATE profile SET kdf_salt = ?1, kdf_params = ?2, wrapped_master = ?3 WHERE id = 1",
+        rusqlite::params![weak_salt.to_vec(), weak_blob, weak_wrapped.clone()],
+    )
+    .expect("downgrade stored parameters");
+    drop(conn);
+
+    let session = vault.unlock(PASSWORD).expect("upgrade on unlock");
+    assert_eq!(session.kdf_params(), Argon2Params::RECOMMENDED);
+
+    let conn = rusqlite::Connection::open(vault.database_path()).expect("reopen raw db");
+    let (new_salt, new_params, new_wrapped): (Vec<u8>, Vec<u8>, Vec<u8>) = conn
+        .query_row(
+            "SELECT kdf_salt, kdf_params, wrapped_master FROM profile WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read upgraded profile");
+    drop(conn);
+    assert_ne!(new_salt, weak_salt.to_vec());
+    assert_ne!(new_wrapped, weak_wrapped);
+    assert_eq!(
+        Argon2Params::from_bytes(&new_params[1..]).expect("upgrade params"),
+        Argon2Params::RECOMMENDED
+    );
+    drop(session);
+
+    assert!(matches!(
+        vault.unlock("wrong password"),
         Err(StorageError::AuthenticationFailed)
     ));
 }

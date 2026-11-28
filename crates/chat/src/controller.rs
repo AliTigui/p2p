@@ -15,10 +15,10 @@ use p2p_files::{
 };
 use p2p_groups::{
     ChannelGroupBinding, ChannelKeyPackage, ChannelWelcome, GroupOperation, MlsChannelGroup,
-    MlsConversation, MlsKeyPackage, channel_group_id, v3_route_tag,
+    MlsConversation, MlsKeyPackage, channel_group_id,
 };
 use p2p_identity::Identity;
-use p2p_messaging::{DeliveryState, EnvelopeV3, MessageKind, ReceiptStatus, random_id};
+use p2p_messaging::{DeliveryState, EnvelopeV4, MessageKind, ReceiptStatus, random_id};
 use p2p_network::{
     ConnectionState, FileEvent, FileRequestId, FileResponseId, MessageEvent, MessageRequestId,
     Network, NetworkConfig, NetworkPrivacyStatus, SetupEvent, SetupResponseId,
@@ -1568,9 +1568,9 @@ impl MessengerController {
                 }
                 state
                     .conversation
-                    .verify_queued_v3(&item.envelope_bytes)
+                    .verify_queued_v4(&item.envelope_bytes)
                     .map_err(|_| {
-                        ChatError::MlsRestore("restored v3 queue frame is not group-authenticated")
+                        ChatError::MlsRestore("restored v4 queue frame is not group-authenticated")
                     })?;
                 queued_messages.push_back(QueuedMessage {
                     peer: queued_peer,
@@ -1799,9 +1799,9 @@ impl MessengerController {
                         "restored channel queued message is inconsistent",
                     ));
                 }
-                group.verify_queued_v3(&item.envelope_bytes).map_err(|_| {
+                group.verify_queued_v4(&item.envelope_bytes).map_err(|_| {
                     ChatError::MlsRestore(
-                        "restored channel v3 queue frame is not group-authenticated",
+                        "restored channel v4 queue frame is not group-authenticated",
                     )
                 })?;
                 queued_messages.push_back(QueuedMessage {
@@ -5931,7 +5931,7 @@ impl MessengerController {
             let (envelope, message_id) =
                 state
                     .group
-                    .compose_v3(&self.identity, MessageKind::Channel, &body)?;
+                    .compose_v4(&self.identity, MessageKind::Channel, &body)?;
             (message_id, envelope.to_bytes()?)
         } else {
             let state = self
@@ -5941,7 +5941,7 @@ impl MessengerController {
             let (envelope, message_id) =
                 state
                     .conversation
-                    .compose_v3(&self.identity, MessageKind::Channel, &body)?;
+                    .compose_v4(&self.identity, MessageKind::Channel, &body)?;
             (message_id, envelope.to_bytes()?)
         };
 
@@ -6037,14 +6037,15 @@ impl MessengerController {
         peer: PeerId,
         bytes: &[u8],
     ) -> Result<Option<Vec<u8>>, ChatError> {
-        let envelope = EnvelopeV3::from_bytes(bytes)?;
+        let envelope = EnvelopeV4::from_bytes(bytes)?;
 
-        // The outer tag is a local selector only. It is checked against every
-        // current parent and derived group before any ciphertext is decrypted;
-        // ambiguity or absence fails closed rather than guessing a group.
+        // The outer tag is random per frame and is never matched as a stable
+        // route value. Every current parent and derived group is offered the
+        // frame; only a group whose exporter key verifies the MAC is a route.
+        // Ambiguity or absence fails closed rather than guessing a group.
         let mut routes = Vec::new();
         for (id, state) in &self.conversations {
-            if envelope.route_tag == v3_route_tag(*id, state.conversation.epoch()) {
+            if state.conversation.verify_v4_route(&envelope).is_ok() {
                 if !state.members.contains(&peer) {
                     return Err(ChatError::NotGroupMember);
                 }
@@ -6052,7 +6053,7 @@ impl MessengerController {
             }
         }
         for (group_id, state) in &self.channel_groups {
-            if envelope.route_tag == v3_route_tag(*group_id, state.group.epoch()) {
+            if state.group.verify_v4_route(&envelope).is_ok() {
                 let parent = state.binding.parent_conversation_id();
                 let channel = state.binding.channel_id();
                 let parent_state = self
@@ -6085,7 +6086,7 @@ impl MessengerController {
                     .get_mut(&group_id)
                     .ok_or(ChatError::ChannelGroupNotReady)?
                     .group
-                    .receive_v3(envelope)?;
+                    .receive_v4(envelope)?;
                 if received.metadata.sender != peer {
                     return Err(ChatError::UnexpectedSender);
                 }
@@ -6130,7 +6131,7 @@ impl MessengerController {
                         .get_mut(&group_id)
                         .ok_or(ChatError::ChannelGroupNotReady)?
                         .group
-                        .receipt_v3(&self.identity, ReceiptStatus::Delivered, message_id)?
+                        .receipt_v4(&self.identity, ReceiptStatus::Delivered, message_id)?
                         .0;
                     Some(receipt.to_bytes()?)
                 };
@@ -6147,7 +6148,7 @@ impl MessengerController {
                     .conversations
                     .get_mut(&parent_conversation_id)
                     .ok_or(ChatError::UnknownConversation)?;
-                let received = state.conversation.receive_v3(envelope)?;
+                let received = state.conversation.receive_v4(envelope)?;
                 if received.metadata.sender != peer {
                     return Err(ChatError::UnexpectedSender);
                 }
@@ -6184,7 +6185,7 @@ impl MessengerController {
                     } else {
                         let receipt = state
                             .conversation
-                            .receipt_v3(&self.identity, ReceiptStatus::Delivered, message_id)?
+                            .receipt_v4(&self.identity, ReceiptStatus::Delivered, message_id)?
                             .0;
                         (
                             message_id,
@@ -6252,7 +6253,7 @@ impl MessengerController {
             return Ok(());
         };
         let peer = identity_peer(swarm_peer)?;
-        let envelope = EnvelopeV3::from_bytes(bytes)?;
+        let envelope = EnvelopeV4::from_bytes(bytes)?;
         let parent_conversation_id = *self
             .message_conversations
             .get(&local_message_id)
@@ -6262,7 +6263,8 @@ impl MessengerController {
             Some(channel_id) => channel_group_id(parent_conversation_id, channel_id),
             None => parent_conversation_id,
         };
-        // `receive_v3` binds the route tag, exporter MAC, MLS group, and inner
+        // `receive_v4` verifies the group-keyed MAC over the random tag,
+        // MLS-decrypts the body in the expected group, and binds the inner
         // sender before the receipt body is parsed.
         let received = if let Some(channel_id) = channel_id {
             let parent_state = self
@@ -6282,7 +6284,7 @@ impl MessengerController {
             let Some(state) = self.channel_groups.get_mut(&expected_group_id) else {
                 return Ok(());
             };
-            state.group.receive_v3(envelope)?
+            state.group.receive_v4(envelope)?
         } else {
             let state = self
                 .conversations
@@ -6291,14 +6293,14 @@ impl MessengerController {
             if !state.members.contains(&peer) {
                 return Err(ChatError::NotGroupMember);
             }
-            state.conversation.receive_v3(envelope)?
+            state.conversation.receive_v4(envelope)?
         };
         if received.metadata.sender != peer {
             return Err(ChatError::UnexpectedSender);
         }
         if received.metadata.kind != MessageKind::Receipt {
             return Err(ChatError::InvalidChannelFrame(
-                "v3 response was not an MLS-protected receipt",
+                "v4 response was not an MLS-protected receipt",
             ));
         }
         let mut setup_trigger = None;
@@ -6464,10 +6466,53 @@ mod tests {
     }
 
     #[test]
+    fn legacy_v3_application_frames_fail_the_controller_receive_gate() {
+        let parent = [0x75u8; 16];
+        let channel = [0x76u8; 16];
+        let (admin, allowed, binding, mut admin_group, allowed_group) =
+            bound_channel_pair(parent, channel);
+        let frame = ChannelFrame::text(channel, 1, "legacy v3 payload").expect("channel frame");
+        let (envelope, _message_id) = admin_group
+            .compose_v3(
+                &admin,
+                MessageKind::Channel,
+                &frame.to_bytes().expect("frame bytes"),
+            )
+            .expect("legacy v3 compose");
+        let bytes = envelope.to_bytes().expect("encoded v3");
+
+        let mut controller =
+            MessengerController::start(&allowed, NetworkConfig::direct()).expect("controller");
+        let members = [admin.peer_id(), allowed.peer_id()];
+        controller.conversations.insert(
+            parent,
+            channel_parent_state(&allowed, admin.peer_id(), channel, &members),
+        );
+        controller.channel_groups.insert(
+            binding.group_id(),
+            ChannelGroupState {
+                binding,
+                group: allowed_group,
+                awaited: BTreeSet::new(),
+                ready: true,
+            },
+        );
+
+        let error = controller
+            .receive_message(admin.peer_id(), &bytes)
+            .expect_err("v3 wire must not enter the v4 controller receive gate");
+        assert!(matches!(
+            error,
+            ChatError::Message(MessageError::BadProtocol)
+        ));
+        assert!(controller.messages.is_empty());
+    }
+
+    #[test]
     fn default_controller_privacy_status_is_all_off_and_unobserved() {
         let identity = Identity::generate().expect("identity");
         let controller =
-            MessengerController::start(&identity, NetworkConfig::default()).expect("controller");
+            MessengerController::start(&identity, NetworkConfig::direct()).expect("controller");
         let status = controller.network_privacy_status();
 
         assert!(!status.identify_enabled);
@@ -6492,7 +6537,7 @@ mod tests {
     fn test_controller() -> (Identity, MessengerController) {
         let identity = Identity::generate().expect("identity");
         let controller =
-            MessengerController::start(&identity, NetworkConfig::default()).expect("controller");
+            MessengerController::start(&identity, NetworkConfig::direct()).expect("controller");
         (identity, controller)
     }
 
@@ -6717,7 +6762,7 @@ mod tests {
             bound_channel_pair(parent, channel);
         let frame = ChannelFrame::text(channel, 1, secret).expect("channel text frame");
         let (envelope, _message_id) = admin_group
-            .compose_v3(
+            .compose_v4(
                 &admin,
                 MessageKind::Channel,
                 &frame.to_bytes().expect("frame bytes"),
@@ -6748,7 +6793,7 @@ mod tests {
             bound_channel_pair(parent, channel);
         let frame = ChannelFrame::text(channel, 1, secret).expect("channel text frame");
         let (envelope, message_id) = admin_group
-            .compose_v3(
+            .compose_v4(
                 &admin,
                 MessageKind::Channel,
                 &frame.to_bytes().expect("frame bytes"),
@@ -6757,7 +6802,7 @@ mod tests {
         let ciphertext = envelope.to_bytes().expect("encode channel ciphertext");
 
         let mut controller =
-            MessengerController::start(&allowed, NetworkConfig::default()).expect("controller");
+            MessengerController::start(&allowed, NetworkConfig::direct()).expect("controller");
         let allowed_members = [admin.peer_id(), allowed.peer_id()];
         let state = channel_parent_state(&allowed, admin.peer_id(), channel, &allowed_members);
         controller.conversations.insert(parent, state);
@@ -6775,9 +6820,9 @@ mod tests {
             .receive_message(admin.peer_id(), &ciphertext)
             .expect("bound member decrypts channel ciphertext")
             .expect("delivery receipt");
-        let receipt = EnvelopeV3::from_bytes(&receipt_bytes).expect("decode receipt");
+        let receipt = EnvelopeV4::from_bytes(&receipt_bytes).expect("decode receipt");
         let verified = admin_group
-            .receive_v3(receipt)
+            .receive_v4(receipt)
             .expect("receipt is in admin group");
         assert_eq!(verified.metadata.sender, allowed.peer_id());
         assert_eq!(verified.metadata.kind, MessageKind::Receipt);
@@ -6828,7 +6873,7 @@ mod tests {
         let frame = ChannelFrame::text(channel, 1, secret).expect("channel text frame");
         let parent = admin_parent.id();
         let (envelope, _message_id) = admin_parent
-            .compose_v3(
+            .compose_v4(
                 &admin,
                 MessageKind::Channel,
                 &frame.to_bytes().expect("frame bytes"),
@@ -6836,7 +6881,7 @@ mod tests {
             .expect("compose parent-group frame");
         let ciphertext = envelope.to_bytes().expect("encode parent-group frame");
         let mut controller =
-            MessengerController::start(&member, NetworkConfig::default()).expect("controller");
+            MessengerController::start(&member, NetworkConfig::direct()).expect("controller");
         controller.conversations.insert(parent, state);
 
         let receipt = controller
@@ -6975,7 +7020,7 @@ mod tests {
         let storage = vault.unlock("vault-password").expect("reopen vault");
         let mut controller = MessengerController::start_with_control_log(
             &identity,
-            NetworkConfig::default(),
+            NetworkConfig::direct(),
             storage,
         )
         .expect("controller with durable replay log");
@@ -7040,7 +7085,7 @@ mod tests {
         {
             let mut controller = MessengerController::start_with_control_log(
                 &identity,
-                NetworkConfig::default(),
+                NetworkConfig::direct(),
                 session,
             )
             .expect("controller with vault");
@@ -7052,7 +7097,7 @@ mod tests {
         let storage = vault.unlock("phase4-password").expect("reopen vault");
         let controller = MessengerController::start_with_control_log(
             &identity,
-            NetworkConfig::default(),
+            NetworkConfig::direct(),
             storage,
         )
         .expect("restored controller");
@@ -7128,7 +7173,7 @@ mod tests {
 
         let mut controller = MessengerController::start_with_control_log(
             &identity,
-            NetworkConfig::default(),
+            NetworkConfig::direct(),
             session.try_clone().expect("controller session"),
         )
         .expect("controller");
@@ -7160,7 +7205,7 @@ mod tests {
             .expect("unlock after restart");
         let mut restored = MessengerController::start_with_control_log(
             &identity,
-            NetworkConfig::default(),
+            NetworkConfig::direct(),
             storage,
         )
         .expect("restored controller");
@@ -7217,7 +7262,7 @@ mod tests {
 
         let mut controller = MessengerController::start_with_control_log(
             &identity,
-            NetworkConfig::default(),
+            NetworkConfig::direct(),
             session.try_clone().expect("controller session"),
         )
         .expect("controller");
@@ -7278,7 +7323,7 @@ mod tests {
             .expect("unlock after restart");
         let mut restored = MessengerController::start_with_control_log(
             &identity,
-            NetworkConfig::default(),
+            NetworkConfig::direct(),
             storage,
         )
         .expect("restored controller");
@@ -7340,7 +7385,7 @@ mod tests {
         let storage = vault.unlock("vault-password").expect("reopen vault");
         let mut controller = MessengerController::start_with_control_log(
             &identity,
-            NetworkConfig::default(),
+            NetworkConfig::direct(),
             storage,
         )
         .expect("controller with durable replay log");
@@ -7374,7 +7419,7 @@ mod tests {
         let storage = vault.unlock("phase4-password").expect("unlock vault");
 
         let error =
-            MessengerController::start_with_control_log(&wrong, NetworkConfig::default(), storage)
+            MessengerController::start_with_control_log(&wrong, NetworkConfig::direct(), storage)
                 .expect_err("wrong vault identity must fail startup");
         assert!(matches!(error, ChatError::ControlLogIdentityMismatch));
     }
@@ -7510,7 +7555,7 @@ mod tests {
         let conversation_id = state.conversation.id();
         let (envelope, message_id) = state
             .conversation
-            .compose_v3(identity, MessageKind::Channel, secret.as_bytes())
+            .compose_v4(identity, MessageKind::Channel, secret.as_bytes())
             .expect("compose queued frame");
         state
             .conversation
@@ -7560,7 +7605,7 @@ mod tests {
         let storage = vault
             .unlock("phase4-password")
             .expect("unlock after restart");
-        MessengerController::start_with_control_log(&identity, NetworkConfig::default(), storage)
+        MessengerController::start_with_control_log(&identity, NetworkConfig::direct(), storage)
             .map(|_| ())
     }
 
@@ -7603,7 +7648,7 @@ mod tests {
             .expect("unlock after restart");
         let controller = MessengerController::start_with_control_log(
             &identity,
-            NetworkConfig::default(),
+            NetworkConfig::direct(),
             storage,
         )
         .expect("restore controller");
@@ -7653,7 +7698,7 @@ mod tests {
         assert!(matches!(
             MessengerController::start_with_control_log(
                 &identity,
-                NetworkConfig::default(),
+                NetworkConfig::direct(),
                 storage
             ),
             Err(ChatError::MlsRestore(_))
@@ -7684,7 +7729,7 @@ mod tests {
         assert!(matches!(
             MessengerController::start_with_control_log(
                 &identity,
-                NetworkConfig::default(),
+                NetworkConfig::direct(),
                 storage
             ),
             Err(ChatError::MlsRestore(_))
@@ -7726,7 +7771,7 @@ mod tests {
             .expect("unlock after restart");
         let controller = MessengerController::start_with_control_log(
             &identity,
-            NetworkConfig::default(),
+            NetworkConfig::direct(),
             storage,
         )
         .expect("restore controller");
@@ -7839,7 +7884,7 @@ mod tests {
         );
         let (_envelope, message_id) = state
             .conversation
-            .compose_v3(&identity, MessageKind::Channel, b"ciphertext")
+            .compose_v4(&identity, MessageKind::Channel, b"ciphertext")
             .expect("compose outgoing frame");
         state
             .conversation
@@ -7872,7 +7917,7 @@ mod tests {
             .expect("unlock after restart");
         let controller = MessengerController::start_with_control_log(
             &identity,
-            NetworkConfig::default(),
+            NetworkConfig::direct(),
             storage,
         )
         .expect("restore controller");
@@ -7959,7 +8004,7 @@ mod tests {
             .expect("unlock after restart");
         let controller = MessengerController::start_with_control_log(
             &identity,
-            NetworkConfig::default(),
+            NetworkConfig::direct(),
             storage,
         )
         .expect("restore controller");
@@ -8085,7 +8130,7 @@ mod tests {
         assert!(matches!(
             MessengerController::start_with_control_log(
                 &identity,
-                NetworkConfig::default(),
+                NetworkConfig::direct(),
                 storage
             ),
             Err(ChatError::MlsRestore(_))
@@ -8124,7 +8169,7 @@ mod tests {
         assert!(matches!(
             MessengerController::start_with_control_log(
                 &identity,
-                NetworkConfig::default(),
+                NetworkConfig::direct(),
                 storage
             ),
             Err(ChatError::MlsRestore(_))
@@ -8625,7 +8670,7 @@ mod tests {
 
         let frame = ChannelFrame::text(channel, 1, secret).expect("channel text frame");
         let (envelope, message_id) = admin_group
-            .compose_v3(
+            .compose_v4(
                 &identity,
                 MessageKind::Channel,
                 &frame.to_bytes().expect("frame bytes"),
@@ -8699,7 +8744,7 @@ mod tests {
 
     fn reopen_vault(vault: &Vault, identity: &Identity) -> Result<MessengerController, ChatError> {
         let storage = vault.unlock("phase4-password")?;
-        MessengerController::start_with_control_log(identity, NetworkConfig::default(), storage)
+        MessengerController::start_with_control_log(identity, NetworkConfig::direct(), storage)
     }
 
     /// A vault where MLS state for a derived channel exists but its
@@ -8871,7 +8916,7 @@ mod tests {
 
         let parent_receipt = fixture
             .peer_parent
-            .receipt_v3(&fixture.peer, ReceiptStatus::Delivered, fixture.message_id)
+            .receipt_v4(&fixture.peer, ReceiptStatus::Delivered, fixture.message_id)
             .expect("peer parent receipt")
             .0
             .to_bytes()
@@ -8885,9 +8930,7 @@ mod tests {
             .insert(first_request, fixture.message_id);
         assert!(matches!(
             controller.handle_message_response(first_request, swarm_peer, &parent_receipt),
-            Err(ChatError::Group(GroupError::Message(
-                MessageError::BadRouteTag
-            )))
+            Err(ChatError::Group(GroupError::Message(MessageError::BadMac)))
         ));
         assert!(
             controller
@@ -8897,7 +8940,7 @@ mod tests {
 
         let channel_receipt = fixture
             .peer_group
-            .receipt_v3(&fixture.peer, ReceiptStatus::Delivered, fixture.message_id)
+            .receipt_v4(&fixture.peer, ReceiptStatus::Delivered, fixture.message_id)
             .expect("peer channel receipt")
             .0
             .to_bytes()
@@ -9054,7 +9097,7 @@ mod tests {
 
         let error = MessengerController::start_with_control_log(
             &identity,
-            NetworkConfig::default(),
+            NetworkConfig::direct(),
             storage,
         )
         .expect_err("an incomplete channel group must not be revived");

@@ -28,12 +28,26 @@ pub struct Argon2Params {
 }
 
 impl Argon2Params {
-    /// Parameters used for newly created profiles: 64 MiB, t=3, p=1.
+    /// Parameters used for newly created profiles: 96 MiB, t=4, p=1. This is
+    /// a bounded local cost increase, not protection from a compromised
+    /// endpoint that can read decrypted memory.
     pub const RECOMMENDED: Self = Self {
-        memory_kib: 64 * 1024,
-        iterations: 3,
+        memory_kib: 96 * 1024,
+        iterations: 4,
         parallelism: 1,
     };
+
+    /// Approximate password-guessing work. Parallelism is not included because
+    /// it mostly trades wall-clock time against hardware concurrency.
+    pub const fn work_factor(self) -> u64 {
+        self.memory_kib as u64 * self.iterations as u64
+    }
+
+    /// Whether these parameters make password guessing cheaper than `other`.
+    /// Used only to decide whether an unlock should rewrap at startup.
+    pub const fn is_weaker_than(self, other: Self) -> bool {
+        self.work_factor() < other.work_factor()
+    }
 
     /// Reject parameters that are either invalid for Argon2id or capable of
     /// exhausting the machine during an unlock attempt.
@@ -126,6 +140,18 @@ mod tests {
             &a[..],
             &derive_kek("password", &[8u8; SALT_LEN], Argon2Params::RECOMMENDED).expect("derive")[..]
         );
+    }
+
+    #[test]
+    fn work_factor_detects_weaker_stored_parameters() {
+        let weak = Argon2Params {
+            memory_kib: 8 * 1024,
+            iterations: 1,
+            parallelism: 8,
+        };
+        assert!(weak.is_weaker_than(Argon2Params::RECOMMENDED));
+        assert!(!Argon2Params::RECOMMENDED.is_weaker_than(weak));
+        assert_eq!(Argon2Params::RECOMMENDED.work_factor(), 96 * 1024 * 4);
     }
 
     #[test]

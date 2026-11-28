@@ -20,8 +20,8 @@ use openmls_traits::types::SignatureScheme;
 use p2p_crypto::{CryptoError, NONCE_LEN, TAG_LEN, decrypt_bytes, encrypt_bytes};
 use p2p_identity::{Identity, IdentityRole, PQ_PUBLIC_KEY_BYTES};
 use p2p_messaging::{
-    Conversation, DeliveryState, Envelope, EnvelopeV3, MessageError, MessageKind, Receipt,
-    ReceiptStatus, ReceivedMessage, V3_MAC_LEN, V3InnerFrame,
+    Conversation, DeliveryState, Envelope, EnvelopeV3, EnvelopeV4, MessageError, MessageKind,
+    Receipt, ReceiptStatus, ReceivedMessage, V3_MAC_LEN, V3InnerFrame,
 };
 use p2p_storage::{MlsProviderError, Session, StagedMlsProvider};
 use sha2::{Digest, Sha256};
@@ -46,10 +46,21 @@ const V3_ROUTE_TAG_DOMAIN: &[u8] = b"p2p-messenger/v3-route-tag";
 const V3_MAC_LABEL: &str = "p2p-messenger/envelope-v3/mac";
 const V3_BODY_LABEL: &str = "p2p-messenger/envelope-v3/body";
 const V3_BODY_AAD_DOMAIN: &[u8] = b"p2p-messenger/v3-wrapped-mls-body";
+const V4_MAC_LABEL: &str = "p2p-messenger/envelope-v4/mac";
+const V4_BODY_LABEL: &str = "p2p-messenger/envelope-v4/body";
+const V4_BODY_AAD_DOMAIN: &[u8] = b"p2p-messenger/v4-wrapped-mls-body";
 
 fn v3_body_aad(route_tag: &[u8; 32], wrapped_len: usize) -> Vec<u8> {
     let mut aad = Vec::with_capacity(V3_BODY_AAD_DOMAIN.len() + 40);
     aad.extend_from_slice(V3_BODY_AAD_DOMAIN);
+    aad.extend_from_slice(route_tag);
+    aad.extend_from_slice(&(wrapped_len as u64).to_le_bytes());
+    aad
+}
+
+fn v4_body_aad(route_tag: &[u8; 32], wrapped_len: usize) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(V4_BODY_AAD_DOMAIN.len() + 40);
+    aad.extend_from_slice(V4_BODY_AAD_DOMAIN);
     aad.extend_from_slice(route_tag);
     aad.extend_from_slice(&(wrapped_len as u64).to_le_bytes());
     aad
@@ -1753,6 +1764,95 @@ impl MlsConversation {
         Ok(())
     }
 
+    /// Authenticate a v4 frame as belonging to this group at its current MLS
+    /// epoch. The random route tag is not compared; group selection is by
+    /// keyed MAC verification only. This is not anonymity: an observer still
+    /// sees timing, size, and transport metadata.
+    pub fn verify_v4_route(&self, envelope: &EnvelopeV4) -> Result<(), GroupError> {
+        let mac_key = self.session.export_v3_key(V4_MAC_LABEL)?;
+        envelope.verify_mac(&mac_key)?;
+        Ok(())
+    }
+
+    /// Compose a v4 envelope with a fresh unlinkable route tag on every frame.
+    /// The body is still MLS-encrypted and then wrapped under a purpose-
+    /// separated exporter key; the random tag is bound into both the wrapped
+    /// body AAD and the group-keyed outer MAC.
+    pub fn compose_v4(
+        &mut self,
+        identity: &Identity,
+        kind: MessageKind,
+        plaintext: &[u8],
+    ) -> Result<(EnvelopeV4, [u8; 16]), GroupError> {
+        self.check_identity(identity)?;
+        let inner = self
+            .conversation
+            .prepare_v3_inner(identity, kind, plaintext)?;
+        let inner_bytes = inner.to_bytes()?;
+        let ciphertext = self.session.encrypt(&inner_bytes)?;
+        let mac_key = self.session.export_v3_key(V4_MAC_LABEL)?;
+        let body_key = self.session.export_v3_key(V4_BODY_LABEL)?;
+        let mut envelope = EnvelopeV4::with_random_header()?;
+        let wrapped_len = ciphertext.len().saturating_add(NONCE_LEN + TAG_LEN);
+        let wrapped = encrypt_bytes(
+            &body_key,
+            &ciphertext,
+            &v4_body_aad(&envelope.route_tag, wrapped_len),
+        )?;
+        envelope.set_body_and_sign(wrapped, &mac_key)?;
+        self.conversation.record_outgoing_v3(&inner)?;
+        self.conversation.advance_epoch(self.session.epoch())?;
+        Ok((envelope, inner.message_id))
+    }
+
+    /// Compose an MLS-encrypted v4 receipt. Delivery state changes only when
+    /// the peer's receipt is MAC-verified, MLS-decrypted, and policy-checked.
+    pub fn receipt_v4(
+        &mut self,
+        identity: &Identity,
+        status: ReceiptStatus,
+        message_id: [u8; 16],
+    ) -> Result<(EnvelopeV4, [u8; 16]), GroupError> {
+        let body = Receipt::new(status, message_id).to_bytes();
+        self.compose_v4(identity, MessageKind::Receipt, &body)
+    }
+
+    /// Verify, decrypt, and apply one inbound v4 frame. A candidate group is
+    /// selected only by verifying the group-keyed MAC; there is no stable tag
+    /// to match or derive.
+    pub fn receive_v4(&mut self, envelope: EnvelopeV4) -> Result<DecryptedMessage, GroupError> {
+        self.conversation.advance_epoch(self.session.epoch())?;
+        self.verify_v4_route(&envelope)?;
+        let body_key = self.session.export_v3_key(V4_BODY_LABEL)?;
+        let mls_ciphertext = decrypt_bytes(
+            &body_key,
+            &envelope.body,
+            &v4_body_aad(&envelope.route_tag, envelope.body.len()),
+        )?;
+        let (mls_sender, plaintext) = self.session.decrypt_v3(&mls_ciphertext)?;
+        let inner = V3InnerFrame::from_bytes(&plaintext)?;
+        if inner.sender != mls_sender {
+            return Err(GroupError::SenderMismatch);
+        }
+        if inner.conversation_id != self.id() {
+            return Err(GroupError::WrongConversation);
+        }
+        let application_body = Zeroizing::new(inner.body.clone());
+        let metadata = self.conversation.receive_v3(inner)?;
+        Ok(DecryptedMessage {
+            metadata,
+            plaintext: application_body,
+        })
+    }
+
+    /// Validate a locally persisted queued v4 frame against this group's
+    /// current exporter key. The random tag is authenticated, not matched.
+    /// Legacy v2/v3 queue bytes are rejected by the v4 decoder.
+    pub fn verify_queued_v4(&self, bytes: &[u8]) -> Result<(), GroupError> {
+        let envelope = EnvelopeV4::from_bytes(bytes)?;
+        self.verify_v4_route(&envelope)
+    }
+
     fn check_identity(&self, identity: &Identity) -> Result<(), GroupError> {
         if identity.peer_id() != self.session.identity.peer_id()
             || self.session.conversation_id != self.conversation.id()
@@ -2034,6 +2134,36 @@ impl MlsChannelGroup {
         self.conversation.verify_queued_v3(bytes)
     }
 
+    pub fn verify_v4_route(&self, envelope: &EnvelopeV4) -> Result<(), GroupError> {
+        self.conversation.verify_v4_route(envelope)
+    }
+
+    pub fn compose_v4(
+        &mut self,
+        identity: &Identity,
+        kind: MessageKind,
+        plaintext: &[u8],
+    ) -> Result<(EnvelopeV4, [u8; 16]), GroupError> {
+        self.conversation.compose_v4(identity, kind, plaintext)
+    }
+
+    pub fn receipt_v4(
+        &mut self,
+        identity: &Identity,
+        status: ReceiptStatus,
+        message_id: [u8; 16],
+    ) -> Result<(EnvelopeV4, [u8; 16]), GroupError> {
+        self.conversation.receipt_v4(identity, status, message_id)
+    }
+
+    pub fn receive_v4(&mut self, envelope: EnvelopeV4) -> Result<DecryptedMessage, GroupError> {
+        self.conversation.receive_v4(envelope)
+    }
+
+    pub fn verify_queued_v4(&self, bytes: &[u8]) -> Result<(), GroupError> {
+        self.conversation.verify_queued_v4(bytes)
+    }
+
     fn from_conversation(
         binding: ChannelGroupBinding,
         conversation: MlsConversation,
@@ -2277,6 +2407,146 @@ mod v3_wire_tests {
             .export_v3_key(V3_BODY_LABEL)
             .expect("body key");
         assert_ne!(mac.as_slice(), body.as_slice());
+    }
+}
+
+#[cfg(test)]
+mod v4_wire_tests {
+    use super::*;
+
+    fn pair(conversation_id: [u8; 16]) -> (Identity, MlsConversation, MlsConversation) {
+        let alice = Identity::generate().expect("alice");
+        let bob = Identity::generate().expect("bob");
+        let mut creator = MlsConversation::create(&alice, conversation_id).expect("creator");
+        let key_package = MlsConversation::key_package(&bob).expect("key package");
+        let bob_key = bob
+            .pq_role_public_bytes(IdentityRole::Mls)
+            .expect("bob PQ MLS key");
+        let welcome = creator
+            .add_member(key_package.bytes(), bob.peer_id(), &bob_key)
+            .expect("welcome");
+        let joiner =
+            MlsConversation::join(&bob, conversation_id, key_package, &welcome).expect("join");
+        (alice, creator, joiner)
+    }
+
+    #[test]
+    fn v4_route_tags_are_fresh_and_round_trip_hides_stable_metadata() {
+        let (alice, mut sender, mut receiver) = pair([66u8; 16]);
+        let secret = b"SECRET_V4_APPLICATION_BODY";
+        let (first, first_id) = sender
+            .compose_v4(&alice, MessageKind::Text, secret)
+            .expect("first v4");
+        let (second, second_id) = sender
+            .compose_v4(&alice, MessageKind::Text, secret)
+            .expect("second v4");
+        assert_ne!(first.route_tag, second.route_tag);
+        assert_ne!(first.nonce, second.nonce);
+        assert_ne!(first_id, second_id);
+
+        let wire = first.to_bytes().expect("encoded v4");
+        assert_eq!(&wire[..4], p2p_messaging::V4_MAGIC);
+        assert!(!wire.windows(16).any(|w| w == sender.id()));
+        assert!(!wire.windows(16).any(|w| w == first_id));
+        assert!(
+            !wire
+                .windows(alice.peer_id().to_bytes().len())
+                .any(|w| w == alice.peer_id().to_bytes())
+        );
+        assert!(!wire.windows(secret.len()).any(|w| w == secret));
+
+        let received = receiver
+            .receive_v4(EnvelopeV4::from_bytes(&wire).expect("decode first"))
+            .expect("receive first");
+        assert_eq!(received.plaintext.as_slice(), secret);
+        assert_eq!(received.metadata.message_id, first_id);
+        assert_eq!(received.metadata.sender, alice.peer_id());
+        assert_eq!(received.metadata.kind, MessageKind::Text);
+        assert_eq!(received.metadata.sender_sequence, 1);
+
+        let second_wire = second.to_bytes().expect("encoded second");
+        let received_second = receiver
+            .receive_v4(EnvelopeV4::from_bytes(&second_wire).expect("decode second"))
+            .expect("receive second");
+        assert_eq!(received_second.metadata.message_id, second_id);
+        assert_eq!(received_second.metadata.sender_sequence, 2);
+        assert!(!format!("{received_second:?}").contains("SECRET_V4"));
+    }
+
+    #[test]
+    fn v4_rejects_tampering_legacy_wire_and_foreign_groups_by_mac() {
+        let (alice, mut sender, mut receiver) = pair([67u8; 16]);
+        let (envelope, _) = sender
+            .compose_v4(&alice, MessageKind::Text, b"authenticated body")
+            .expect("compose v4");
+        let wire = envelope.to_bytes().expect("encoded v4");
+        sender.verify_queued_v4(&wire).expect("local queue check");
+        receiver
+            .verify_v4_route(&envelope)
+            .expect("receiver selects group by MAC");
+
+        let mut body_tampered = envelope.clone();
+        body_tampered.body[0] ^= 0x01;
+        assert!(matches!(
+            receiver.receive_v4(body_tampered),
+            Err(GroupError::Message(MessageError::BadMac))
+        ));
+
+        let mut tag_tampered = envelope.clone();
+        tag_tampered.route_tag[0] ^= 0x01;
+        assert!(matches!(
+            receiver.receive_v4(tag_tampered),
+            Err(GroupError::Message(MessageError::BadMac))
+        ));
+        assert!(
+            sender
+                .verify_queued_v4(&envelope.to_bytes().expect("valid bytes"))
+                .is_ok()
+        );
+
+        let legacy = sender
+            .compose_v3(&alice, MessageKind::Text, b"legacy v3")
+            .expect("legacy compose");
+        let legacy_bytes = legacy.0.to_bytes().expect("legacy bytes");
+        assert!(EnvelopeV4::from_bytes(&legacy_bytes).is_err());
+        assert!(sender.verify_queued_v4(&legacy_bytes).is_err());
+
+        let (_other_alice, mut foreign, _foreign_peer) = pair([68u8; 16]);
+        assert!(matches!(
+            foreign.receive_v4(envelope),
+            Err(GroupError::Message(MessageError::BadMac))
+        ));
+    }
+
+    #[test]
+    fn v4_replay_and_sequence_regression_fail_after_decryption() {
+        let (alice, mut sender, mut receiver) = pair([69u8; 16]);
+        let (first, _) = sender
+            .compose_v4(&alice, MessageKind::Text, b"first")
+            .expect("first");
+        let (second, _) = sender
+            .compose_v4(&alice, MessageKind::Text, b"second")
+            .expect("second");
+        let first_bytes = first.to_bytes().expect("first bytes");
+        let second_bytes = second.to_bytes().expect("second bytes");
+
+        receiver
+            .receive_v4(EnvelopeV4::from_bytes(&second_bytes).expect("decode second"))
+            .expect("receive second");
+        let replay = receiver
+            .receive_v4(EnvelopeV4::from_bytes(&second_bytes).expect("decode replay"))
+            .expect_err("an exact v4 replay must fail closed");
+        assert!(
+            matches!(replay, GroupError::Mls(_) | GroupError::Message(_)),
+            "unexpected replay error: {replay:?}"
+        );
+        let regression = receiver
+            .receive_v4(EnvelopeV4::from_bytes(&first_bytes).expect("decode first"))
+            .expect_err("an older v4 frame must fail closed");
+        assert!(
+            matches!(regression, GroupError::Mls(_) | GroupError::Message(_)),
+            "unexpected regression error: {regression:?}"
+        );
     }
 }
 

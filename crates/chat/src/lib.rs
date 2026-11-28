@@ -91,9 +91,9 @@ pub enum ChatError {
     NoActiveConversation,
     #[error("conversation is unknown")]
     UnknownConversation,
-    #[error("message route tag matched no local MLS group")]
+    #[error("no local MLS group authenticated the message route")]
     UnknownMessageRoute,
-    #[error("message route tag matched more than one local MLS group")]
+    #[error("more than one local MLS group authenticated the message route")]
     AmbiguousMessageRoute,
     #[error("conversation setup is not complete")]
     ConversationNotReady,

@@ -14,11 +14,12 @@ mod error;
 mod receipt;
 
 pub use conversation::{Conversation, DeliveryState, ReceivedMessage};
-pub use envelope::{ENVELOPE_V3_VERSION, now_seconds};
+pub use envelope::{ENVELOPE_V3_VERSION, ENVELOPE_V4_VERSION, now_seconds};
 pub use envelope::{
-    Envelope, EnvelopeParams, EnvelopeV3, MAX_ENVELOPE_BYTES, MAX_PAYLOAD_BYTES, MessageKind,
-    PROTOCOL_MAGIC, V3_INNER_MAGIC, V3_INNER_VERSION, V3_MAC_LEN, V3_MAGIC, V3_NONCE_LEN,
-    V3_ROUTE_TAG_LEN, V3InnerFrame, random_id,
+    Envelope, EnvelopeParams, EnvelopeV3, EnvelopeV4, MAX_ENVELOPE_BYTES, MAX_PAYLOAD_BYTES,
+    MessageKind, PROTOCOL_MAGIC, V3_INNER_MAGIC, V3_INNER_VERSION, V3_MAC_LEN, V3_MAGIC,
+    V3_NONCE_LEN, V3_ROUTE_TAG_LEN, V3InnerFrame, V4_MAC_LEN, V4_MAGIC, V4_NONCE_LEN,
+    V4_ROUTE_TAG_LEN, random_id,
 };
 pub use error::MessageError;
 pub use receipt::{Receipt, ReceiptStatus};

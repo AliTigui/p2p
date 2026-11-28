@@ -1,6 +1,6 @@
 # Privacy Improvement Plan (Q0–Q5)
 
-This is a **local engineering plan**, not an external audit, not a privacy guarantee, and not a claim that the app is equivalent to Signal or Session. It follows the P0–P14 closeout. Status: **Q0–Q5 are complete locally and uncommitted**, including Q3 v3 metadata reduction, Q4 bounded wire-level deniability, and the enabled hybrid MLS suite. All work remains local unless the user explicitly changes that requirement. No CI, release, commit, push, PR, review, merge, user/manual, or external verification claim is made.
+This is a **local engineering plan**, not an external audit, not a privacy guarantee, and not a claim that the app is equivalent to Signal or Session. It follows the P0–P14 closeout. Q0–Q5 below are historical plan phases recorded against an earlier tree. The current worktree is based on `HEAD 34968e4` and adds three local, uncommitted changes: a fail-closed SOCKS5-only default (`TransportPrivacyMode::TorRequired`) with explicit `direct()` opt-in, a production v4 application wire with fresh random per-frame route tags and MAC-based group selection, and at-rest hardening (96 MiB/t=4/p=1 Argon2id, weak-vault rewrap on unlock, and restricted SQLite sidecar permissions). No CI, release, commit, push, PR, review, merge, user/manual, or external verification claim is made.
 
 ## 1. What “fixed” can honestly mean
 
@@ -63,10 +63,10 @@ This app must not claim Session parity. Matching Session’s IP protection would
 
 Source review of `crates/network/src/lib.rs`, `crates/network/src/privacy.rs`, `crates/messaging/src/envelope.rs`, `crates/chat/src/setup.rs`, `crates/files/src/frame.rs`, `crates/groups/src/lib.rs`, and `apps/desktop/src/{app.rs,model.rs}` found:
 
-- Default transport is direct TCP + Noise + Yamux and explicitly non-anonymous.
+- Default transport is now `TorRequired`: a user-supplied SOCKS5 proxy is mandatory, no direct listener or fallback is created, and startup fails closed without a valid proxy. Direct TCP/QUIC transport is only an explicit opt-in through `NetworkConfig::direct()` / `NetworkOptions::direct()`. A configured route is not a verified Tor route and is not anonymity.
 - Optional relay mode is off/empty by default; relay addresses must be direct `/p2p/<peer-id>` addresses and `/p2p-circuit` is rejected in configuration.
 - `TransportPrivacyMode::TorRequired` selects a configured SOCKS5-only outbound route; without a valid proxy address it fails closed before a dial is created. It is not a verified Tor route.
-- Legacy v2 application envelopes expose protocol, conversation, epoch, message ID, sender PeerId, certified role key, identity proof, sequence, sender time, kind, and ciphertext before MLS payload decryption. They remain only as a compatibility/test artifact; production v3 paths reject them.
+- Legacy v2 and v3 application envelopes expose stable metadata before MLS payload decryption. They remain only as compatibility/adversarial test artifacts; production v4 paths reject them.
 - Stable identifiers include PeerId, transport key, Application/File/Mls role keys, conversation ID, transaction ID, transfer ID, channel ID, and sequence. Q4 does not change these identities.
 - Q1 adds a `DialPolicy::RelayOnly` route that rejects direct application dials and requires an observed relayed path.
 - Q2 pads MLS application plaintext to fixed buckets before encryption and rejects malformed padding after decryption.
@@ -83,7 +83,7 @@ No code or dependency change. This document anchors all later phases and forbids
 
 ### Q1 — Relay-only route policy
 
-Status: **complete locally and uncommitted**.
+Status: **historically complete locally**.
 
 Goal: make destination peers unable to learn the local public IP when the user explicitly configures relay-only routing.
 
@@ -102,7 +102,7 @@ Non-claims: the relay sees IP, timing and sizes; relay operators can deny servic
 
 ### Q2 — Application message padding
 
-Status: **complete locally and uncommitted**.
+Status: **historically complete locally**.
 
 Goal: reduce coarse plaintext-size correlation for messages and receipts.
 
@@ -114,13 +114,13 @@ Implementation boundary:
 
 Tests added: bucket selection, exact-fit and one-byte-over boundary behaviour, valid round trip, empty/oversized input rejection, wrong tag, zero length, extended claimed length, dirty tail, and wrong-length padding.
 
-Non-claims: no timing defence, no volume/correlation defence, and no protection against a relay or peer observing outer frame sizes or the selected bucket. Q2 padding is retained inside the v3 MLS body; v3 additionally randomizes the outer nonce.
+Non-claims: no timing defence, no volume/correlation defence, and no protection against a relay or peer observing outer frame sizes or the selected bucket. Q2 padding is retained inside the current v4 MLS-protected body; v4 additionally randomizes the outer nonce and route tag.
 
 ### Q3 — Clear envelope metadata reduction
 
 Goal: reduce stable metadata visible before MLS decryption.
 
-Implemented as a new wire version (`P2P3`, version 3) with no silent v2 change:
+Historically implemented as a new wire version (`P2P3`, version 3) with no silent v2 change; v4 superseded it in production:
 
 - The outer header carries only a per-epoch route tag, a fresh random nonce, an encrypted body length, the wrapped MLS ciphertext, and an HMAC-SHA256 tag keyed by an MLS exporter secret.
 - Sender PeerId certified proof, long-term role key, conversation ID, epoch, message ID, sequence, timestamp, and kind move into an MLS-protected inner frame that is recovered only after group-authenticated decryption.
@@ -128,15 +128,15 @@ Implemented as a new wire version (`P2P3`, version 3) with no silent v2 change:
 - Route tags are SHA-256 over a domain separator, group ID, and epoch. They are local routing hints, not secrets, not proofs, and not unlinkability.
 - Production parsing rejects v1/v2 wire frames and legacy setup frames; the legacy v2 codec and its transferable-authorship test remain only as a compatibility artifact.
 
-Non-claims: transport PeerId, IP, timing, direction, volume, outer bucket length, and route-tag linkability within one epoch remain observable. Version 3 is not unlinkability, not anonymity, and not a full metadata confidentiality claim.
+Historical non-claims for Q3: transport PeerId, IP, timing, direction, volume, outer bucket length, and route-tag linkability within one epoch remained observable. Version 3 was not unlinkability, not anonymity, and not a full metadata confidentiality claim.
 
-Status: **complete locally and uncommitted**; adversarial tests cover outer tampering, wrong route, legacy substitution, foreign groups, malformed inner frames, replay/sequence policy, and third-party metadata absence.
+Status: **historical**. The current production application wire is v4 (`P2P4`): every frame carries a fresh random route tag and nonce, and a receiver selects a candidate group by verifying the group-keyed exporter MAC instead of matching an epoch-stable tag. Outside observers cannot link v4 frames by tag; timing, size, direction, volume, and the transport peer remain observable. v3 is retained only for legacy/adversarial evidence and is rejected by the production receive path.
 
 ### Q4 — Bounded authorship deniability
 
 Goal: stop wire bytes from acting as third-party-verifiable long-term-key authorship proof.
 
-Implemented in the v3 wire path:
+Implemented first in the v3 wire path and retained in the production v4 wire:
 
 - The v2 identity proof and long-term application signature are no longer present on the wire. MLS group-authenticated decryption establishes the sender only for a recipient that holds current group state.
 - The exported route tag and outer MAC do not identify a sender to an outside observer; the outer MAC is group-keyed, not sender-keyed.
@@ -144,17 +144,17 @@ Implemented in the v3 wire path:
 
 Non-claims: root/device/transport keys remain stable; relay/peer correlation remains possible; this is bounded deniability, not full deniability and not anonymity. Ephemeral delegated application keys (`RoleDelegation` grants) were not introduced.
 
-Status: **complete locally and uncommitted** as bounded wire-level deniability; GUI wording and tests state the group-member attribution boundary explicitly.
+Status: **historically complete locally** as bounded wire-level deniability and retained in v4; GUI wording and tests state the group-member attribution boundary explicitly.
 
 ### Q5 — Optional local SOCKS5/Tor route
 
-Status: **complete locally and uncommitted**; this is a configured route, not a verified Tor or anonymity route.
+Status: **historically complete locally**; the current tree keeps the SOCKS5 route but changes the route to a fail-closed default. This is a configured route, not a verified Tor or anonymity route.
 
 Goal: allow a user who already runs a local SOCKS5 proxy to route outbound dials through it.
 
 Implemented boundary:
 
-- `TransportPrivacyMode::TorRequired` now selects a SOCKS5-only libp2p transport built from `tokio-socks = =0.5.3` and `tokio-util`'s `compat` feature. It authenticates Noise and multiplexes Yamux over the proxy.
+- `TransportPrivacyMode::TorRequired` now selects a SOCKS5-only libp2p transport built from `tokio-socks = "0.5.3"` and `tokio-util`'s `compat` feature. It authenticates Noise and multiplexes Yamux over the proxy.
 - `socks5_proxy` must be an IP literal and port; hostnames are rejected so the proxy address itself requires no local DNS. `/dns4` and `/dns6` destination names are passed to the proxy as domain CONNECT targets; `/dnsaddr`, UDP, circuit, and incomplete targets fail before a dial future is created.
 - Proxy mode disables mDNS, AutoNAT, and DCUtR through fail-closed validation. A proxy address without `TorRequired`, or `TorRequired` without a proxy, is rejected.
 - The SOCKS5 transport's `listen_on` always fails with “SOCKS5-only route has no direct listener”. The worker skips the direct listener in proxy mode, and no direct TCP fallback transport is built.
@@ -187,8 +187,9 @@ A phase is not called complete until targeted adversarial tests and the full loc
 The following remain true unless a specific phase changes them with source and tests:
 
 - No verified anonymity, Tor/I2P/mixnet, onion service, proxy identity, or unlinkability. Q5 configures a SOCKS5 route; it does not prove the proxy is Tor.
-- No complete metadata confidentiality or traffic-analysis resistance. Q2 coarse padding and Q3 v3 wire reduction do not hide timing, direction, volume, outer frame buckets, or route-tag linkability within one epoch.
+- No complete metadata confidentiality or traffic-analysis resistance. Q2 coarse padding reduces coarse size correlation, and the v4 production wire removes stable route tags from outside observers, but timing, direction, volume, and outer frame buckets remain observable.
 - No mandatory centralized infrastructure.
 - No secure multi-device convergence, full ACL, or production readiness.
 - Relay operators and direct peers observe metadata that is not hidden by MLS content encryption. Q1 changes the destination peer's view under explicit relay-only routing, not the relay's view.
-- Q3 (v3 clear-envelope metadata reduction) and Q4 (bounded wire-level authorship deniability) are implemented locally and uncommitted. Ephemeral delegated application keys remain unimplemented; group members with MLS state can still attribute messages.
+- v4 supersedes Q3's stable route tag with a fresh random tag per frame and MAC-based route selection. Q4's bounded wire-level authorship deniability remains; group members with MLS state can still attribute messages. Ephemeral delegated application keys remain unimplemented.
+- At-rest hardening raises new vault and identity-export KDF parameters to 96 MiB/t=4/p=1, upgrades weak vault parameters on successful unlock or password change, and restricts SQLite WAL/SHM sidecar permissions. This does not protect a fully compromised endpoint that can read decrypted memory.

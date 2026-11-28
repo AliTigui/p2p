@@ -61,8 +61,10 @@ pub enum VaultState {
     },
 }
 
-/// User-editable optional network settings. Every field is off or empty by
-/// default. These are local configuration values, not observed capabilities.
+/// User-editable network settings. The default requires a user-supplied SOCKS5
+/// proxy; direct transport is an explicit opt-in. Every other field is off or
+/// empty by default. These are local configuration values, not observed
+/// capabilities.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkOptions {
     pub transport_mode: TransportPrivacyMode,
@@ -79,10 +81,21 @@ pub struct NetworkOptions {
     pub enable_dcutr: bool,
 }
 
+impl NetworkOptions {
+    /// Explicit direct-route settings for callers that deliberately accept
+    /// direct IP exposure. This is not the GUI default.
+    pub fn direct() -> Self {
+        Self {
+            transport_mode: TransportPrivacyMode::Direct,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for NetworkOptions {
     fn default() -> Self {
         Self {
-            transport_mode: TransportPrivacyMode::Direct,
+            transport_mode: TransportPrivacyMode::TorRequired,
             socks5_proxy: String::new(),
             enable_identify: false,
             enable_ping: false,
@@ -963,10 +976,18 @@ mod tests {
     }
 
     #[test]
-    fn network_options_default_to_all_off() {
-        let config = NetworkOptions::default()
+    fn network_options_default_fails_closed_until_a_proxy_is_configured() {
+        let error = NetworkOptions::default()
             .to_config()
-            .expect("default config");
+            .expect_err("default must not fall back to a direct route");
+        assert!(error.contains("direct fallback is disabled"));
+    }
+
+    #[test]
+    fn network_options_direct_opt_in_is_explicit() {
+        let config = NetworkOptions::direct()
+            .to_config()
+            .expect("explicit direct config");
         assert!(!config.enable_identify);
         assert!(!config.enable_ping);
         assert!(!config.enable_mdns);
@@ -987,7 +1008,7 @@ mod tests {
         let kad = NetworkOptions {
             enable_kad: true,
             kad_bootstrap_peers: format!("{address}, {address}"),
-            ..NetworkOptions::default()
+            ..NetworkOptions::direct()
         };
         assert_eq!(
             kad.to_config()
@@ -1000,14 +1021,14 @@ mod tests {
         let no_peer = NetworkOptions {
             enable_kad: true,
             kad_bootstrap_peers: "/ip4/127.0.0.1/tcp/4001".to_owned(),
-            ..NetworkOptions::default()
+            ..NetworkOptions::direct()
         };
         assert!(no_peer.to_config().is_err());
 
         let circuit = NetworkOptions {
             relay_mode: RelayMode::Client,
             relay_servers: format!("{address}/p2p-circuit"),
-            ..NetworkOptions::default()
+            ..NetworkOptions::direct()
         };
         assert!(circuit.to_config().is_err());
     }
@@ -1017,7 +1038,7 @@ mod tests {
         let valid = NetworkOptions {
             transport_mode: TransportPrivacyMode::TorRequired,
             socks5_proxy: "127.0.0.1:9050".to_owned(),
-            ..NetworkOptions::default()
+            ..NetworkOptions::direct()
         };
         let config = valid.to_config().expect("valid proxy route");
         assert_eq!(config.transport_mode, TransportPrivacyMode::TorRequired);
@@ -1029,7 +1050,7 @@ mod tests {
         assert!(
             NetworkOptions {
                 transport_mode: TransportPrivacyMode::TorRequired,
-                ..NetworkOptions::default()
+                ..NetworkOptions::direct()
             }
             .to_config()
             .is_err()
@@ -1038,7 +1059,7 @@ mod tests {
             NetworkOptions {
                 transport_mode: TransportPrivacyMode::TorRequired,
                 socks5_proxy: "localhost:9050".to_owned(),
-                ..NetworkOptions::default()
+                ..NetworkOptions::direct()
             }
             .to_config()
             .is_err()
@@ -1048,7 +1069,7 @@ mod tests {
                 transport_mode: TransportPrivacyMode::TorRequired,
                 socks5_proxy: "127.0.0.1:9050".to_owned(),
                 enable_mdns: true,
-                ..NetworkOptions::default()
+                ..NetworkOptions::direct()
             }
             .to_config()
             .is_err()
@@ -1056,7 +1077,7 @@ mod tests {
         assert!(
             NetworkOptions {
                 socks5_proxy: "127.0.0.1:9050".to_owned(),
-                ..NetworkOptions::default()
+                ..NetworkOptions::direct()
             }
             .to_config()
             .is_err()
@@ -1070,7 +1091,7 @@ mod tests {
             dial_policy: DialPolicy::RelayOnly,
             relay_mode: RelayMode::Client,
             relay_servers: address.clone(),
-            ..NetworkOptions::default()
+            ..NetworkOptions::direct()
         };
         let config = valid.to_config().expect("valid relay-only config");
         assert_eq!(config.dial_policy, DialPolicy::RelayOnly);
@@ -1080,7 +1101,7 @@ mod tests {
             NetworkOptions {
                 dial_policy: DialPolicy::RelayOnly,
                 relay_servers: address,
-                ..NetworkOptions::default()
+                ..NetworkOptions::direct()
             }
             .to_config()
             .is_err()
@@ -1091,7 +1112,7 @@ mod tests {
                 relay_mode: RelayMode::Client,
                 relay_servers: direct_address(),
                 enable_dcutr: true,
-                ..NetworkOptions::default()
+                ..NetworkOptions::direct()
             }
             .to_config()
             .is_err()
@@ -1103,7 +1124,7 @@ mod tests {
         assert!(
             NetworkOptions {
                 enable_kad: true,
-                ..NetworkOptions::default()
+                ..NetworkOptions::direct()
             }
             .to_config()
             .is_err()
@@ -1111,7 +1132,7 @@ mod tests {
         assert!(
             NetworkOptions {
                 relay_mode: RelayMode::Client,
-                ..NetworkOptions::default()
+                ..NetworkOptions::direct()
             }
             .to_config()
             .is_err()
@@ -1120,13 +1141,13 @@ mod tests {
         let relay = NetworkOptions {
             relay_mode: RelayMode::Client,
             relay_servers: address,
-            ..NetworkOptions::default()
+            ..NetworkOptions::direct()
         };
         assert!(relay.to_config().is_ok());
 
         let unused = NetworkOptions {
             kad_bootstrap_peers: direct_address(),
-            ..NetworkOptions::default()
+            ..NetworkOptions::direct()
         };
         assert!(unused.to_config().is_err());
     }

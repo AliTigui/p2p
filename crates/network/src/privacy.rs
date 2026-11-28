@@ -12,14 +12,16 @@ use libp2p::{Multiaddr, PeerId};
 /// claims that a requested hidden route was obtained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TransportPrivacyMode {
-    /// Direct TCP + Noise or direct QUIC hybrid key exchange. This is the
-    /// implemented default and is not anonymous; peers can observe addresses
-    /// and timing, and TLS/libp2p PeerId authentication remains classical.
-    #[default]
+    /// Direct TCP + Noise or direct QUIC hybrid key exchange. This is an
+    /// explicit opt-in, not the default, and is not anonymous; peers can
+    /// observe addresses and timing, and TLS/libp2p PeerId authentication
+    /// remains classical.
     Direct,
     /// A user-configured SOCKS5 proxy route is required, typically a local Tor
-    /// SOCKS5 service. No direct dial or listener is used. This does not verify
-    /// that the proxy is Tor or that traffic is anonymous.
+    /// SOCKS5 service. No direct dial or listener is used. This is the default
+    /// and fails closed until a proxy is configured. It does not verify that
+    /// the proxy is Tor or that traffic is anonymous.
+    #[default]
     TorRequired,
 }
 
@@ -31,7 +33,7 @@ impl TransportPrivacyMode {
                 "Direct TCP + Noise or QUIC hybrid KEX (not anonymous; PeerId auth classical)"
             }
             Self::TorRequired => {
-                "SOCKS5/Tor route required (proxy not verified; no direct fallback)"
+                "SOCKS5/Tor route required by default (proxy not verified; no direct fallback)"
             }
         }
     }
@@ -293,10 +295,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transport_mode_default_is_direct_without_an_anonymity_claim() {
+    fn transport_mode_default_is_tor_required_and_direct_is_opt_in() {
         assert_eq!(
             TransportPrivacyMode::default(),
-            TransportPrivacyMode::Direct
+            TransportPrivacyMode::TorRequired
         );
         assert!(
             TransportPrivacyMode::Direct

@@ -1,5 +1,7 @@
 # Post-Quantum Status (local, uncommitted)
 
+> **Current worktree note (2026-11-28):** The PQ status below remains valid for transport/PQ scope, but the current uncommitted work based on `HEAD 34968e4` changes the default route to fail-closed `TorRequired` (SOCKS5 proxy required; `direct()` is explicit opt-in). `NetworkConfig::pq_transport` remains `None` by default. Production application frames are now v4 (`P2P4`) with fresh random route tags and MAC-based group selection; this is metadata hardening, not anonymity or traffic-analysis defense. At-rest KDF defaults are 96 MiB/t=4/p=1 with weak-vault rewrap; a fully compromised endpoint still exposes decrypted memory.
+
 This document records the exact post-quantum boundary for the current source
 tree. It is not a release note, audit result, CI result, external verification,
 two-machine result, visual-GUI result, or production-readiness claim.

@@ -34,7 +34,7 @@ fn config_with_pins(pins: PqTransportConfig) -> NetworkConfig {
     NetworkConfig {
         listen_addr: Multiaddr::from_str("/ip4/127.0.0.1/tcp/0").expect("valid multiaddr"),
         pq_transport: Some(pins),
-        ..NetworkConfig::default()
+        ..NetworkConfig::direct()
     }
 }
 

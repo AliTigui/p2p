@@ -7,7 +7,7 @@
 Local data must be encrypted at rest, the user must authenticate locally with a password, and password changes must not require re-encrypting all stored data.
 
 ## Decision
-Generate a random 32-byte master key. Derive a KEK from the password with Argon2id (64 MiB, t=3, p=1, 16-byte salt) and use XChaCha20-Poly1305 to wrap the master key in a versioned envelope with domain-separated AAD. Derive independent subkeys via HKDF-SHA256 for database, identity, attachments, search index, and backup. A password change creates a new salt/KEK and re-wraps only the master key.
+Generate a random 32-byte master key. Derive a KEK from the password with Argon2id (96 MiB, t=4, p=1, 16-byte salt) and use XChaCha20-Poly1305 to wrap the master key in a versioned envelope with domain-separated AAD. Derive independent subkeys via HKDF-SHA256 for database, identity, attachments, search index, and backup. A password change creates a new salt/KEK, upgrades weak stored parameters without downgrading stronger ones, and re-wraps only the master key. Existing weak vaults are rewrapped on the first successful unlock. This is at-rest hardening only and does not protect a fully compromised endpoint with access to decrypted memory.
 
 ## Consequences
 - Password changes are cheap and safe.

@@ -12,7 +12,7 @@ use p2p_network::{ConnectionState, Network, NetworkConfig};
 fn local_config() -> NetworkConfig {
     NetworkConfig {
         listen_addr: Multiaddr::from_str("/ip4/127.0.0.1/tcp/0").expect("valid multiaddr"),
-        ..NetworkConfig::default()
+        ..NetworkConfig::direct()
     }
 }
 

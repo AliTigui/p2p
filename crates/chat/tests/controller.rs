@@ -33,7 +33,7 @@ fn local_config() -> NetworkConfig {
     NetworkConfig {
         listen_addr: libp2p::Multiaddr::from_str("/ip4/127.0.0.1/tcp/0").expect("valid multiaddr"),
         max_redial_attempts: 0,
-        ..NetworkConfig::default()
+        ..NetworkConfig::direct()
     }
 }
 

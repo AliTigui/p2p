@@ -20,10 +20,10 @@ const VERSION: u8 = 1;
 
 /// Identifier stored in the envelope for the Argon2id KDF.
 pub const KDF_ARGON2ID_V1: u8 = 1;
-/// Default Argon2id memory cost in KiB (64 MiB).
-pub const DEFAULT_M_COST: u32 = 64 * 1024;
+/// Default Argon2id memory cost in KiB (96 MiB).
+pub const DEFAULT_M_COST: u32 = 96 * 1024;
 /// Default Argon2id iteration count.
-pub const DEFAULT_T_COST: u32 = 3;
+pub const DEFAULT_T_COST: u32 = 4;
 /// Default Argon2id parallelism.
 pub const DEFAULT_P_COST: u32 = 1;
 

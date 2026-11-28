@@ -37,6 +37,17 @@ pub const V3_ROUTE_TAG_LEN: usize = 32;
 pub const V3_NONCE_LEN: usize = 16;
 pub const V3_MAC_LEN: usize = 32;
 
+/// Version 4 replaces the stable per-epoch route tag with a fresh random tag
+/// on every frame. The tag remains a local selector only: receivers identify a
+/// candidate group by verifying the group-keyed MAC, not by matching a stable
+/// clear value. Outside observers cannot link two frames by tag.
+pub const ENVELOPE_V4_VERSION: u16 = 4;
+pub const V4_MAGIC: &[u8; 4] = b"P2P4";
+pub const V4_ROUTE_TAG_LEN: usize = 32;
+pub const V4_NONCE_LEN: usize = 16;
+pub const V4_MAC_LEN: usize = 32;
+const V4_HEADER_LEN: usize = 4 + 2 + V4_ROUTE_TAG_LEN + V4_NONCE_LEN + 4;
+
 /// Version 1 of the MLS-protected inner frame. It is never present on the wire
 /// in plaintext; only MLS group members can decrypt it.
 pub const V3_INNER_MAGIC: &[u8; 4] = b"P2I1";
@@ -477,6 +488,183 @@ impl fmt::Debug for EnvelopeV3 {
         f.debug_struct("EnvelopeV3")
             .field("version", &self.version)
             .field("route_tag", &hex(&self.route_tag))
+            .field("body_len", &self.body.len())
+            .field("body", &"<mls ciphertext>")
+            .finish_non_exhaustive()
+    }
+}
+
+/// A version-4 wire envelope. The per-frame random route tag is unlinkable to
+/// an outside observer; it is authenticated but carries no stable group or
+/// epoch identifier.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EnvelopeV4 {
+    pub version: u16,
+    pub protocol: [u8; 4],
+    /// Fresh random selector for this frame only. Not a secret or a proof.
+    pub route_tag: [u8; V4_ROUTE_TAG_LEN],
+    /// Fresh random bytes that make repeated outer frames differ.
+    pub nonce: [u8; V4_NONCE_LEN],
+    /// MLS ciphertext carrying [`V3InnerFrame`].
+    pub body: Vec<u8>,
+    /// HMAC-SHA256 under an MLS exporter-derived group key.
+    pub mac: [u8; V4_MAC_LEN],
+}
+
+impl EnvelopeV4 {
+    /// Build an authenticated v4 envelope with a fresh random route tag and
+    /// nonce. Callers cannot supply a stable tag, which is what makes the
+    /// outer selector unlinkable between frames.
+    pub fn new(body: Vec<u8>, mac_key: &[u8; V4_MAC_LEN]) -> Result<Self, MessageError> {
+        let mut envelope = Self::with_random_header()?;
+        envelope.set_body_and_sign(body, mac_key)?;
+        Ok(envelope)
+    }
+
+    /// Allocate a fresh random outer header before the protected body exists.
+    /// This lets a caller bind the random route tag into AEAD associated data;
+    /// no caller-supplied tag is accepted anywhere in the v4 API.
+    pub fn with_random_header() -> Result<Self, MessageError> {
+        let mut route_tag = [0u8; V4_ROUTE_TAG_LEN];
+        let mut nonce = [0u8; V4_NONCE_LEN];
+        getrandom::fill(&mut route_tag).map_err(|_| MessageError::Randomness)?;
+        getrandom::fill(&mut nonce).map_err(|_| MessageError::Randomness)?;
+        Ok(Self {
+            version: ENVELOPE_V4_VERSION,
+            protocol: *V4_MAGIC,
+            route_tag,
+            nonce,
+            body: Vec::new(),
+            mac: [0; V4_MAC_LEN],
+        })
+    }
+
+    /// Install the already protected body and recompute the group MAC over the
+    /// whole frame, including the random route tag.
+    pub fn set_body_and_sign(
+        &mut self,
+        body: Vec<u8>,
+        mac_key: &[u8; V4_MAC_LEN],
+    ) -> Result<(), MessageError> {
+        if body.is_empty() || body.len() > MAX_PAYLOAD_BYTES {
+            return Err(MessageError::BadV3Inner);
+        }
+        self.body = body;
+        let authenticated = self.authenticated_bytes()?;
+        self.mac = derive_v3_mac(mac_key, &authenticated)?;
+        Ok(())
+    }
+
+    /// Parse a canonical v4 envelope. This does **not** verify the MAC or the
+    /// MLS ciphertext; callers must do both before trusting the group route.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, MessageError> {
+        if bytes.len() > MAX_ENVELOPE_BYTES {
+            return Err(MessageError::TooLarge {
+                len: bytes.len(),
+                max: MAX_ENVELOPE_BYTES,
+            });
+        }
+        let mut reader = Reader::new(bytes);
+        let protocol: [u8; 4] = reader.fixed().map_err(|_| MessageError::BadProtocol)?;
+        if &protocol != V4_MAGIC {
+            return Err(MessageError::BadProtocol);
+        }
+        let version = reader.u16()?;
+        if version != ENVELOPE_V4_VERSION {
+            return Err(MessageError::UnsupportedVersion(version));
+        }
+        let route_tag = reader.fixed()?;
+        let nonce = reader.fixed()?;
+        let body_len = reader.u32()? as usize;
+        if body_len == 0 || body_len > MAX_PAYLOAD_BYTES {
+            return Err(MessageError::BadV3Inner);
+        }
+        let body = reader.take(body_len)?.to_vec();
+        let mac = reader.fixed()?;
+        reader.finish()?;
+        Ok(Self {
+            version,
+            protocol,
+            route_tag,
+            nonce,
+            body,
+            mac,
+        })
+    }
+
+    /// Versioned outer header used as AEAD associated data for the wrapped MLS
+    /// ciphertext. It contains only the random route tag, nonce, and body
+    /// length.
+    pub fn header_bytes(&self) -> Result<Vec<u8>, MessageError> {
+        if &self.protocol != V4_MAGIC {
+            return Err(MessageError::BadProtocol);
+        }
+        if self.version != ENVELOPE_V4_VERSION {
+            return Err(MessageError::UnsupportedVersion(self.version));
+        }
+        if self.body.is_empty() || self.body.len() > MAX_PAYLOAD_BYTES {
+            return Err(MessageError::BadV3Inner);
+        }
+        let mut bytes = Vec::with_capacity(V4_HEADER_LEN);
+        bytes.extend_from_slice(&self.protocol);
+        bytes.extend_from_slice(&self.version.to_le_bytes());
+        bytes.extend_from_slice(&self.route_tag);
+        bytes.extend_from_slice(&self.nonce);
+        bytes.extend_from_slice(&(self.body.len() as u32).to_le_bytes());
+        Ok(bytes)
+    }
+
+    /// All bytes covered by the MAC: versioned header, random tag, nonce,
+    /// body length, and body. The tag cannot be swapped without invalidating
+    /// the MAC, but it remains unlinkable because it is random per frame.
+    pub fn authenticated_bytes(&self) -> Result<Vec<u8>, MessageError> {
+        if &self.protocol != V4_MAGIC {
+            return Err(MessageError::BadProtocol);
+        }
+        if self.version != ENVELOPE_V4_VERSION {
+            return Err(MessageError::UnsupportedVersion(self.version));
+        }
+        if self.body.is_empty() || self.body.len() > MAX_PAYLOAD_BYTES {
+            return Err(MessageError::BadV3Inner);
+        }
+        let mut bytes = Vec::with_capacity(self.body.len() + V4_HEADER_LEN);
+        bytes.extend_from_slice(&self.protocol);
+        bytes.extend_from_slice(&self.version.to_le_bytes());
+        bytes.extend_from_slice(&self.route_tag);
+        bytes.extend_from_slice(&self.nonce);
+        bytes.extend_from_slice(&(self.body.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&self.body);
+        Ok(bytes)
+    }
+
+    /// Encode the full authenticated envelope.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, MessageError> {
+        let mut bytes = self.authenticated_bytes()?;
+        bytes.extend_from_slice(&self.mac);
+        if bytes.len() > MAX_ENVELOPE_BYTES {
+            return Err(MessageError::TooLarge {
+                len: bytes.len(),
+                max: MAX_ENVELOPE_BYTES,
+            });
+        }
+        Ok(bytes)
+    }
+
+    /// Constant-time verification of the group-keyed outer MAC.
+    pub fn verify_mac(&self, mac_key: &[u8; V4_MAC_LEN]) -> Result<(), MessageError> {
+        let authenticated = self.authenticated_bytes()?;
+        let mut mac = HmacSha256::new_from_slice(mac_key).map_err(|_| MessageError::BadMac)?;
+        mac.update(&authenticated);
+        mac.verify_slice(&self.mac)
+            .map_err(|_| MessageError::BadMac)
+    }
+}
+
+impl fmt::Debug for EnvelopeV4 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EnvelopeV4")
+            .field("version", &self.version)
+            .field("route_tag", &"<random selector>")
             .field("body_len", &self.body.len())
             .field("body", &"<mls ciphertext>")
             .finish_non_exhaustive()
@@ -1032,6 +1220,79 @@ mod tests {
             assert!(
                 EnvelopeV3::from_bytes(&bytes[..len]).is_err(),
                 "v3 prefix of length {len} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn v4_route_tag_is_random_and_outer_frame_hides_stable_metadata() {
+        let identity = Identity::generate().expect("identity");
+        let key = [0x55; V4_MAC_LEN];
+        let first = EnvelopeV4::new(vec![0xaa; 128], &key).expect("first v4");
+        let second = EnvelopeV4::new(vec![0xaa; 128], &key).expect("second v4");
+        assert_ne!(first.route_tag, second.route_tag);
+        assert_ne!(first.nonce, second.nonce);
+
+        let bytes = first.to_bytes().expect("encoded v4");
+        assert_eq!(&bytes[..4], V4_MAGIC);
+        assert_eq!(&bytes[4..6], &ENVELOPE_V4_VERSION.to_le_bytes());
+        assert!(
+            !bytes
+                .windows(16)
+                .any(|w| w == identity.peer_id().to_bytes())
+        );
+        assert!(!bytes.windows(16).any(|w| w == [0x11; 16]));
+        assert!(!bytes.windows(16).any(|w| w == [0x22; 16]));
+        assert!(format!("{first:?}").contains("<random selector>"));
+        assert!(!format!("{first:?}").contains("aa"));
+
+        let decoded = EnvelopeV4::from_bytes(&bytes).expect("decoded v4");
+        decoded.verify_mac(&key).expect("valid group MAC");
+        assert_eq!(decoded.route_tag, first.route_tag);
+        assert_eq!(decoded.body, vec![0xaa; 128]);
+
+        // The two-step API exists so the random tag can be bound into AEAD AAD
+        // before the protected body is installed; it still rejects a caller-
+        // supplied tag because no setter is exposed.
+        let mut prepared = EnvelopeV4::with_random_header().expect("fresh header");
+        prepared
+            .set_body_and_sign(vec![0xaa; 128], &key)
+            .expect("signed body");
+        prepared.verify_mac(&key).expect("valid prepared MAC");
+        assert_ne!(prepared.route_tag, first.route_tag);
+    }
+
+    #[test]
+    fn v4_mac_rejects_tampering_and_legacy_wire_is_rejected() {
+        let key = [0x66; V4_MAC_LEN];
+        let envelope = EnvelopeV4::new(vec![0x77; 96], &key).expect("v4 envelope");
+        let bytes = envelope.to_bytes().expect("encoded v4");
+
+        for index in [4, 6, 22, 38, 42, bytes.len() - 1] {
+            let mut changed = bytes.clone();
+            changed[index] ^= 0x01;
+            if let Ok(decoded) = EnvelopeV4::from_bytes(&changed) {
+                assert!(
+                    decoded.verify_mac(&key).is_err(),
+                    "byte {index} produced an authenticated frame"
+                );
+            }
+        }
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(matches!(
+            EnvelopeV4::from_bytes(&trailing),
+            Err(MessageError::TrailingBytes)
+        ));
+
+        let legacy = EnvelopeV3::new([0x11; 32], vec![0x22; 64], &[0x33; 32]).expect("v3");
+        assert!(EnvelopeV4::from_bytes(&legacy.to_bytes().expect("v3 bytes")).is_err());
+
+        for len in 0..bytes.len() {
+            assert!(
+                EnvelopeV4::from_bytes(&bytes[..len]).is_err(),
+                "v4 prefix of length {len} was accepted"
             );
         }
     }

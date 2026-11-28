@@ -12,6 +12,7 @@ mod control_log;
 mod mls_provider;
 mod mls_state;
 
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -242,6 +243,13 @@ impl Vault {
             &master_aad(&record.profile_id, &record.kdf_salt, record.params),
         )
         .map_err(|_| StorageError::AuthenticationFailed)?;
+        let params = if record.params.is_weaker_than(Argon2Params::RECOMMENDED) {
+            // Upgrade legacy vaults on the first successful unlock. The master
+            // key is already authenticated; only its password wrap is changed.
+            rewrap_weak_kdf(&mut conn, &record, password, &master)?
+        } else {
+            record.params
+        };
         let subkeys = Subkeys::new(master, record.subkey_salts);
 
         let identity_plaintext = decrypt_bytes(
@@ -260,7 +268,7 @@ impl Vault {
             subkeys,
             profile_id: record.profile_id,
             identity,
-            params: record.params,
+            params,
             attachment_dir,
             vault_dir: self.directory.clone(),
             mls_key_version: record.mls_key_version,
@@ -275,6 +283,48 @@ impl Vault {
     }
 }
 
+/// Re-wrap an already authenticated master key with stronger KDF parameters.
+/// The update is atomic and guarded by the exact old header so a concurrent
+/// password change cannot be overwritten.
+fn rewrap_weak_kdf(
+    conn: &mut Connection,
+    record: &ProfileRecord,
+    password: &str,
+    master: &Zeroizing<[u8; KEY_LEN]>,
+) -> Result<Argon2Params, StorageError> {
+    let password = Zeroizing::new(password.to_owned());
+    let params = Argon2Params::RECOMMENDED;
+    let salt = fresh_salt()?;
+    let kek = derive_kek(password.as_str(), &salt, params)?;
+    let wrapped_master = wrap_key(master, &kek, &master_aad(&record.profile_id, &salt, params))?;
+    let mut kdf_blob = Vec::with_capacity(1 + 12);
+    kdf_blob.push(ARGON2_ID_V1);
+    kdf_blob.extend_from_slice(&params.to_bytes());
+
+    let transaction = conn.transaction()?;
+    let changed = transaction.execute(
+        "UPDATE profile SET kdf_salt = ?1, kdf_params = ?2, wrapped_master = ?3
+         WHERE id = 1 AND kdf_salt = ?4 AND kdf_params = ?5 AND wrapped_master = ?6",
+        params![
+            salt.to_vec(),
+            kdf_blob,
+            wrapped_master,
+            record.kdf_salt.to_vec(),
+            {
+                let mut old = vec![ARGON2_ID_V1];
+                old.extend_from_slice(&record.params.to_bytes());
+                old
+            },
+            record.wrapped_master.clone(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StorageError::RollbackDetected);
+    }
+    transaction.commit()?;
+    Ok(params)
+}
+
 fn open_connection(path: &Path) -> Result<Connection, StorageError> {
     let conn = Connection::open(path)?;
     conn.execute_batch(
@@ -284,6 +334,7 @@ fn open_connection(path: &Path) -> Result<Connection, StorageError> {
          PRAGMA foreign_keys = ON;
          PRAGMA busy_timeout = 5000;",
     )?;
+    restrict_database_files(path)?;
     Ok(conn)
 }
 
@@ -452,8 +503,10 @@ impl Session {
         if new_password.is_empty() {
             return Err(StorageError::EmptyPassword);
         }
+        let current_password = Zeroizing::new(current_password.to_owned());
+        let new_password = Zeroizing::new(new_password.to_owned());
         let record = read_profile(&self.conn)?;
-        let old_kek = derive_kek(current_password, &record.kdf_salt, record.params)
+        let old_kek = derive_kek(current_password.as_str(), &record.kdf_salt, record.params)
             .map_err(|_| StorageError::AuthenticationFailed)?;
         let master = unwrap_key(
             &record.wrapped_master,
@@ -462,17 +515,27 @@ impl Session {
         )
         .map_err(|_| StorageError::AuthenticationFailed)?;
 
+        // A password change is also an opportunity to upgrade weak vaults.
+        // Never downgrade a vault that already uses stronger parameters.
+        let new_params = if record.params.is_weaker_than(Argon2Params::RECOMMENDED) {
+            Argon2Params::RECOMMENDED
+        } else {
+            record.params
+        };
         let new_salt = fresh_salt()?;
-        let new_kek = derive_kek(new_password, &new_salt, record.params)?;
+        let new_kek = derive_kek(new_password.as_str(), &new_salt, new_params)?;
         let wrapped_master = wrap_key(
             &master,
             &new_kek,
-            &master_aad(&record.profile_id, &new_salt, record.params),
+            &master_aad(&record.profile_id, &new_salt, new_params),
         )?;
+        let mut kdf_blob = vec![ARGON2_ID_V1];
+        kdf_blob.extend_from_slice(&new_params.to_bytes());
         self.conn.execute(
-            "UPDATE profile SET kdf_salt = ?1, wrapped_master = ?2 WHERE id = 1",
-            params![new_salt.to_vec(), wrapped_master],
+            "UPDATE profile SET kdf_salt = ?1, kdf_params = ?2, wrapped_master = ?3 WHERE id = 1",
+            params![new_salt.to_vec(), kdf_blob, wrapped_master],
         )?;
+        self.params = new_params;
         Ok(())
     }
 }
@@ -775,6 +838,21 @@ fn restrict_directory(path: &Path) -> io::Result<()> {
 #[cfg(not(unix))]
 fn restrict_directory(_path: &Path) -> io::Result<()> {
     // Windows ACL hardening is tracked for the cross-platform security pass.
+    Ok(())
+}
+
+/// Restrict the database and any SQLite WAL/SHM sidecars created by an open.
+/// These files can contain recently written ciphertext and row structure.
+fn restrict_database_files(path: &Path) -> io::Result<()> {
+    restrict_file(path)?;
+    for suffix in ["-wal", "-shm"] {
+        let mut name = OsString::from(path.as_os_str());
+        name.push(suffix);
+        let sidecar = PathBuf::from(name);
+        if sidecar.exists() {
+            restrict_file(&sidecar)?;
+        }
+    }
     Ok(())
 }
 

@@ -965,6 +965,20 @@ pub struct NetworkConfig {
     pub pq_transport: Option<PqTransportConfig>,
 }
 
+impl NetworkConfig {
+    /// Explicit opt-in to a direct, non-private transport. This is **not** the
+    /// default: the default configuration requires a user-supplied SOCKS5
+    /// proxy and fails closed before any listener or dial is created. Use this
+    /// constructor only when the caller deliberately accepts direct IP
+    /// exposure to peers.
+    pub fn direct() -> Self {
+        Self {
+            transport_mode: TransportPrivacyMode::Direct,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
@@ -982,7 +996,7 @@ impl Default for NetworkConfig {
             max_requests_per_peer_per_window: 64,
             max_request_bytes_per_peer_per_window: 16 * MAX_MESSAGE_BYTES,
             rate_window: Duration::from_secs(1),
-            transport_mode: TransportPrivacyMode::Direct,
+            transport_mode: TransportPrivacyMode::TorRequired,
             socks5_proxy: None,
             dial_policy: DialPolicy::DirectAllowed,
             enable_identify: false,
@@ -3937,8 +3951,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_has_no_bootstrap_or_relay() {
+    fn default_config_requires_a_proxy_and_has_no_bootstrap_or_relay() {
         let config = NetworkConfig::default();
+        assert_eq!(config.transport_mode, TransportPrivacyMode::TorRequired);
+        assert!(config.socks5_proxy.is_none());
+        assert!(matches!(
+            validate_config(&config),
+            Err(NetworkError::InvalidConfig(reason))
+                if reason.contains("direct fallback is disabled")
+        ));
+        assert_eq!(
+            privacy_status_from_config(&config).transport_mode,
+            TransportPrivacyMode::TorRequired
+        );
+    }
+
+    #[test]
+    fn direct_config_has_no_bootstrap_or_relay() {
+        let config = NetworkConfig::direct();
         assert!(config.listen_addr.to_string().starts_with("/ip4/"));
         assert_eq!(config.connection_timeout, Duration::from_secs(10));
         assert_eq!(config.max_redial_attempts, 3);
@@ -3957,11 +3987,13 @@ mod tests {
         assert!(config.socks5_proxy.is_none());
         assert_eq!(config.relay_mode, RelayMode::Off);
         assert_eq!(config.max_relayed_connections, 4);
+        assert_eq!(config.transport_mode, TransportPrivacyMode::Direct);
+        assert!(validate_config(&config).is_ok());
     }
 
     #[test]
     fn transport_limits_map_config_to_explicit_libp2p_bounds() {
-        let config = NetworkConfig::default();
+        let config = NetworkConfig::direct();
         assert_eq!(
             TransportLimits::from_config(&config).expect("transport limits"),
             TransportLimits {
@@ -3978,28 +4010,28 @@ mod tests {
         assert!(matches!(
             validate_config(&NetworkConfig {
                 max_pending_incoming_connections: 0,
-                ..NetworkConfig::default()
+                ..NetworkConfig::direct()
             }),
             Err(NetworkError::InvalidConfig(_))
         ));
         assert!(matches!(
             validate_config(&NetworkConfig {
                 max_pending_outgoing_connections: 0,
-                ..NetworkConfig::default()
+                ..NetworkConfig::direct()
             }),
             Err(NetworkError::InvalidConfig(_))
         ));
         assert!(matches!(
             validate_config(&NetworkConfig {
                 max_total_connections: 0,
-                ..NetworkConfig::default()
+                ..NetworkConfig::direct()
             }),
             Err(NetworkError::InvalidConfig(_))
         ));
         assert!(matches!(
             validate_config(&NetworkConfig {
                 max_total_connections: usize::MAX,
-                ..NetworkConfig::default()
+                ..NetworkConfig::direct()
             }),
             Err(NetworkError::InvalidConfig(_))
         ));
@@ -4010,7 +4042,7 @@ mod tests {
         let identity = Identity::generate().expect("identity");
         let config = NetworkConfig {
             transport_mode: TransportPrivacyMode::TorRequired,
-            ..NetworkConfig::default()
+            ..NetworkConfig::direct()
         };
         assert!(matches!(
             validate_config(&config),
@@ -4022,7 +4054,7 @@ mod tests {
             Err(NetworkError::InvalidConfig(_))
         ));
         assert_eq!(
-            privacy_status_from_config(&NetworkConfig::default()).transport_mode,
+            privacy_status_from_config(&NetworkConfig::direct()).transport_mode,
             TransportPrivacyMode::Direct
         );
     }
@@ -4040,18 +4072,18 @@ mod tests {
         let mut circuit = direct.clone();
         circuit.push(Protocol::P2pCircuit);
 
-        assert!(validate_config(&NetworkConfig::default()).is_ok());
+        assert!(validate_config(&NetworkConfig::direct()).is_ok());
         assert!(
             validate_config(&NetworkConfig {
                 enable_kad: true,
-                ..NetworkConfig::default()
+                ..NetworkConfig::direct()
             })
             .is_err()
         );
         assert!(
             validate_config(&NetworkConfig {
                 relay_mode: RelayMode::Client,
-                ..NetworkConfig::default()
+                ..NetworkConfig::direct()
             })
             .is_err()
         );
@@ -4061,14 +4093,14 @@ mod tests {
                     Multiaddr::from_str("/ip4/127.0.0.1/tcp/4001")
                         .expect("address without peer id")
                 ],
-                ..NetworkConfig::default()
+                ..NetworkConfig::direct()
             })
             .is_err()
         );
         assert!(
             validate_config(&NetworkConfig {
                 relay_servers: vec![circuit],
-                ..NetworkConfig::default()
+                ..NetworkConfig::direct()
             })
             .is_err()
         );
@@ -4077,7 +4109,7 @@ mod tests {
                 relay_mode: RelayMode::Client,
                 relay_servers: vec![direct.clone()],
                 max_relayed_connections: 0,
-                ..NetworkConfig::default()
+                ..NetworkConfig::direct()
             })
             .is_err()
         );
@@ -4085,14 +4117,14 @@ mod tests {
             validate_config(&NetworkConfig {
                 relay_mode: RelayMode::Client,
                 relay_servers: vec![direct],
-                ..NetworkConfig::default()
+                ..NetworkConfig::direct()
             })
             .is_ok()
         );
         assert!(
             validate_config(&NetworkConfig {
                 relay_mode: RelayMode::Server,
-                ..NetworkConfig::default()
+                ..NetworkConfig::direct()
             })
             .is_ok()
         );
@@ -4104,7 +4136,7 @@ mod tests {
         let base = NetworkConfig {
             transport_mode: TransportPrivacyMode::TorRequired,
             socks5_proxy: Some(proxy),
-            ..NetworkConfig::default()
+            ..NetworkConfig::direct()
         };
         assert!(validate_config(&base).is_ok());
         assert!(
@@ -4142,7 +4174,7 @@ mod tests {
             dial_policy: DialPolicy::RelayOnly,
             relay_mode: RelayMode::Client,
             relay_servers: vec![relay],
-            ..NetworkConfig::default()
+            ..NetworkConfig::direct()
         }
     }
 
@@ -4158,7 +4190,7 @@ mod tests {
                 dial_policy: DialPolicy::RelayOnly,
                 relay_mode: RelayMode::Off,
                 relay_servers: vec![relay.clone()],
-                ..NetworkConfig::default()
+                ..NetworkConfig::direct()
             }),
             Err(NetworkError::InvalidConfig(reason))
                 if reason.contains("relay-client mode")
@@ -4287,7 +4319,7 @@ mod tests {
             rate_window: Duration::from_secs(1),
             max_requests_per_peer_per_window: 2,
             max_request_bytes_per_peer_per_window: 10,
-            ..NetworkConfig::default()
+            ..NetworkConfig::direct()
         };
         let mut limiter = RateLimiter::new(&config);
         let peer = Identity::generate().expect("identity");
@@ -4330,7 +4362,7 @@ mod tests {
             rate_window: Duration::from_secs(1),
             max_requests_per_peer_per_window: 8,
             max_request_bytes_per_peer_per_window: 8 * MAX_MESSAGE_BYTES,
-            ..NetworkConfig::default()
+            ..NetworkConfig::direct()
         };
         let mut limiter = RateLimiter::new(&config);
         assert_eq!(limiter.max_protocol_requests, 2);
@@ -4366,7 +4398,7 @@ mod tests {
             rate_window: Duration::from_secs(1),
             max_requests_per_peer_per_window: 3,
             max_request_bytes_per_peer_per_window: 64,
-            ..NetworkConfig::default()
+            ..NetworkConfig::direct()
         };
         let mut limiter = RateLimiter::new(&config);
         assert_eq!(limiter.max_protocol_requests, 2);
@@ -4392,7 +4424,7 @@ mod tests {
             rate_window: Duration::from_secs(1),
             max_requests_per_peer_per_window: 64,
             max_request_bytes_per_peer_per_window: 128,
-            ..NetworkConfig::default()
+            ..NetworkConfig::direct()
         };
         let mut limiter = RateLimiter::new(&config);
         let peer = generated_peer_id();
@@ -4571,7 +4603,7 @@ mod tests {
             rate_window: Duration::from_secs(1),
             max_requests_per_peer_per_window: 2,
             max_request_bytes_per_peer_per_window: 10,
-            ..NetworkConfig::default()
+            ..NetworkConfig::direct()
         };
         let mut limiter = RateLimiter::new(&config);
         let peers = [
