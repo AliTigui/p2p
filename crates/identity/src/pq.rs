@@ -494,6 +494,32 @@ fn verify_public(
     public_key.verify_with_context(message, &[], &decoded_signature)
 }
 
+/// Verify an ML-DSA-65 role signature against an already pinned raw verifying
+/// key. Unlike proof-based verification, this function does not trust a
+/// self-contained proof or the classical PeerId contained in it; the caller
+/// must have obtained `public_key` from a local trust anchor.
+pub fn verify_pq_role_signature_with_key(
+    role: IdentityRole,
+    public_key: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), IdentityError> {
+    if role == IdentityRole::Transport {
+        return Err(IdentityError::WrongRole);
+    }
+    let public: [u8; PQ_PUBLIC_KEY_BYTES] = public_key
+        .try_into()
+        .map_err(|_| IdentityError::Crypto("unexpected ML-DSA public key length".to_owned()))?;
+    let signature = fixed_signature(signature)?;
+    let mut bytes = signature_signing_bytes(role, message);
+    bytes.extend_from_slice(&public);
+    if verify_public(&public, &bytes, &signature) {
+        Ok(())
+    } else {
+        Err(IdentityError::InvalidSignature)
+    }
+}
+
 struct Reader<'a> {
     bytes: &'a [u8],
     position: usize,
@@ -604,6 +630,15 @@ mod tests {
         proof
             .verify_role_signature(IdentityRole::Application, message, &signature)
             .expect("application signature");
+        let pinned = proof
+            .role_public_key(IdentityRole::Application)
+            .expect("application key");
+        verify_pq_role_signature_with_key(IdentityRole::Application, &pinned, message, &signature)
+            .expect("pinned application signature");
+        assert!(
+            verify_pq_role_signature_with_key(IdentityRole::File, &pinned, message, &signature)
+                .is_err()
+        );
         assert!(
             proof
                 .verify_role_signature(IdentityRole::File, message, &signature)

@@ -54,11 +54,15 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 mod pending_admission;
 mod pq_auth;
+mod pq_transport;
 mod privacy;
 mod protocol;
 mod socks5;
 
 use pending_admission::PerIpPendingTransport;
+use pq_transport::PqNoiseConfig;
+
+pub use pq_transport::PqTransportConfig;
 
 pub use privacy::{
     DialPolicy, DiscoveryEvent, DiscoverySource, IdentifyEvent, NatEvent, NetworkPrivacyStatus,
@@ -954,6 +958,11 @@ pub struct NetworkConfig {
     pub enable_dcutr: bool,
     /// Hard cap on simultaneously established relayed connections.
     pub max_relayed_connections: usize,
+    /// Optional pinned PQ transport mode. When set, every accepted connection
+    /// must present an ML-DSA-65 `Application` signature from a locally pinned
+    /// key and complete an authenticated ML-KEM-768 exchange. QUIC and relay
+    /// paths are disabled in this mode so no classical-only transport remains.
+    pub pq_transport: Option<PqTransportConfig>,
 }
 
 impl Default for NetworkConfig {
@@ -986,6 +995,7 @@ impl Default for NetworkConfig {
             enable_autonat: false,
             enable_dcutr: false,
             max_relayed_connections: 4,
+            pq_transport: None,
         }
     }
 }
@@ -1056,6 +1066,7 @@ pub struct Network {
     privacy_status: NetworkPrivacyStatus,
     dial_policy: DialPolicy,
     relay_servers: Vec<Multiaddr>,
+    pq_pinned_peers: Option<BTreeSet<PeerId>>,
     pending_addresses: HashMap<Multiaddr, PeerId>,
     next_request_id: AtomicU64,
     next_setup_request_id: AtomicU64,
@@ -1090,6 +1101,10 @@ impl Network {
         let privacy_status = privacy_status_from_config(&config);
         let dial_policy = config.dial_policy;
         let relay_servers = config.relay_servers.clone();
+        let pq_pinned_peers = config
+            .pq_transport
+            .as_ref()
+            .map(|pq| pq.application_keys.keys().copied().collect::<BTreeSet<_>>());
         // libp2p 0.56 uses an older `libp2p-identity` than the identity crate.
         // The protobuf keypair encoding is a stable, version-independent
         // boundary; importing it preserves the exact vault PeerId.
@@ -1152,6 +1167,7 @@ impl Network {
                 privacy_status,
                 dial_policy,
                 relay_servers,
+                pq_pinned_peers,
                 pending_addresses: HashMap::new(),
                 next_request_id: AtomicU64::new(1),
                 next_setup_request_id: AtomicU64::new(1),
@@ -1225,6 +1241,13 @@ impl Network {
     }
 
     fn queue_dial(&mut self, address: Multiaddr, expected: PeerId) -> Result<(), NetworkError> {
+        if let Some(pins) = &self.pq_pinned_peers
+            && !pins.contains(&expected)
+        {
+            return Err(NetworkError::InvalidConfig(format!(
+                "peer {expected} has no locally pinned ML-DSA-65 application key"
+            )));
+        }
         if self
             .pending_addresses
             .insert(address.clone(), expected)
@@ -1753,6 +1776,23 @@ fn validate_config(config: &NetworkConfig) -> Result<(), NetworkError> {
             "PQ connection admission requires max_connections_per_peer == 1".to_owned(),
         ));
     }
+    if let Some(pq) = &config.pq_transport {
+        if pq.application_keys.is_empty() {
+            return Err(NetworkError::InvalidConfig(
+                "pinned PQ transport requires at least one local ML-DSA-65 application key"
+                    .to_owned(),
+            ));
+        }
+        if config.relay_mode != RelayMode::Off
+            || !config.relay_servers.is_empty()
+            || config.dial_policy == DialPolicy::RelayOnly
+        {
+            return Err(NetworkError::InvalidConfig(
+                "pinned PQ transport does not support relay paths; disable relay mode and relay-only routing"
+                    .to_owned(),
+            ));
+        }
+    }
     if config.max_pending_incoming_connections == 0 || config.max_pending_outgoing_connections == 0
     {
         return Err(NetworkError::InvalidConfig(
@@ -1843,7 +1883,7 @@ fn run_worker(
     };
 
     runtime.block_on(async move {
-        let mut swarm = match build_swarm(&keypair, &config, &discovery_events) {
+        let mut swarm = match build_swarm(&keypair, &identity, &config, &discovery_events) {
             Ok(swarm) => swarm,
             Err(error) => {
                 let _ = startup.send(Startup::Error(error));
@@ -1853,7 +1893,8 @@ fn run_worker(
 
         // Neither relay-only nor SOCKS5/Tor route mode advertises a direct TCP
         // or QUIC listener. Relay clients still create circuit listeners below,
-        // and those reservation dials use the selected transport.
+        // and those reservation dials use the selected transport. Pinned PQ
+        // transport has no QUIC upgrade, so it must not open a QUIC listener.
         if config.transport_mode != TransportPrivacyMode::TorRequired
             && config.dial_policy != DialPolicy::RelayOnly
         {
@@ -1861,7 +1902,8 @@ fn run_worker(
                 let _ = startup.send(Startup::Error(error.to_string()));
                 return;
             }
-            if let Some(quic_addr) = quic_listen_addr(&config.listen_addr)
+            if config.pq_transport.is_none()
+                && let Some(quic_addr) = quic_listen_addr(&config.listen_addr)
                 && let Err(error) = swarm.listen_on(quic_addr)
             {
                 let _ = startup.send(Startup::Error(error.to_string()));
@@ -2208,7 +2250,7 @@ fn run_worker(
                             }
                             emit(&events, ConnectionState::Failed {
                                 peer: peer_id,
-                                reason: truncate_reason(&error.to_string()),
+                                reason: dial_error_reason(&error),
                             });
                         }
                         SwarmEvent::ListenerError { error, .. } => {
@@ -2926,6 +2968,7 @@ fn run_worker(
 
 fn build_swarm(
     keypair: &libp2p::identity::Keypair,
+    identity: &Identity,
     config: &NetworkConfig,
     discovery_events: &tokio_mpsc::Sender<DiscoveryEvent>,
 ) -> Result<Swarm<Behaviour>, String> {
@@ -2996,29 +3039,41 @@ fn build_swarm(
     // The standard builder applies libp2p's connection limits only after the
     // transport emits an inbound connection. Wrap all direct transports so a
     // single source IP cannot occupy the whole pre-authentication budget with
-    // stalled sockets before authentication. QUIC uses the pinned libp2p-tls
-    // stack, which configures rustls with `prefer-post-quantum` and negotiates
-    // X25519MLKEM768; its TLS peer authentication remains classical. Every
-    // accepted connection is additionally gated by the mandatory ML-DSA-65
-    // admission behaviour below before application traffic is delivered.
-    let noise_direct = libp2p::noise::Config::new(keypair).map_err(|error| error.to_string())?;
-    let tcp_transport = libp2p::tcp::tokio::Transport::new(Default::default())
-        .upgrade(libp2p::core::upgrade::Version::V1Lazy)
-        .authenticate(noise_direct)
-        .multiplex(libp2p::yamux::Config::default())
-        .map(|(peer, connection), _| (peer, StreamMuxerBox::new(connection)));
-    let quic_transport = libp2p::quic::tokio::Transport::new(libp2p::quic::Config::new(keypair))
-        .map(|(peer, connection), _| (peer, StreamMuxerBox::new(connection)));
-    let direct_transport = PerIpPendingTransport::new(
-        libp2p::core::transport::OrTransport::new(tcp_transport, quic_transport).map(
-            |connection, _| match connection {
-                libp2p::futures::future::Either::Left(connection)
-                | libp2p::futures::future::Either::Right(connection) => connection,
-            },
-        ),
-        config.max_connections_per_ip,
-    )
-    .boxed();
+    // stalled sockets before authentication. In the default mode QUIC uses the
+    // pinned libp2p-tls stack with X25519MLKEM768, but its TLS PeerId
+    // authentication remains classical. When pinned PQ transport is enabled,
+    // QUIC is omitted so every connection uses the ML-DSA-65/ML-KEM-768 upgrade.
+    let direct_transport: libp2p::core::transport::Boxed<(PeerId, StreamMuxerBox)> =
+        if let Some(pq_config) = config.pq_transport.clone() {
+            let security = PqNoiseConfig::new(keypair, identity.clone(), pq_config)?;
+            libp2p::tcp::tokio::Transport::new(Default::default())
+                .upgrade(libp2p::core::upgrade::Version::V1Lazy)
+                .authenticate(security)
+                .multiplex(libp2p::yamux::Config::default())
+                .map(|(peer, connection), _| (peer, StreamMuxerBox::new(connection)))
+                .boxed()
+        } else {
+            let noise_direct =
+                libp2p::noise::Config::new(keypair).map_err(|error| error.to_string())?;
+            let tcp_transport = libp2p::tcp::tokio::Transport::new(Default::default())
+                .upgrade(libp2p::core::upgrade::Version::V1Lazy)
+                .authenticate(noise_direct)
+                .multiplex(libp2p::yamux::Config::default())
+                .map(|(peer, connection), _| (peer, StreamMuxerBox::new(connection)));
+            let quic_transport =
+                libp2p::quic::tokio::Transport::new(libp2p::quic::Config::new(keypair))
+                    .map(|(peer, connection), _| (peer, StreamMuxerBox::new(connection)));
+            PerIpPendingTransport::new(
+                libp2p::core::transport::OrTransport::new(tcp_transport, quic_transport).map(
+                    |connection, _| match connection {
+                        libp2p::futures::future::Either::Left(connection)
+                        | libp2p::futures::future::Either::Right(connection) => connection,
+                    },
+                ),
+                config.max_connections_per_ip,
+            )
+            .boxed()
+        };
 
     let transport: libp2p::core::transport::Boxed<(PeerId, StreamMuxerBox)> =
         if config.transport_mode == TransportPrivacyMode::TorRequired {
@@ -3027,32 +3082,31 @@ fn build_swarm(
             let proxy = config
                 .socks5_proxy
                 .ok_or_else(|| "SOCKS5/Tor route requires a proxy address".to_owned())?;
-            let noise_proxy =
-                libp2p::noise::Config::new(keypair).map_err(|error| error.to_string())?;
-            socks5::Socks5OnlyTransport::new(proxy)
-                .upgrade(libp2p::core::upgrade::Version::V1Lazy)
-                .authenticate(noise_proxy)
-                .multiplex(libp2p::yamux::Config::default())
-                .map(|(peer, connection), _| (peer, StreamMuxerBox::new(connection)))
-                .boxed()
+            if let Some(pq_config) = config.pq_transport.clone() {
+                let security = PqNoiseConfig::new(keypair, identity.clone(), pq_config)?;
+                socks5::Socks5OnlyTransport::new(proxy)
+                    .upgrade(libp2p::core::upgrade::Version::V1Lazy)
+                    .authenticate(security)
+                    .multiplex(libp2p::yamux::Config::default())
+                    .map(|(peer, connection), _| (peer, StreamMuxerBox::new(connection)))
+                    .boxed()
+            } else {
+                let noise_proxy =
+                    libp2p::noise::Config::new(keypair).map_err(|error| error.to_string())?;
+                socks5::Socks5OnlyTransport::new(proxy)
+                    .upgrade(libp2p::core::upgrade::Version::V1Lazy)
+                    .authenticate(noise_proxy)
+                    .multiplex(libp2p::yamux::Config::default())
+                    .map(|(peer, connection), _| (peer, StreamMuxerBox::new(connection)))
+                    .boxed()
+            }
         } else {
             direct_transport
         };
 
-    let swarm = SwarmBuilder::with_existing_identity(keypair.clone())
-        .with_tokio()
-        .with_other_transport(move |_| transport)
-        // `with_other_transport` is infallible for a ready-made transport.
-        // Matching `Infallible` avoids an unreachable `Display` call that
-        // newer Clippy versions reject under `-D warnings`.
-        .map_err(|never| -> String { match never {} })?
-        // The relay transport is present so client behaviour can be opted in.
-        // With the behaviour toggled off it never dials or listens on a relay.
-        // Relay upgrades are composed around the wrapped direct transport, so
-        // this per-IP rule applies only to raw inbound TCP sockets.
-        .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)
-        .map_err(|error| error.to_string())?
-        .with_behaviour(|key, relay_client| Behaviour {
+    let make_behaviour = |key: &libp2p::identity::Keypair,
+                          relay_client: Option<relay::client::Behaviour>| {
+        Behaviour {
             pq_auth: request_response::Behaviour::new(
                 [(PQ_AUTH_PROTOCOL.to_owned(), ProtocolSupport::Full)],
                 // Both endpoints send a request on the same connection. Allow
@@ -3104,6 +3158,7 @@ fn build_swarm(
                 .into(),
             relay_client: (config.relay_mode == RelayMode::Client)
                 .then_some(relay_client)
+                .flatten()
                 .into(),
             relay_server: (config.relay_mode == RelayMode::Server)
                 .then(|| {
@@ -3128,13 +3183,37 @@ fn build_swarm(
                 .then(|| dcutr::Behaviour::new(local_peer_id))
                 .into(),
             connection_limits: ConnectionLimitBehaviour::new(transport_limits.libp2p()),
-        })
-        // `with_behaviour` is infallible when given a ready-made behaviour;
-        // see the `Infallible` note on `with_other_transport` above.
-        .map_err(|never| -> String { match never {} })?
-        .with_swarm_config(std::convert::identity)
-        .with_connection_timeout(connection_timeout)
-        .build();
+        }
+    };
+
+    let swarm = if config.pq_transport.is_some() {
+        // Pinned PQ mode deliberately omits the relay transport. Validation
+        // rejects relay configuration in this mode, so no classical-only path
+        // is constructed.
+        SwarmBuilder::with_existing_identity(keypair.clone())
+            .with_tokio()
+            .with_other_transport(move |_| transport)
+            .map_err(|never| -> String { match never {} })?
+            .with_behaviour(|key| make_behaviour(key, None))
+            .map_err(|never| -> String { match never {} })?
+            .with_swarm_config(std::convert::identity)
+            .with_connection_timeout(connection_timeout)
+            .build()
+    } else {
+        // The relay transport is present so client behaviour can be opted in.
+        // With the behaviour toggled off it never dials or listens on a relay.
+        SwarmBuilder::with_existing_identity(keypair.clone())
+            .with_tokio()
+            .with_other_transport(move |_| transport)
+            .map_err(|never| -> String { match never {} })?
+            .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)
+            .map_err(|error| error.to_string())?
+            .with_behaviour(|key, relay_client| make_behaviour(key, Some(relay_client)))
+            .map_err(|never| -> String { match never {} })?
+            .with_swarm_config(std::convert::identity)
+            .with_connection_timeout(connection_timeout)
+            .build()
+    };
     Ok(swarm)
 }
 
@@ -3795,11 +3874,60 @@ fn truncate_reason(reason: &str) -> String {
     }
 }
 
+fn error_chain_messages(error: &(dyn std::error::Error + 'static)) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = Some(error);
+    while let Some(cause) = current {
+        let message = cause.to_string();
+        if !message.is_empty() {
+            parts.push(message);
+        }
+        current = cause.source();
+    }
+    parts
+}
+
+fn pinned_pq_reason(parts: &[String]) -> Option<String> {
+    parts
+        .iter()
+        .find(|part| {
+            part.contains("no pinned")
+                || part.contains("PQ authentication")
+                || part.contains("invalid PQ transport")
+        })
+        .cloned()
+}
+
 fn incoming_error_reason(error: &libp2p::swarm::ListenError) -> String {
     if let libp2p::swarm::ListenError::Denied { cause } = error
         && let Some(exceeded) = cause.downcast_ref::<libp2p::connection_limits::Exceeded>()
     {
         return truncate_reason(&exceeded.to_string());
+    }
+    if let libp2p::swarm::ListenError::Transport(error) = error {
+        let parts = error_chain_messages(error);
+        if let Some(pq_reason) = pinned_pq_reason(&parts) {
+            return truncate_reason(&format!("PQ transport rejected: {pq_reason}"));
+        }
+        if !parts.is_empty() {
+            return truncate_reason(&parts.join(": "));
+        }
+    }
+    truncate_reason(&error.to_string())
+}
+
+fn dial_error_reason(error: &libp2p::swarm::DialError) -> String {
+    if let libp2p::swarm::DialError::Transport(errors) = error {
+        let parts: Vec<String> = errors
+            .iter()
+            .flat_map(|(_, error)| error_chain_messages(error))
+            .collect();
+        if let Some(pq_reason) = pinned_pq_reason(&parts) {
+            return truncate_reason(&format!("PQ transport rejected: {pq_reason}"));
+        }
+        if !parts.is_empty() {
+            return truncate_reason(&parts.join(": "));
+        }
     }
     truncate_reason(&error.to_string())
 }
@@ -4391,6 +4519,7 @@ mod tests {
             privacy_status: NetworkPrivacyStatus::default(),
             dial_policy: DialPolicy::DirectAllowed,
             relay_servers: Vec::new(),
+            pq_pinned_peers: None,
             pending_addresses: HashMap::new(),
             next_request_id: AtomicU64::new(1),
             next_setup_request_id: AtomicU64::new(1),

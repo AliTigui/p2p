@@ -62,6 +62,7 @@ openmls = "=0.10.0-rc.1"
 openmls_rust_crypto = { version = "=0.7.0-rc.1", features = ["draft-ietf-mls-pq-ciphersuites"] }
 openmls_traits = { version = "=0.7.0-rc.1", features = ["draft-ietf-mls-pq-ciphersuites"] }
 ml-dsa = { version = "=0.1.2", features = ["alloc"] }
+ml-kem = { version = "=0.3.4", features = ["getrandom", "zeroize"] }
 argon2 = "0.6"
 hkdf = "0.13"
 hmac = "0.13"

@@ -33,6 +33,7 @@ pub use fingerprint::{FINGERPRINT_PREFIX, Fingerprint};
 pub use pq::{
     MAX_PQ_IDENTITY_PROOF_BYTES, PQ_PROOF_VERSION, PQ_PROOF_VERSION as PQ_SIGNATURE_VERSION,
     PQ_PUBLIC_KEY_BYTES, PQ_SCHEME_ID, PQ_SEED_BYTES, PQ_SIGNATURE_BYTES,
+    verify_pq_role_signature_with_key,
 };
 pub(crate) use pq::{PqIdentityProof, PqSeeds, random_seed, sign_seed};
 pub use proof::{IDENTITY_PROOF_HEADER_BYTES, IdentityProof, MAX_IDENTITY_PROOF_BYTES};
